@@ -907,17 +907,23 @@ function q_stats(string $state=''):array{
     $cat_stmt=$db->prepare("SELECT COUNT(DISTINCT r.food_category_id) FROM recalls r WHERE r.status='ongoing' AND r.food_category_id IS NOT NULL$where_state");
     $cat_stmt->execute($params);$cats=(int)$cat_stmt->fetchColumn();
 
+    // All-time totals (not gated to active status) for dashboard overview stats
+    $total_ret=$db->prepare("SELECT COUNT(DISTINCT rr.retailer_id) FROM recall_retailers rr JOIN recalls r ON r.id=rr.recall_id".($where_state?" WHERE r.id IN(SELECT recall_id FROM recall_states WHERE state_code=?)":""));
+    $total_ret->execute($where_state?[$params[0]]:[]);$total_retailers=(int)$total_ret->fetchColumn();
+
+    $total_cat=$db->prepare("SELECT COUNT(DISTINCT r.food_category_id) FROM recalls r WHERE r.food_category_id IS NOT NULL".($where_state?" AND r.id IN(SELECT recall_id FROM recall_states WHERE state_code=?)":""));
+    $total_cat->execute($where_state?[$params[0]]:[]);$total_cats=(int)$total_cat->fetchColumn();
+
     $newest=$db->query("SELECT title,announced_date FROM recalls ORDER BY announced_date DESC LIMIT 1")->fetch();
     $last_sync=$db->query("SELECT MAX(completed_at) FROM ingestion_runs WHERE status IN('completed','partial')")->fetchColumn();
 
-    return compact('total','active','severe','retailers','cats','newest','last_sync');
+    return compact('total','active','severe','retailers','cats','total_retailers','total_cats','newest','last_sync');
 }
 
 function q_recalls(int $page=1,int $per=25,array $f=[]):array{
     $db=db();$offset=($page-1)*$per;
     $w=[];$p=[];
-    if(!empty($f['status'])){$w[]='r.status=?';$p[]=$f['status'];}
-    else{$w[]="r.status='ongoing'";}
+    if(!empty($f['status'])&&$f['status']!=='all'){$w[]='r.status=?';$p[]=$f['status'];}
     if(!empty($f['severity'])){$w[]='r.severity=?';$p[]=(float)$f['severity'];}
     if(!empty($f['state'])){$w[]='r.id IN(SELECT recall_id FROM recall_states WHERE state_code=?)';$p[]=$f['state'];}
     if(!empty($f['category'])){$w[]='r.food_category_id=?';$p[]=(int)$f['category'];}
@@ -1239,7 +1245,7 @@ function handle_api(string $api):void{
         switch($api){
             case 'stats':    echo js(q_stats($_GET['state']??''));break;
             case 'recalls':
-                $f=['status'=>$_GET['status']??'ongoing','state'=>$_GET['state']??'','category'=>$_GET['cat']??'','hazard'=>$_GET['haz']??'','agency'=>$_GET['agency']??'','q'=>$_GET['q']??'','sort'=>$_GET['sort']??'date','severity'=>$_GET['sev']??''];
+                $f=['status'=>$_GET['status']??'all','state'=>$_GET['state']??'','category'=>$_GET['cat']??'','hazard'=>$_GET['haz']??'','agency'=>$_GET['agency']??'','q'=>$_GET['q']??'','sort'=>$_GET['sort']??'date','severity'=>$_GET['sev']??''];
                 echo js(q_recalls((int)($_GET['page']??1),(int)($_GET['per']??25),$f));break;
             case 'recall':   echo js(q_recall((int)($_GET['id']??0)));break;
             case 'retailers':echo js(q_retailers($_GET['sort']??'risk',$_GET['state']??''));break;
@@ -1414,8 +1420,8 @@ function view_dashboard():void{
 <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
   <div class="fw-stat"><div class="text-2xl font-bold text-slate-800"><?=number_format($stats['active'])?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="alert-circle" class="w-3 h-3 text-red-500"></i>Active Recalls</div></div>
   <div class="fw-stat"><div class="text-2xl font-bold text-red-600"><?=number_format($stats['severe'])?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="shield-alert" class="w-3 h-3 text-red-600"></i>Class I (Severe)</div></div>
-  <div class="fw-stat"><div class="text-2xl font-bold text-slate-800"><?=number_format($stats['retailers'])?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="store" class="w-3 h-3"></i>Affected Retailers</div></div>
-  <div class="fw-stat"><div class="text-2xl font-bold text-slate-800"><?=number_format($stats['cats'])?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="tag" class="w-3 h-3"></i>Food Categories</div></div>
+  <div class="fw-stat"><div class="text-2xl font-bold text-slate-800"><?=number_format($stats['total_retailers'])?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="store" class="w-3 h-3"></i>Retailers Affected</div></div>
+  <div class="fw-stat"><div class="text-2xl font-bold text-slate-800"><?=number_format($stats['total_cats'])?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="tag" class="w-3 h-3"></i>Food Categories</div></div>
   <div class="fw-stat"><div class="text-2xl font-bold text-slate-800"><?=number_format($stats['total'])?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="database" class="w-3 h-3"></i>Total Records</div></div>
   <div class="fw-stat"><div class="text-sm font-semibold text-slate-700 truncate"><?=h(mb_substr($stats['newest']['title']??'—',0,30))?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="clock" class="w-3 h-3"></i>Newest Recall</div></div>
 </div>
@@ -1507,21 +1513,21 @@ function view_dashboard():void{
 
 function view_recalls():void{
     $page=(int)($_GET['p']??1);
-    $f=['status'=>$_GET['status']??'ongoing','state'=>$_GET['state']??'','category'=>$_GET['cat']??'','hazard'=>$_GET['haz']??'','agency'=>$_GET['agency']??'','q'=>$_GET['q']??'','sort'=>$_GET['sort']??'date','severity'=>$_GET['sev']??''];
+    $f=['status'=>$_GET['status']??'all','state'=>$_GET['state']??'','category'=>$_GET['cat']??'','hazard'=>$_GET['haz']??'','agency'=>$_GET['agency']??'','q'=>$_GET['q']??'','sort'=>$_GET['sort']??'date','severity'=>$_GET['sev']??''];
     $data=q_recalls($page,25,$f);
     $agencies=db()->query('SELECT id,code,name FROM agencies ORDER BY code')->fetchAll();
     $cats=db()->query('SELECT id,name,slug FROM food_categories ORDER BY name')->fetchAll();
     $hazs=db()->query('SELECT id,name,type FROM hazards ORDER BY type,name')->fetchAll();
 
-    layout_head('Active Recalls','recalls'); ?>
+    layout_head('Recalls','recalls'); ?>
 <!-- Filters -->
 <form method="get" class="bg-white border border-slate-200 rounded-lg p-4 mb-4 grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
   <input type="hidden" name="page" value="recalls">
   <select name="status" class="text-sm border border-slate-300 rounded px-2 py-1.5">
-    <option value="ongoing" <?=$f['status']==='ongoing'?'selected':''?>>Active</option>
+    <option value="all" <?=in_array($f['status'],['all',''])?'selected':''?>>All Statuses</option>
+    <option value="ongoing" <?=$f['status']==='ongoing'?'selected':''?>>Active Only</option>
     <option value="completed" <?=$f['status']==='completed'?'selected':''?>>Completed</option>
     <option value="terminated" <?=$f['status']==='terminated'?'selected':''?>>Terminated</option>
-    <option value="" <?=$f['status']===''?'selected':''?>>All Statuses</option>
   </select>
   <select name="sev" class="text-sm border border-slate-300 rounded px-2 py-1.5">
     <option value="">All Severities</option>
