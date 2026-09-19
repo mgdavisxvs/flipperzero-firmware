@@ -9,8 +9,8 @@ declare(strict_types=1);
 // ================================================================
 // § CONSTANTS
 // ================================================================
-const FW_VERSION    = '1.0.0';
-const FW_SCHEMA_VER = 6;
+const FW_VERSION    = '2.0.0';
+const FW_SCHEMA_VER = 8;
 const FW_DATA_DIR   = __DIR__ . '/data';
 const FW_DB_PATH    = __DIR__ . '/data/foodwatch.db';
 const FW_LAMBDA     = 0.01;   // daily decay; half-life ≈69 days
@@ -192,7 +192,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -412,6 +412,30 @@ CREATE TABLE IF NOT EXISTS api_health(
   last_check TEXT,last_success TEXT,last_status INTEGER,
   consecutive_failures INTEGER NOT NULL DEFAULT 0,notes TEXT);
 INSERT OR IGNORE INTO api_health(agency_code)VALUES('FDA'),('FSIS');
+SQL; }
+
+function m7():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS subscriptions(
+  id INTEGER PRIMARY KEY,email TEXT NOT NULL,
+  filter_json TEXT NOT NULL DEFAULT '{}',
+  active INTEGER NOT NULL DEFAULT 1,
+  token TEXT NOT NULL UNIQUE,
+  confirmed INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT(datetime('now')),
+  last_sent_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_sub_email ON subscriptions(email);
+CREATE INDEX IF NOT EXISTS idx_sub_token ON subscriptions(token);
+SQL; }
+
+function m8():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS recall_velocity(
+  id INTEGER PRIMARY KEY,
+  computed_date TEXT NOT NULL UNIQUE,
+  rate_30d INTEGER NOT NULL DEFAULT 0,
+  rate_90d INTEGER NOT NULL DEFAULT 0,
+  baseline_monthly REAL NOT NULL DEFAULT 0,
+  z_score REAL NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT(datetime('now')));
 SQL; }
 
 // ================================================================
@@ -1052,6 +1076,175 @@ function q_search(string $q,int $limit=50):array{
     $stmt->execute($ids);return $stmt->fetchAll();
 }
 
+function q_manufacturers(int $limit=100):array{
+    $stmt=db()->prepare("
+        SELECT m.id,m.name,m.city,m.state,
+          COUNT(DISTINCT rm.recall_id) as total_recalls,
+          COUNT(DISTINCT CASE WHEN r.status='ongoing' THEN rm.recall_id END) as active_recalls,
+          COUNT(DISTINCT CASE WHEN r.severity>=3.0 THEN rm.recall_id END) as severe_recalls,
+          ROUND(SUM(COALESCE(re.event_risk,0)),3) as total_risk,
+          MIN(r.announced_date) as first_recall,
+          MAX(r.announced_date) as last_recall,
+          GROUP_CONCAT(DISTINCT CASE WHEN r.severity>=3.0 THEN r.title END) as severe_titles
+        FROM manufacturers m
+        JOIN recall_manufacturers rm ON rm.manufacturer_id=m.id
+        JOIN recalls r ON r.id=rm.recall_id
+        LEFT JOIN retail_exposures re ON re.recall_id=r.id
+        GROUP BY m.id
+        HAVING COUNT(DISTINCT rm.recall_id)>=1
+        ORDER BY severe_recalls DESC,total_recalls DESC
+        LIMIT ?");
+    $stmt->execute([$limit]);return $stmt->fetchAll();
+}
+
+function q_recall_trend(int $weeks=52):array{
+    $since=date('Y-m-d',strtotime("-$weeks weeks"));
+    $stmt=db()->prepare("
+        SELECT strftime('%Y-%W',announced_date) as week_key,
+          COUNT(*) as total,
+          SUM(CASE WHEN severity>=3.0 THEN 1 ELSE 0 END) as severe,
+          SUM(CASE WHEN agency_id=(SELECT id FROM agencies WHERE code='FDA') THEN 1 ELSE 0 END) as fda_count,
+          SUM(CASE WHEN agency_id=(SELECT id FROM agencies WHERE code='FSIS') THEN 1 ELSE 0 END) as fsis_count,
+          MIN(announced_date) as week_start
+        FROM recalls
+        WHERE announced_date>=?
+        GROUP BY week_key ORDER BY week_key");
+    $stmt->execute([$since]);return $stmt->fetchAll();
+}
+
+function q_velocity():array{
+    $r30=(int)db()->query("SELECT COUNT(*) FROM recalls WHERE announced_date>=date('now','-30 days')")->fetchColumn();
+    $r90=(int)db()->query("SELECT COUNT(*) FROM recalls WHERE announced_date>=date('now','-90 days')")->fetchColumn();
+    $r90p=(int)db()->query("SELECT COUNT(*) FROM recalls WHERE announced_date>=date('now','-180 days') AND announced_date<date('now','-90 days')")->fetchColumn();
+    $baseline=round($r90p/3.0,1);
+    $z_score=$baseline>0?round(($r30-$baseline)/max(1,sqrt($baseline)),2):0.0;
+    $cat_stmt=db()->query("SELECT fc.name,COUNT(DISTINCT r.id) as cnt FROM recalls r JOIN food_categories fc ON fc.id=r.food_category_id WHERE r.announced_date>=date('now','-30 days') GROUP BY fc.id ORDER BY cnt DESC LIMIT 5");
+    return['rate_30d'=>$r30,'rate_90d'=>$r90,'baseline_monthly'=>$baseline,'z_score'=>$z_score,'trending_cats'=>$cat_stmt->fetchAll()];
+}
+
+function q_seasonal():array{
+    $stmt=db()->query("
+        SELECT strftime('%m',announced_date) as month,
+          strftime('%Y',announced_date) as year,
+          COUNT(*) as total,
+          SUM(CASE WHEN severity>=3.0 THEN 1 ELSE 0 END) as severe
+        FROM recalls
+        WHERE announced_date IS NOT NULL AND announced_date!=''
+        GROUP BY year,month ORDER BY year,month");
+    return $stmt->fetchAll();
+}
+
+function q_sankey_data():array{
+    $links=[];
+    // Manufacturer → Category flows
+    $stmt=db()->query("
+        SELECT m.name as src,fc.name as tgt,'mfr_cat' as link_type,COUNT(*) as value
+        FROM recall_manufacturers rm
+        JOIN manufacturers m ON m.id=rm.manufacturer_id
+        JOIN recalls r ON r.id=rm.recall_id
+        JOIN food_categories fc ON fc.id=r.food_category_id
+        GROUP BY m.name,fc.name HAVING COUNT(*)>=1");
+    foreach($stmt->fetchAll() as $r)$links[]=$r;
+    // Category → Retailer flows
+    $stmt=db()->query("
+        SELECT fc.name as src,rt.name as tgt,'cat_ret' as link_type,COUNT(*) as value
+        FROM recalls r
+        JOIN food_categories fc ON fc.id=r.food_category_id
+        JOIN recall_retailers rr ON rr.recall_id=r.id
+        JOIN retailers rt ON rt.id=rr.retailer_id
+        GROUP BY fc.name,rt.name HAVING COUNT(*)>=1");
+    foreach($stmt->fetchAll() as $r)$links[]=$r;
+    return $links;
+}
+
+function q_timeline_data(int $limit=60):array{
+    $stmt=db()->prepare("
+        SELECT r.id,r.title,r.severity,r.severity_label,r.classification,
+          r.announced_date,r.status_updated_date,r.status,r.food_category_id,
+          a.code as agency_code, fc.name as category_name
+        FROM recalls r
+        JOIN agencies a ON a.id=r.agency_id
+        LEFT JOIN food_categories fc ON fc.id=r.food_category_id
+        WHERE r.announced_date IS NOT NULL AND r.announced_date!=''
+        ORDER BY r.announced_date ASC
+        LIMIT ?");
+    $stmt->execute([$limit]);return $stmt->fetchAll();
+}
+
+function q_geo_risk():array{
+    $stmt=db()->query("
+        SELECT rs.state_code,
+          COUNT(DISTINCT rs.recall_id) as total,
+          COUNT(DISTINCT CASE WHEN rc.status='ongoing' THEN rs.recall_id END) as active,
+          ROUND(SUM(COALESCE(re.event_risk,rc.severity*0.25)),3) as risk_score,
+          SUM(CASE WHEN rc.severity>=3.0 THEN 1 ELSE 0 END) as severe
+        FROM recall_states rs
+        JOIN recalls rc ON rc.id=rs.recall_id
+        LEFT JOIN retail_exposures re ON re.recall_id=rs.recall_id
+        WHERE rs.state_code!='nationwide'
+        GROUP BY rs.state_code");
+    $rows=$stmt->fetchAll();
+    $out=[];foreach($rows as $r)$out[$r['state_code']]=$r;
+    return $out;
+}
+
+// Email alert helpers
+function subscription_token():string{ return bin2hex(random_bytes(16)); }
+
+function send_email_alerts():array{
+    $stmt=db()->query("SELECT * FROM subscriptions WHERE active=1");
+    $subs=$stmt->fetchAll();
+    $sent=0;$errors=[];
+    foreach($subs as $sub){
+        $f=json_decode($sub['filter_json']??'{}',true)??[];
+        $since=$sub['last_sent_at']??date('Y-m-d',strtotime('-7 days'));
+        $w=["r.announced_date>?"];$p=[$since];
+        if(!empty($f['status']))$w[]="r.status=?";if(!empty($f['status']))$p[]=$f['status'];
+        if(!empty($f['severity']))$w[]="r.severity>=?";if(!empty($f['severity']))$p[]=(float)$f['severity'];
+        if(!empty($f['state'])){$w[]="r.id IN(SELECT recall_id FROM recall_states WHERE state_code=?)";$p[]=$f['state'];}
+        if(!empty($f['category'])){$w[]="r.food_category_id=?";$p[]=(int)$f['category'];}
+        $where='WHERE '.implode(' AND ',$w);
+        $rs=db()->prepare("SELECT r.id,r.title,r.severity,r.classification,r.announced_date,a.code as agency FROM recalls r JOIN agencies a ON a.id=r.agency_id $where ORDER BY r.announced_date DESC LIMIT 20");
+        $rs->execute($p);$recalls=$rs->fetchAll();
+        if(!$recalls)continue;
+        $body='<html><body style="font-family:sans-serif;max-width:600px;margin:0 auto">';
+        $body.='<h2 style="color:#3b5bdb">FoodWatch US Alert</h2>';
+        $body.='<p>'.count($recalls).' new recall(s) match your subscription criteria since '.date('M j, Y',strtotime($since)).':</p>';
+        $body.='<table style="width:100%;border-collapse:collapse">';
+        $body.='<tr><th style="text-align:left;padding:6px;background:#f1f5f9">Class</th><th style="text-align:left;padding:6px;background:#f1f5f9">Product</th><th style="text-align:left;padding:6px;background:#f1f5f9">Agency</th><th style="text-align:left;padding:6px;background:#f1f5f9">Date</th></tr>';
+        foreach($recalls as $rc){
+            $clr=$rc['severity']>=3.0?'#dc2626':($rc['severity']>=2.0?'#d97706':'#16a34a');
+            $body.='<tr><td style="padding:5px;color:'.$clr.';font-weight:bold">'.htmlspecialchars($rc['classification']??'').'</td><td style="padding:5px">'.htmlspecialchars(mb_substr($rc['title'],0,70)).'</td><td style="padding:5px">'.htmlspecialchars($rc['agency']).'</td><td style="padding:5px">'.htmlspecialchars($rc['announced_date']).'</td></tr>';
+        }
+        $body.='</table><hr><p style="font-size:11px;color:#64748b">Unsubscribe: '.($_SERVER['HTTP_HOST']??'').'?api=subscription_del&token='.urlencode($sub['token']).'</p></body></html>';
+        $headers="From: FoodWatch US <alerts@foodwatch-us.com>\r\nContent-Type: text/html; charset=utf-8\r\nMIME-Version: 1.0\r\n";
+        if(@mail($sub['email'],'FoodWatch US Alert: '.count($recalls).' new recall(s)',$body,$headers)){
+            db()->prepare("UPDATE subscriptions SET last_sent_at=datetime('now') WHERE id=?")->execute([$sub['id']]);
+            $sent++;
+        }else{
+            $errors[]='Failed to send to '.$sub['email'];
+        }
+    }
+    return['sent'=>$sent,'errors'=>$errors];
+}
+
+// UPC/barcode lookup via Open Food Facts
+function barcode_lookup(string $upc):array{
+    $upc=preg_replace('/[^0-9]/','',$upc);
+    if(!$upc)return['error'=>'Invalid UPC'];
+    // Check recall DB first
+    $stmt=db()->prepare("SELECT rp.upc,rp.description,r.id,r.title,r.status,r.severity,r.classification,r.announced_date FROM recall_products rp JOIN recalls r ON r.id=rp.recall_id WHERE rp.upc=? LIMIT 10");
+    $stmt->execute([$upc]);$recall_matches=$stmt->fetchAll();
+    // Query Open Food Facts
+    $off=fw_fetch("https://world.openfoodfacts.org/api/v0/product/$upc.json",[],10);
+    $product=null;
+    if($off['ok']&&isset($off['data']['product']['product_name'])){
+        $p=$off['data']['product'];
+        $product=['name'=>$p['product_name']??'','brand'=>$p['brands']??'','category'=>$p['categories']??'','image'=>$p['image_url']??'','quantity'=>$p['quantity']??''];
+    }
+    return['upc'=>$upc,'recall_matches'=>$recall_matches,'product'=>$product];
+}
+
 // ================================================================
 // § SELF-TEST SUITE
 // ================================================================
@@ -1224,17 +1417,25 @@ function route():void{
     }
 
     switch($p){
-        case 'dashboard': render_page('dashboard');break;
-        case 'recalls':   render_page('recalls');break;
-        case 'recall':    render_page('recall');break;
-        case 'retailers': render_page('retailers');break;
-        case 'categories':render_page('categories');break;
-        case 'geo':       render_page('geo');break;
-        case 'search':    render_page('search');break;
-        case 'watchlist': render_page('watchlist');break;
-        case 'tests':     render_page('tests');break;
-        case 'admin':     render_page('admin');break;
-        default:          render_page('dashboard');
+        case 'dashboard':     render_page('dashboard');break;
+        case 'recalls':       render_page('recalls');break;
+        case 'recall':        render_page('recall');break;
+        case 'retailers':     render_page('retailers');break;
+        case 'manufacturers': render_page('manufacturers');break;
+        case 'categories':    render_page('categories');break;
+        case 'analytics':     render_page('analytics');break;
+        case 'map':           render_page('map');break;
+        case 'timeline':      render_page('timeline');break;
+        case 'sankey':        render_page('sankey');break;
+        case 'graph3d':       render_page('graph3d');break;
+        case 'geo':           render_page('geo');break;
+        case 'barcode':       render_page('barcode');break;
+        case 'subscriptions': render_page('subscriptions');break;
+        case 'search':        render_page('search');break;
+        case 'watchlist':     render_page('watchlist');break;
+        case 'tests':         render_page('tests');break;
+        case 'admin':         render_page('admin');break;
+        default:              render_page('dashboard');
     }
 }
 
@@ -1279,6 +1480,67 @@ function handle_api(string $api):void{
             case 'dq':       if(!is_admin())fw_abort('Unauthorized',403);
                 $stmt=db()->query('SELECT flag_type,severity,COUNT(*) as cnt FROM data_quality_flags WHERE resolved=0 GROUP BY flag_type,severity ORDER BY cnt DESC');
                 echo js($stmt->fetchAll());break;
+            case 'manufacturers':echo js(q_manufacturers((int)($_GET['limit']??100)));break;
+            case 'trend':    echo js(q_recall_trend((int)($_GET['weeks']??52)));break;
+            case 'velocity': echo js(q_velocity());break;
+            case 'seasonal': echo js(q_seasonal());break;
+            case 'sankey':   echo js(q_sankey_data());break;
+            case 'timeline_data':echo js(q_timeline_data((int)($_GET['limit']??60)));break;
+            case 'geo_risk': echo js(array_values(q_geo_risk()));break;
+            case 'barcode':
+                $upc=preg_replace('/[^0-9]/','',trim($_GET['upc']??''));
+                echo js($upc?barcode_lookup($upc):['error'=>'No UPC provided']);break;
+            case 'subscription_add':
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $email=trim($_POST['email']??'');
+                if(!filter_var($email,FILTER_VALIDATE_EMAIL))fw_abort('Invalid email',400);
+                $f=['status'=>$_POST['status']??'','severity'=>$_POST['severity']??'','state'=>$_POST['state']??'','category'=>$_POST['category']??''];
+                $f=array_filter($f);
+                $tok=subscription_token();
+                db()->prepare("INSERT OR IGNORE INTO subscriptions(email,filter_json,token)VALUES(?,?,?)")->execute([$email,json_encode($f),$tok]);
+                echo js(['ok'=>true,'message'=>"Subscribed $email"]);break;
+            case 'subscription_del':
+                $tok=trim($_GET['token']??$_POST['token']??'');
+                if($tok)db()->prepare("UPDATE subscriptions SET active=0 WHERE token=?")->execute([$tok]);
+                echo js(['ok'=>true]);break;
+            case 'subscriptions':
+                if(!is_admin())fw_abort('Unauthorized',403);
+                $stmt=db()->query('SELECT id,email,filter_json,active,created_at,last_sent_at FROM subscriptions ORDER BY created_at DESC');
+                echo js($stmt->fetchAll());break;
+            case 'send_alerts':
+                if(!is_admin())fw_abort('Unauthorized',403);
+                echo js(send_email_alerts());break;
+            case 'poll_status':
+                if(!is_admin())fw_abort('Unauthorized',403);
+                // Re-fetch ongoing recalls from FDA and update status
+                $ongoing=db()->query("SELECT source_id FROM recalls WHERE status='ongoing' AND agency_id=(SELECT id FROM agencies WHERE code='FDA') LIMIT 20")->fetchAll(PDO::FETCH_COLUMN);
+                $updated=0;
+                foreach($ongoing as $src_id){
+                    $res=fw_fetch(FDA_API,['search'=>"recall_number:\"$src_id\"","limit"=>1],10);
+                    if($res['ok']&&!empty($res['data']['results'][0])){
+                        $raw=$res['data']['results'][0];
+                        $new_status=strtolower($raw['status']??'ongoing');
+                        $db_status=match($new_status){'completed'=>'completed','terminated'=>'terminated',default=>'ongoing'};
+                        $r=db()->prepare("UPDATE recalls SET status=?,updated_at=datetime('now') WHERE source_id=? AND agency_id=(SELECT id FROM agencies WHERE code='FDA') AND status!='completed'");
+                        $r->execute([$db_status,$src_id]);
+                        if($r->rowCount())$updated++;
+                    }
+                }
+                echo js(['ok'=>true,'polled'=>count($ongoing),'updated'=>$updated]);break;
+            case 'export_pdf':
+                // Returns HTML fragment for print/PDF
+                $f=['status'=>$_GET['status']??'all','q'=>$_GET['q']??''];
+                $data=q_recalls(1,100,$f);
+                header('Content-Type: text/html; charset=utf-8');
+                echo '<!DOCTYPE html><html><head><title>FoodWatch US Export</title>';
+                echo '<style>body{font-family:sans-serif;font-size:11px}table{width:100%;border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px}th{background:#f1f5f9;font-weight:600}h1{font-size:16px}</style></head><body>';
+                echo '<h1>FoodWatch US — Recall Export ('.date('Y-m-d').')</h1>';
+                echo '<table><thead><tr><th>Class</th><th>Product</th><th>Agency</th><th>Category</th><th>Date</th><th>Status</th></tr></thead><tbody>';
+                foreach($data['records'] as $r){
+                    echo '<tr><td>'.htmlspecialchars($r['classification']??'').'</td><td>'.htmlspecialchars(mb_substr($r['title'],0,80)).'</td><td>'.htmlspecialchars($r['agency_code']).'</td><td>'.htmlspecialchars($r['category_name']??'').'</td><td>'.htmlspecialchars($r['announced_date']??'').'</td><td>'.htmlspecialchars($r['status']).'</td></tr>';
+                }
+                echo '</tbody></table><script>window.print()</script></body></html>';
+                exit;
             default:         fw_abort('Unknown API endpoint',404);
         }
     }catch(\Throwable $e){
@@ -1323,6 +1585,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc}
 .fw-table th{@apply px-3 py-2 text-left text-xs font-semibold text-slate-500 uppercase tracking-wide bg-slate-50 border-b border-slate-200}
 .fw-table td{@apply px-3 py-2 text-sm text-slate-700 border-b border-slate-100}
 .fw-table tr:hover td{@apply bg-slate-50}
+@media print{nav,form,button,.no-print{display:none!important}main{margin-left:0!important}body{background:#fff}}
 </style>
 </head>
 <body class="h-full" x-data>
@@ -1338,10 +1601,20 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc}
   </div>
   <div class="flex-1 py-3 px-2 space-y-0.5 overflow-y-auto">
     <a href="?" class="fw-nav-link <?=$page==='dashboard'?'active':''?>"><i data-lucide="layout-dashboard" class="w-4 h-4"></i>Dashboard</a>
-    <a href="?page=recalls" class="fw-nav-link <?=$page==='recalls'?'active':''?>"><i data-lucide="alert-triangle" class="w-4 h-4"></i>Active Recalls</a>
+    <a href="?page=recalls" class="fw-nav-link <?=$page==='recalls'?'active':''?>"><i data-lucide="alert-triangle" class="w-4 h-4"></i>Recalls</a>
     <a href="?page=retailers" class="fw-nav-link <?=$page==='retailers'?'active':''?>"><i data-lucide="store" class="w-4 h-4"></i>Retailer Exposure</a>
+    <a href="?page=manufacturers" class="fw-nav-link <?=$page==='manufacturers'?'active':''?>"><i data-lucide="factory" class="w-4 h-4"></i>Manufacturers</a>
     <a href="?page=categories" class="fw-nav-link <?=$page==='categories'?'active':''?>"><i data-lucide="tag" class="w-4 h-4"></i>Food Categories</a>
-    <a href="?page=geo" class="fw-nav-link <?=$page==='geo'?'active':''?>"><i data-lucide="map" class="w-4 h-4"></i>Geographic View</a>
+    <div class="text-xs text-slate-500 px-3 pt-3 pb-1 uppercase tracking-wider font-semibold">Analysis</div>
+    <a href="?page=analytics" class="fw-nav-link <?=$page==='analytics'?'active':''?>"><i data-lucide="trending-up" class="w-4 h-4"></i>Trends &amp; Velocity</a>
+    <a href="?page=map" class="fw-nav-link <?=$page==='map'?'active':''?>"><i data-lucide="map" class="w-4 h-4"></i>Choropleth Map</a>
+    <a href="?page=timeline" class="fw-nav-link <?=$page==='timeline'?'active':''?>"><i data-lucide="gantt-chart" class="w-4 h-4"></i>Timeline / Gantt</a>
+    <a href="?page=sankey" class="fw-nav-link <?=$page==='sankey'?'active':''?>"><i data-lucide="git-merge" class="w-4 h-4"></i>Sankey Flow</a>
+    <a href="?page=graph3d" class="fw-nav-link <?=$page==='graph3d'?'active':''?>"><i data-lucide="globe" class="w-4 h-4"></i>3D Force Graph</a>
+    <a href="?page=geo" class="fw-nav-link <?=$page==='geo'?'active':''?>"><i data-lucide="bar-chart" class="w-4 h-4"></i>State Table</a>
+    <div class="text-xs text-slate-500 px-3 pt-3 pb-1 uppercase tracking-wider font-semibold">Tools</div>
+    <a href="?page=barcode" class="fw-nav-link <?=$page==='barcode'?'active':''?>"><i data-lucide="scan-barcode" class="w-4 h-4"></i>Barcode Lookup</a>
+    <a href="?page=subscriptions" class="fw-nav-link <?=$page==='subscriptions'?'active':''?>"><i data-lucide="mail" class="w-4 h-4"></i>Email Alerts</a>
     <a href="?page=search" class="fw-nav-link <?=$page==='search'?'active':''?>"><i data-lucide="search" class="w-4 h-4"></i>Search</a>
     <a href="?page=watchlist" class="fw-nav-link <?=$page==='watchlist'?'active':''?>"><i data-lucide="bell" class="w-4 h-4"></i>Watchlist</a>
     <div class="border-t border-slate-700 my-2 pt-2">
@@ -1375,17 +1648,25 @@ function layout_foot():void{ ?>
 // ================================================================
 function render_page(string $p):void{
     match($p){
-        'dashboard' =>view_dashboard(),
-        'recalls'   =>view_recalls(),
-        'recall'    =>view_recall_detail(),
-        'retailers' =>view_retailers(),
-        'categories'=>view_categories(),
-        'geo'       =>view_geo(),
-        'search'    =>view_search(),
-        'watchlist' =>view_watchlist(),
-        'tests'     =>view_tests(),
-        'admin'     =>view_admin(),
-        default     =>view_dashboard(),
+        'dashboard'     =>view_dashboard(),
+        'recalls'       =>view_recalls(),
+        'recall'        =>view_recall_detail(),
+        'retailers'     =>view_retailers(),
+        'manufacturers' =>view_manufacturers(),
+        'categories'    =>view_categories(),
+        'analytics'     =>view_analytics(),
+        'map'           =>view_map(),
+        'timeline'      =>view_timeline(),
+        'sankey'        =>view_sankey(),
+        'graph3d'       =>view_graph3d(),
+        'geo'           =>view_geo(),
+        'barcode'       =>view_barcode(),
+        'subscriptions' =>view_subscriptions(),
+        'search'        =>view_search(),
+        'watchlist'     =>view_watchlist(),
+        'tests'         =>view_tests(),
+        'admin'         =>view_admin(),
+        default         =>view_dashboard(),
     };
 }
 
@@ -2167,6 +2448,649 @@ function view_admin():void{
   </table>
 </div>
 <?php endif; ?>
+<?php layout_foot(); }
+
+// ================================================================
+// § NEW VIEWS — v2.0
+// ================================================================
+
+function view_manufacturers():void{
+    $mfrs=q_manufacturers(100);
+    $max_recalls=max(1,...array_column($mfrs,'total_recalls'));
+    layout_head('Manufacturer Profiles','manufacturers'); ?>
+<div class="mb-4 text-sm text-slate-600">
+  <strong>Repeat-Offender Analysis</strong> — manufacturers ranked by total recall count and severe (Class I) events. Risk score = Σ EventRisk across all linked retail exposures.
+</div>
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-x-auto mb-4">
+  <table class="fw-table w-full min-w-max">
+    <thead><tr>
+      <th>Manufacturer</th><th>Location</th>
+      <th>Recalls (Total)</th><th title="Class I">Severe</th>
+      <th>Active</th><th>Risk Score</th>
+      <th>First Recall</th><th>Latest Recall</th>
+    </tr></thead>
+    <tbody>
+    <?php foreach($mfrs as $m): ?>
+    <?php $r=(float)($m['total_risk']??0);$pct=min(100,round((int)$m['total_recalls']/$max_recalls*100)); ?>
+    <tr>
+      <td class="font-medium"><?=h($m['name'])?></td>
+      <td class="text-xs text-slate-500"><?=h(trim(($m['city']??'').($m['state']?', '.$m['state']:'')))?></td>
+      <td>
+        <div class="flex items-center gap-2">
+          <span class="font-bold <?=(int)$m['total_recalls']>=3?'text-red-600':''?>"><?=(int)$m['total_recalls']?></span>
+          <div class="h-2 rounded bg-slate-100 flex-1 max-w-24"><div class="h-2 rounded bg-fw-500" style="width:<?=$pct?>%"></div></div>
+        </div>
+      </td>
+      <td class="text-center font-bold <?=$m['severe_recalls']>0?'text-red-600':'text-slate-300'?>"><?=(int)$m['severe_recalls']?></td>
+      <td class="text-center font-bold <?=$m['active_recalls']>0?'text-orange-600':'text-slate-300'?>"><?=(int)$m['active_recalls']?></td>
+      <td class="text-center text-xs <?=$r>3?'text-red-600 font-semibold':($r>1?'text-orange-500':'text-slate-600')?>"><?=number_format($r,2)?></td>
+      <td class="text-xs"><?=h($m['first_recall']??'—')?></td>
+      <td class="text-xs"><?=h($m['last_recall']??'—')?></td>
+    </tr>
+    <?php endforeach; ?>
+    <?php if(empty($mfrs)): ?><tr><td colspan="8" class="text-center py-8 text-slate-400">No manufacturer data. Run ingestion first.</td></tr><?php endif; ?>
+    </tbody>
+  </table>
+</div>
+<?php layout_foot(); }
+
+function view_analytics():void{
+    $trend=q_recall_trend(52);
+    $velocity=q_velocity();
+    $seasonal=q_seasonal();
+    layout_head('Trends & Velocity','analytics'); ?>
+
+<!-- Velocity Indicator -->
+<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+  <?php
+  $z=$velocity['z_score'];
+  $zcolor=$z>2?'text-red-600 font-bold':($z>1?'text-orange-500 font-semibold':($z<-1?'text-green-600':'text-slate-700'));
+  $signal=$z>2?'⬆ HIGH ACTIVITY':($z>1?'⬆ Elevated':($z<-1?'⬇ Below baseline':'→ Normal'));
+  ?>
+  <div class="fw-stat"><div class="text-3xl font-bold text-slate-800"><?=(int)$velocity['rate_30d']?></div><div class="text-xs text-slate-500 mt-1">Recalls (last 30d)</div></div>
+  <div class="fw-stat"><div class="text-3xl font-bold text-slate-800"><?=(int)$velocity['rate_90d']?></div><div class="text-xs text-slate-500 mt-1">Recalls (last 90d)</div></div>
+  <div class="fw-stat"><div class="text-3xl font-bold text-slate-600"><?=number_format($velocity['baseline_monthly'],1)?></div><div class="text-xs text-slate-500 mt-1">Monthly baseline (prior 90d)</div></div>
+  <div class="fw-stat"><div class="text-3xl font-bold <?=$zcolor?>"><?=number_format($z,2)?> σ</div><div class="text-xs text-slate-500 mt-1"><?=h($signal)?></div></div>
+</div>
+
+<?php if(!empty($velocity['trending_cats'])): ?>
+<div class="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 text-sm text-amber-800 flex items-center gap-3">
+  <i data-lucide="flame" class="w-4 h-4 flex-shrink-0"></i>
+  <span><strong>Trending in last 30 days:</strong>
+  <?php foreach($velocity['trending_cats'] as $i=>$tc): ?><?=$i?', ':''?><?=h($tc['name'])?> (<?=(int)$tc['cnt']?>)<?php endforeach; ?></span>
+</div>
+<?php endif; ?>
+
+<!-- Trend chart -->
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm mb-6">
+  <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+    <h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="trending-up" class="w-4 h-4 text-blue-500"></i>Weekly Recall Volume (52 weeks)</h2>
+  </div>
+  <div id="trend-chart" class="p-4" style="height:240px"></div>
+</div>
+
+<!-- Seasonal Heatmap -->
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm">
+  <div class="px-4 py-3 border-b border-slate-200">
+    <h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="calendar" class="w-4 h-4 text-green-500"></i>Seasonal Heatmap — Recalls by Month</h2>
+    <p class="text-xs text-slate-500 mt-0.5">Each cell = recall count for that month/year. Darker = more recalls.</p>
+  </div>
+  <div id="heatmap-chart" class="p-4 overflow-x-auto"></div>
+</div>
+
+<script>
+(function(){
+  // Trend chart
+  const trend=<?=js($trend)?>;
+  if(trend.length){
+    const el=document.getElementById('trend-chart');
+    const W=el.offsetWidth||700,H=200,m={top:10,right:15,bottom:30,left:35};
+    const svg=d3.select('#trend-chart').append('svg').attr('width','100%').attr('height',H+m.top+m.bottom);
+    const g=svg.append('g').attr('transform',`translate(${m.left},${m.top})`);
+    const iw=W-m.left-m.right,ih=H;
+    const x=d3.scalePoint().domain(trend.map(d=>d.week_key)).range([0,iw]).padding(0.1);
+    const maxT=d3.max(trend,d=>+d.total)||1;
+    const y=d3.scaleLinear().domain([0,maxT]).range([ih,0]);
+    // Area
+    const area=d3.area().x(d=>x(d.week_key)).y0(ih).y1(d=>y(+d.total)).curve(d3.curveCatmullRom);
+    const line=d3.line().x(d=>x(d.week_key)).y(d=>y(+d.total)).curve(d3.curveCatmullRom);
+    g.append('defs').append('linearGradient').attr('id','areaGrad').attr('x1','0').attr('y1','0').attr('x2','0').attr('y2','1')
+      .selectAll('stop').data([{offset:'0%',color:'#3b5bdb',opacity:0.3},{offset:'100%',color:'#3b5bdb',opacity:0.02}])
+      .enter().append('stop').attr('offset',d=>d.offset).attr('stop-color',d=>d.color).attr('stop-opacity',d=>d.opacity);
+    g.append('path').datum(trend).attr('fill','url(#areaGrad)').attr('d',area);
+    g.append('path').datum(trend).attr('fill','none').attr('stroke','#3b5bdb').attr('stroke-width',2).attr('d',line);
+    // Severe overlay
+    const lineS=d3.line().x(d=>x(d.week_key)).y(d=>y(+d.severe)).curve(d3.curveCatmullRom);
+    g.append('path').datum(trend).attr('fill','none').attr('stroke','#dc2626').attr('stroke-width',1.5).attr('stroke-dasharray','4,2').attr('d',lineS);
+    g.append('g').attr('transform',`translate(0,${ih})`).call(d3.axisBottom(x).tickValues(x.domain().filter((_,i)=>i%4===0)).tickFormat(d=>d.substring(5))).selectAll('text').attr('font-size','9').attr('transform','rotate(-35)').attr('text-anchor','end');
+    g.append('g').call(d3.axisLeft(y).ticks(4).tickFormat(d3.format('d'))).selectAll('text').attr('font-size','10');
+    // Legend
+    const leg=svg.append('g').attr('transform',`translate(${m.left+iw-120},${m.top+8})`);
+    leg.append('line').attr('x1',0).attr('x2',18).attr('stroke','#3b5bdb').attr('stroke-width',2);
+    leg.append('text').attr('x',22).attr('y',4).attr('font-size','10').attr('fill','#475569').text('Total');
+    leg.append('line').attr('x1',60).attr('x2',78).attr('stroke','#dc2626').attr('stroke-width',1.5).attr('stroke-dasharray','4,2');
+    leg.append('text').attr('x',82).attr('y',4).attr('font-size','10').attr('fill','#475569').text('Class I');
+  }else{
+    document.getElementById('trend-chart').innerHTML='<p class="text-sm text-slate-400 text-center py-8">No trend data yet. Run ingestion first.</p>';
+  }
+
+  // Seasonal heatmap
+  const seas=<?=js($seasonal)?>;
+  if(seas.length){
+    const years=[...new Set(seas.map(d=>d.year))].sort();
+    const months=['01','02','03','04','05','06','07','08','09','10','11','12'];
+    const mNames=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const lookup={};seas.forEach(d=>lookup[d.year+'-'+d.month]=+d.total);
+    const maxVal=d3.max(seas,d=>+d.total)||1;
+    const color=d3.scaleSequential([0,maxVal],d3.interpolateBlues);
+    const cw=Math.max(28,Math.min(50,Math.floor((document.getElementById('heatmap-chart').offsetWidth-80)/months.length)));
+    const ch=22;
+    const el=document.getElementById('heatmap-chart');
+    const W=80+cw*months.length,H=24+ch*years.length+20;
+    const svg=d3.select('#heatmap-chart').append('svg').attr('width',W).attr('height',H);
+    months.forEach((m,mi)=>svg.append('text').attr('x',80+mi*cw+cw/2).attr('y',14).attr('text-anchor','middle').attr('font-size','9').attr('fill','#64748b').text(mNames[mi]));
+    years.forEach((yr,yi)=>{
+      svg.append('text').attr('x',74).attr('y',30+yi*ch+ch/2+3).attr('text-anchor','end').attr('font-size','9').attr('fill','#64748b').text(yr);
+      months.forEach((mo,mi)=>{
+        const v=lookup[yr+'-'+mo]??0;
+        const g=svg.append('g').attr('transform',`translate(${80+mi*cw},${24+yi*ch})`);
+        g.append('rect').attr('width',cw-2).attr('height',ch-2).attr('rx',2).attr('fill',v?color(v):'#f1f5f9');
+        if(v)g.append('text').attr('x',(cw-2)/2).attr('y',(ch-2)/2+4).attr('text-anchor','middle').attr('font-size','9').attr('fill',v>maxVal*0.5?'#fff':'#334155').text(v);
+        g.append('title').text(`${mNames[mi]} ${yr}: ${v} recalls`);
+      });
+    });
+  }else{
+    document.getElementById('heatmap-chart').innerHTML='<p class="text-sm text-slate-400 text-center py-4">No data</p>';
+  }
+})();
+</script>
+<?php layout_foot(); }
+
+function view_map():void{
+    $geo_risk=q_geo_risk();
+    layout_head('Choropleth Map','map'); ?>
+<div class="mb-3 text-sm text-slate-600">US states colored by total recall count. Hover for details; click to filter recalls by state.</div>
+<div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+  <div class="lg:col-span-2 bg-white rounded-lg border border-slate-200 shadow-sm p-3">
+    <div id="us-map" style="width:100%;min-height:380px"></div>
+  </div>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3">Top States by Recall Count</h3>
+    <div id="state-list" class="space-y-1 max-h-80 overflow-y-auto text-sm"></div>
+    <div id="map-tooltip" class="hidden mt-3 p-3 bg-slate-50 rounded border border-slate-200 text-xs"></div>
+  </div>
+</div>
+<div class="mt-2 text-xs text-slate-500 flex items-center gap-4">
+  <span>Color scale: light = fewer recalls → dark blue = most recalls</span>
+  <span>Includes nationwide recalls in all states</span>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/topojson-client@3/dist/topojson.min.js"></script>
+<script>
+(function(){
+  const geoRisk=<?=js(array_values($geo_risk))?>;
+  const byState={};
+  geoRisk.forEach(d=>{byState[d.state_code]=d;});
+
+  // State list
+  const sorted=[...geoRisk].sort((a,b)=>+b.total-+a.total).slice(0,20);
+  const maxT=sorted[0]?+sorted[0].total:1;
+  const listEl=document.getElementById('state-list');
+  sorted.forEach(d=>{
+    const pct=Math.round(+d.total/maxT*100);
+    listEl.innerHTML+=`<div class="flex items-center gap-2 cursor-pointer hover:bg-slate-50 rounded px-1" onclick="location='?page=recalls&state=${d.state_code}'">
+      <span class="text-xs font-mono text-slate-500 w-6">${d.state_code}</span>
+      <div class="flex-1 h-2 bg-slate-100 rounded"><div class="h-2 bg-blue-600 rounded" style="width:${pct}%"></div></div>
+      <span class="text-xs font-semibold text-slate-700 w-6 text-right">${d.total}</span>
+    </div>`;
+  });
+
+  // Load TopoJSON and render map
+  fetch('https://cdn.jsdelivr.net/npm/us-atlas@3/states-10m.json')
+    .then(r=>r.json())
+    .then(us=>{
+      const states=topojson.feature(us,us.objects.states);
+      const fips={
+        '01':'AL','02':'AK','04':'AZ','05':'AR','06':'CA','08':'CO','09':'CT','10':'DE','11':'DC',
+        '12':'FL','13':'GA','15':'HI','16':'ID','17':'IL','18':'IN','19':'IA','20':'KS','21':'KY',
+        '22':'LA','23':'ME','24':'MD','25':'MA','26':'MI','27':'MN','28':'MS','29':'MO','30':'MT',
+        '31':'NE','32':'NV','33':'NH','34':'NJ','35':'NM','36':'NY','37':'NC','38':'ND','39':'OH',
+        '40':'OK','41':'OR','42':'PA','44':'RI','45':'SC','46':'SD','47':'TN','48':'TX','49':'UT',
+        '50':'VT','51':'VA','53':'WA','54':'WV','55':'WI','56':'WY','72':'PR','78':'VI'
+      };
+      const el=document.getElementById('us-map');
+      const W=el.offsetWidth||600;const H=Math.round(W*0.62);
+      const proj=d3.geoAlbersUsa().fitSize([W,H],states);
+      const path=d3.geoPath().projection(proj);
+      const maxV=d3.max(geoRisk,d=>+d.total)||1;
+      const color=d3.scaleSequential([0,maxV],d3.interpolateBlues);
+      const svg=d3.select('#us-map').append('svg').attr('width','100%').attr('viewBox',`0 0 ${W} ${H}`);
+      const tip=document.getElementById('map-tooltip');
+      svg.selectAll('path').data(states.features).enter().append('path')
+        .attr('d',path)
+        .attr('fill',d=>{const code=fips[String(+d.id).padStart(2,'0')];const info=byState[code];return info&&+info.total>0?color(+info.total):'#e2e8f0';})
+        .attr('stroke','#fff').attr('stroke-width',0.5)
+        .style('cursor','pointer')
+        .on('mouseover',function(e,d){
+          d3.select(this).attr('stroke','#1e3a5f').attr('stroke-width',1.5);
+          const code=fips[String(+d.id).padStart(2,'0')];
+          const info=byState[code]||{total:0,active:0,risk_score:0,severe:0};
+          tip.classList.remove('hidden');
+          tip.innerHTML=`<strong>${code||'?'}</strong><br>Total recalls: ${info.total||0}<br>Active: ${info.active||0}<br>Severe (Class I): ${info.severe||0}<br>Risk score: ${(+info.risk_score||0).toFixed(2)}`;
+        })
+        .on('mouseout',function(){d3.select(this).attr('stroke','#fff').attr('stroke-width',0.5);tip.classList.add('hidden');})
+        .on('click',(e,d)=>{const code=fips[String(+d.id).padStart(2,'0')];if(code)location='?page=recalls&state='+code;});
+      // State borders mesh
+      svg.append('path').datum(topojson.mesh(us,us.objects.states,(a,b)=>a!==b))
+        .attr('fill','none').attr('stroke','#fff').attr('stroke-width',0.5).attr('d',path);
+    })
+    .catch(()=>{document.getElementById('us-map').innerHTML='<p class="text-sm text-slate-400 text-center py-12">Map unavailable — check network connection.</p>';});
+})();
+</script>
+<?php layout_foot(); }
+
+function view_timeline():void{
+    $records=q_timeline_data(80);
+    layout_head('Timeline / Gantt','timeline'); ?>
+<div class="mb-3 flex items-center gap-3">
+  <div class="text-sm text-slate-600">Recall timeline from earliest to most recent. Bar width = duration active (min 3px). Color = severity class.</div>
+  <a href="?api=export_pdf&status=all" target="_blank" class="no-print ml-auto text-xs text-fw-500 border border-fw-500 rounded px-3 py-1 hover:bg-fw-50 flex items-center gap-1"><i data-lucide="printer" class="w-3 h-3"></i>Print / PDF</a>
+</div>
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
+  <div id="gantt-legend" class="flex items-center gap-4 text-xs text-slate-600 mb-3">
+    <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded bg-red-500"></span>Class I</span>
+    <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded bg-amber-400"></span>Class II</span>
+    <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded bg-green-500"></span>Class III</span>
+    <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded bg-slate-300"></span>Completed</span>
+  </div>
+  <div id="gantt-chart" style="overflow-x:auto"></div>
+</div>
+<script>
+(function(){
+  const raw=<?=js($records)?>;
+  if(!raw.length){document.getElementById('gantt-chart').innerHTML='<p class="text-sm text-slate-400 text-center py-8">No data</p>';return;}
+  const today=new Date();
+  const dates=raw.map(d=>new Date(d.announced_date)).filter(d=>!isNaN(d));
+  if(!dates.length)return;
+  const minD=new Date(Math.min(...dates)),maxD=today;
+  const W=Math.max(700,document.getElementById('gantt-chart').offsetWidth-20);
+  const rowH=22,labelW=200,m={top:30,right:20,bottom:10,left:labelW};
+  const H=rowH*raw.length;
+  const x=d3.scaleTime().domain([minD,maxD]).range([0,W-labelW-20]);
+  const color=d=>+d.severity>=3?'#ef4444':(+d.severity>=2?'#f59e0b':'#22c55e');
+  const colorFaded=d=>d.status==='completed'?'#cbd5e1':color(d);
+  const svg=d3.select('#gantt-chart').append('svg').attr('width',W).attr('height',H+m.top+m.bottom);
+  const g=svg.append('g').attr('transform',`translate(${m.left},${m.top})`);
+  // X-axis months
+  g.append('g').call(d3.axisTop(x).ticks(d3.timeMonth.every(3)).tickFormat(d3.timeFormat('%b %Y'))).selectAll('text').attr('font-size','9').attr('fill','#64748b');
+  // Grid lines
+  g.selectAll('.gridline').data(x.ticks(d3.timeMonth.every(3))).enter().append('line').attr('x1',d=>x(d)).attr('x2',d=>x(d)).attr('y1',0).attr('y2',H).attr('stroke','#e2e8f0').attr('stroke-width',1);
+  // Rows
+  raw.forEach((d,i)=>{
+    const y=i*rowH+2;
+    const start=new Date(d.announced_date);
+    const end=d.status_updated_date&&d.status!=='ongoing'?new Date(d.status_updated_date):today;
+    if(isNaN(start))return;
+    const x1=x(start),x2=Math.max(x1+3,x(end));
+    // Label
+    svg.append('text').attr('x',m.left-5).attr('y',m.top+y+rowH/2+3).attr('text-anchor','end').attr('font-size','9').attr('fill','#334155').text(d.title.substring(0,30)+(d.title.length>30?'…':''));
+    // Bar
+    const bar=g.append('rect').attr('x',x1).attr('y',y).attr('width',x2-x1).attr('height',rowH-4).attr('rx',2).attr('fill',colorFaded(d)).attr('opacity',d.status==='completed'?0.5:0.85).style('cursor','pointer');
+    bar.append('title').text(`${d.title}\n${d.announced_date} → ${d.status_updated_date||'ongoing'}\n${d.classification||''} (${d.agency_code})`);
+    bar.on('click',()=>location='?page=recall&id='+d.id);
+  });
+})();
+</script>
+<?php layout_foot(); }
+
+function view_sankey():void{
+    layout_head('Sankey Flow','sankey'); ?>
+<div class="mb-3 text-sm text-slate-600">Flow diagram: <strong>Manufacturers</strong> → <strong>Food Categories</strong> → <strong>Retailers</strong>. Width proportional to recall count. Hover flows for details.</div>
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
+  <div id="sankey-chart" style="min-height:500px"></div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/d3-sankey@0.12.3/dist/d3-sankey.min.js"></script>
+<script>
+(function(){
+  fetch('?api=sankey').then(r=>r.json()).then(links=>{
+    if(!links.length){document.getElementById('sankey-chart').innerHTML='<p class="text-sm text-slate-400 text-center py-8">No flow data. Run ingestion first.</p>';return;}
+    // Build nodes
+    const nodeNames=new Set();
+    links.forEach(l=>{nodeNames.add(l.src);nodeNames.add(l.tgt);});
+    const nodes=[...nodeNames].map(name=>({name}));
+    const nodeIndex=Object.fromEntries(nodes.map((n,i)=>[n.name,i]));
+    // Filter to top 10 per type to keep readable
+    const mfrTotals={},catTotals={};
+    links.forEach(l=>{if(l.link_type==='mfr_cat'){mfrTotals[l.src]=(mfrTotals[l.src]||0)+l.value;}else{catTotals[l.tgt]=(catTotals[l.tgt]||0)+l.value;}});
+    const topMfrs=new Set(Object.entries(mfrTotals).sort((a,b)=>b[1]-a[1]).slice(0,10).map(e=>e[0]));
+    const topRets=new Set(Object.entries(catTotals).sort((a,b)=>b[1]-a[1]).slice(0,10).map(e=>e[0]));
+    const filteredLinks=links.filter(l=>(l.link_type==='mfr_cat'&&topMfrs.has(l.src))||(l.link_type==='cat_ret'&&topRets.has(l.tgt)));
+    const usedNames=new Set();filteredLinks.forEach(l=>{usedNames.add(l.src);usedNames.add(l.tgt);});
+    const fNodes=[...usedNames].map(name=>({name}));
+    const fIndex=Object.fromEntries(fNodes.map((n,i)=>[n.name,i]));
+    const fLinks=filteredLinks.map(l=>({source:fIndex[l.src],target:fIndex[l.tgt],value:+l.value,type:l.link_type}));
+    const el=document.getElementById('sankey-chart');
+    const W=el.offsetWidth||700,H=Math.max(500,fNodes.length*20);
+    const svg=d3.select('#sankey-chart').append('svg').attr('width','100%').attr('viewBox',`0 0 ${W} ${H}`);
+    const sankey=d3.sankey().nodeWidth(18).nodePadding(10).extent([[15,10],[W-15,H-10]]);
+    const {nodes:sNodes,links:sLinks}=sankey({nodes:fNodes.map(d=>Object.assign({},d)),links:fLinks.map(d=>Object.assign({},d))});
+    const colorScale=d3.scaleOrdinal(d3.schemeTableau10);
+    // Links
+    svg.append('g').attr('fill','none').selectAll('path').data(sLinks).enter().append('path')
+      .attr('d',d3.sankeyLinkHorizontal())
+      .attr('stroke',d=>colorScale(d.source.name))
+      .attr('stroke-width',d=>Math.max(1,d.width))
+      .attr('opacity',0.4)
+      .on('mouseover',function(){d3.select(this).attr('opacity',0.7);})
+      .on('mouseout',function(){d3.select(this).attr('opacity',0.4);})
+      .append('title').text(d=>`${d.source.name} → ${d.target.name}\n${d.value} recall(s)`);
+    // Nodes
+    const gn=svg.append('g').selectAll('g').data(sNodes).enter().append('g');
+    gn.append('rect').attr('x',d=>d.x0).attr('y',d=>d.y0).attr('height',d=>Math.max(1,d.y1-d.y0)).attr('width',d=>d.x1-d.x0).attr('fill',d=>colorScale(d.name)).attr('rx',2).append('title').text(d=>`${d.name}\n${d.value} recalls`);
+    gn.append('text').attr('x',d=>d.x0<W/2?d.x1+5:d.x0-5).attr('y',d=>(d.y0+d.y1)/2).attr('dy','0.35em').attr('text-anchor',d=>d.x0<W/2?'start':'end').attr('font-size','10').attr('fill','#334155').text(d=>d.name.length>22?d.name.substring(0,22)+'…':d.name);
+  });
+})();
+</script>
+<?php layout_foot(); }
+
+function view_graph3d():void{
+    $recalls_raw=db()->query("SELECT r.id,r.title,r.severity,r.classification,r.status,r.food_category_id,r.announced_date,a.code as agency_code,fc.name as category_name FROM recalls r JOIN agencies a ON a.id=r.agency_id LEFT JOIN food_categories fc ON fc.id=r.food_category_id ORDER BY r.id")->fetchAll();
+    $retailer_links=db()->query("SELECT rr.recall_id,rt.name as retailer FROM recall_retailers rr JOIN retailers rt ON rt.id=rr.retailer_id")->fetchAll();
+    layout_head('3D Force Graph','graph3d'); ?>
+<div class="mb-3 flex items-center gap-4">
+  <div class="text-sm text-slate-600">Force-directed 3D graph of all recalls. Drag to rotate. Nodes sized by severity. Edges = shared retailer.</div>
+  <div class="ml-auto flex items-center gap-2 text-xs">
+    <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded-full bg-red-500"></span>Class I</span>
+    <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded-full bg-amber-400"></span>Class II</span>
+    <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded-full bg-green-500"></span>Class III</span>
+  </div>
+</div>
+<div class="bg-slate-900 rounded-lg border border-slate-700 shadow-sm relative" style="height:520px">
+  <canvas id="graph3d-canvas" style="width:100%;height:100%;border-radius:0.5rem"></canvas>
+  <div id="graph3d-info" class="absolute top-3 right-3 bg-black bg-opacity-70 text-white text-xs p-3 rounded max-w-xs hidden"></div>
+  <div class="absolute bottom-3 left-3 text-slate-400 text-xs">Drag to rotate · Scroll to zoom · Click node for details</div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function(){
+  const R=<?=js($recalls_raw)?>;
+  const LINKS=<?=js($retailer_links)?>;
+  if(!R.length||typeof THREE==='undefined'){document.getElementById('graph3d-canvas').parentNode.innerHTML='<p class="text-sm text-slate-400 text-center py-12">3D unavailable</p>';return;}
+
+  const canvas=document.getElementById('graph3d-canvas');
+  const W=canvas.parentNode.offsetWidth,H=520;
+  canvas.width=W*devicePixelRatio;canvas.height=H*devicePixelRatio;
+  canvas.style.width=W+'px';canvas.style.height=H+'px';
+
+  const renderer=new THREE.WebGLRenderer({canvas,antialias:true,alpha:true});
+  renderer.setPixelRatio(devicePixelRatio);renderer.setSize(W,H);renderer.setClearColor(0x0f172a,1);
+
+  const scene=new THREE.Scene();
+  const camera=new THREE.PerspectiveCamera(60,W/H,0.1,2000);
+  camera.position.set(0,0,300);
+
+  scene.add(new THREE.AmbientLight(0xffffff,0.6));
+  const dl=new THREE.DirectionalLight(0xffffff,0.8);dl.position.set(1,1,1);scene.add(dl);
+
+  // Build nodes
+  const nodeColor=d=>+d.severity>=3?0xef4444:(+d.severity>=2?0xf59e0b:0x22c55e);
+  const nodeR=d=>3+Math.sqrt(+d.severity)*4;
+  const nodes=R.map((d,i)=>({...d,idx:i,x:(Math.random()-0.5)*200,y:(Math.random()-0.5)*200,z:(Math.random()-0.5)*200,vx:0,vy:0,vz:0}));
+
+  // Build edges from shared retailers
+  const retMap={};
+  LINKS.forEach(l=>{if(!retMap[l.retailer])retMap[l.retailer]=[];retMap[l.retailer].push(+l.recall_id-1);});
+  const edges=[];
+  const nodeById=Object.fromEntries(nodes.map(n=>[+n.id,n]));
+  LINKS.forEach(l=>{});// edges from shared retailers
+  Object.values(retMap).forEach(ids=>{
+    if(ids.length<2)return;
+    for(let i=0;i<Math.min(ids.length,5);i++)for(let j=i+1;j<Math.min(ids.length,6);j++){
+      const a=nodes.find(n=>+n.id===ids[i]||+n.idx===ids[i]);
+      const b=nodes.find(n=>+n.id===ids[j]||+n.idx===ids[j]);
+      if(a&&b)edges.push([a,b]);
+    }
+  });
+
+  // Meshes
+  const meshes=nodes.map(n=>{
+    const geo=new THREE.SphereGeometry(nodeR(n),8,8);
+    const mat=new THREE.MeshPhongMaterial({color:nodeColor(n),transparent:true,opacity:0.85});
+    const mesh=new THREE.Mesh(geo,mat);
+    mesh.position.set(n.x,n.y,n.z);
+    mesh.userData=n;
+    scene.add(mesh);return mesh;
+  });
+
+  // Edge lines
+  const lineMat=new THREE.LineBasicMaterial({color:0x334155,transparent:true,opacity:0.25});
+  edges.slice(0,300).forEach(([a,b])=>{
+    const geo=new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(a.x,a.y,a.z),new THREE.Vector3(b.x,b.y,b.z)]);
+    scene.add(new THREE.Line(geo,lineMat));
+  });
+
+  // Simple spring simulation
+  function tick(){
+    nodes.forEach(n=>{
+      nodes.forEach(m=>{
+        if(m===n)return;
+        const dx=n.x-m.x,dy=n.y-m.y,dz=n.z-m.z;
+        const d2=dx*dx+dy*dy+dz*dz+1;
+        const f=200/d2;n.vx+=dx*f;n.vy+=dy*f;n.vz+=dz*f;
+      });
+      n.vx*=0.9;n.vy*=0.9;n.vz*=0.9;
+      n.x+=n.vx*0.05;n.y+=n.vy*0.05;n.z+=n.vz*0.05;
+    });
+    meshes.forEach((m,i)=>m.position.set(nodes[i].x,nodes[i].y,nodes[i].z));
+  }
+  for(let i=0;i<80;i++)tick();
+
+  // Mouse rotation
+  let isDragging=false,prevX=0,prevY=0,rotX=0,rotY=0;
+  canvas.addEventListener('mousedown',e=>{isDragging=true;prevX=e.clientX;prevY=e.clientY;});
+  window.addEventListener('mouseup',()=>isDragging=false);
+  canvas.addEventListener('mousemove',e=>{
+    if(!isDragging)return;
+    rotY+=(e.clientX-prevX)*0.01;rotX+=(e.clientY-prevY)*0.01;
+    prevX=e.clientX;prevY=e.clientY;
+  });
+  canvas.addEventListener('wheel',e=>{camera.position.z=Math.max(100,Math.min(600,camera.position.z+e.deltaY*0.3));});
+
+  // Click to select
+  const raycaster=new THREE.Raycaster();const mouse=new THREE.Vector2();
+  const info=document.getElementById('graph3d-info');
+  canvas.addEventListener('click',e=>{
+    const rect=canvas.getBoundingClientRect();
+    mouse.x=((e.clientX-rect.left)/rect.width)*2-1;
+    mouse.y=-((e.clientY-rect.top)/rect.height)*2+1;
+    raycaster.setFromCamera(mouse,camera);
+    const hits=raycaster.intersectObjects(meshes);
+    if(hits.length){
+      const d=hits[0].object.userData;
+      info.classList.remove('hidden');
+      info.innerHTML=`<strong>${d.title||''}</strong><br>${d.classification||''} · ${d.agency_code||''}<br>${d.announced_date||''}<br>${d.category_name||''}<br><a href="?page=recall&id=${d.id}" class="text-blue-300 underline">View details →</a>`;
+    }
+  });
+
+  let autoRot=true;
+  canvas.addEventListener('mousedown',()=>{autoRot=false;});
+  canvas.addEventListener('mouseup',()=>setTimeout(()=>autoRot=true,3000));
+
+  function animate(){
+    requestAnimationFrame(animate);
+    if(autoRot)rotY+=0.003;
+    scene.rotation.x=rotX;scene.rotation.y=rotY;
+    renderer.render(scene,camera);
+  }
+  animate();
+})();
+</script>
+<?php layout_foot(); }
+
+function view_barcode():void{
+    $result=null;$upc='';
+    if($_GET['upc']??''){
+        $upc=preg_replace('/[^0-9]/','',trim($_GET['upc']));
+        if($upc)$result=barcode_lookup($upc);
+    }
+    $supported=true; // BarcodeDetector needs browser check
+    layout_head('Barcode Lookup','barcode'); ?>
+<div class="max-w-2xl">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-4">
+    <h2 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="scan-barcode" class="w-4 h-4 text-fw-500"></i>UPC / Barcode Lookup</h2>
+    <form method="get" class="flex items-center gap-2 mb-3">
+      <input type="hidden" name="page" value="barcode">
+      <input type="text" name="upc" value="<?=h($upc)?>" placeholder="Enter UPC (e.g. 0 12345 67890 5)" class="flex-1 text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500" pattern="[0-9 \-]*">
+      <button type="submit" class="bg-fw-500 text-white px-4 py-2 rounded text-sm font-medium hover:bg-fw-700">Look Up</button>
+    </form>
+    <!-- Camera scanner -->
+    <div id="scanner-section" class="border-t border-slate-100 pt-3 mt-3">
+      <p class="text-xs text-slate-500 mb-2">Or scan with your camera:</p>
+      <button id="scan-btn" class="text-xs border border-slate-300 rounded px-3 py-1.5 hover:bg-slate-50 flex items-center gap-1.5"><i data-lucide="camera" class="w-3.5 h-3.5"></i>Open Camera Scanner</button>
+      <video id="scan-video" class="hidden mt-2 rounded border border-slate-200 max-w-full" width="320" height="240" autoplay muted playsinline></video>
+    </div>
+  </div>
+
+  <?php if($result): ?>
+  <?php if(!empty($result['recall_matches'])): ?>
+  <div class="bg-red-50 border border-red-300 rounded-lg p-4 mb-4">
+    <h3 class="text-sm font-bold text-red-700 mb-2 flex items-center gap-2"><i data-lucide="alert-triangle" class="w-4 h-4"></i>⚠ RECALL ALERT — <?=count($result['recall_matches'])?> recall(s) found for UPC <?=h($upc)?></h3>
+    <?php foreach($result['recall_matches'] as $rm): ?>
+    <div class="bg-white border border-red-200 rounded p-3 mb-2">
+      <div class="flex items-center gap-2 mb-1"><?=sev_badge((float)$rm['severity'],$rm['classification']??'')?><?=status_badge($rm['status'])?></div>
+      <p class="text-sm font-medium text-slate-800"><?=h($rm['title'])?></p>
+      <p class="text-xs text-slate-600 mt-1">Product: <?=h($rm['description']??'—')?> · Date: <?=h($rm['announced_date']??'—')?></p>
+      <a href="?page=recall&id=<?=(int)$rm['id']?>" class="text-xs text-fw-500 hover:underline">View full recall →</a>
+    </div>
+    <?php endforeach; ?>
+  </div>
+  <?php else: ?>
+  <div class="bg-green-50 border border-green-200 rounded-lg p-4 mb-4 text-sm text-green-800">
+    <i data-lucide="check-circle" class="w-4 h-4 inline mr-1 text-green-600"></i>No active recalls found in our database for UPC <?=h($upc)?>.
+  </div>
+  <?php endif; ?>
+
+  <?php if($result['product']): ?>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4 mb-4">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="package" class="w-4 h-4"></i>Product Info (Open Food Facts)</h3>
+    <div class="flex gap-4">
+      <?php if($result['product']['image']): ?><img src="<?=h($result['product']['image'])?>" alt="product" class="w-20 h-20 object-contain rounded border border-slate-100 flex-shrink-0"><?php endif; ?>
+      <dl class="text-sm space-y-1">
+        <div><dt class="text-xs font-semibold text-slate-500">Name</dt><dd><?=h($result['product']['name'])?></dd></div>
+        <div><dt class="text-xs font-semibold text-slate-500">Brand</dt><dd><?=h($result['product']['brand'])?></dd></div>
+        <div><dt class="text-xs font-semibold text-slate-500">Category</dt><dd><?=h(mb_substr($result['product']['category'],0,80))?></dd></div>
+        <div><dt class="text-xs font-semibold text-slate-500">Quantity</dt><dd><?=h($result['product']['quantity'])?></dd></div>
+      </dl>
+    </div>
+  </div>
+  <?php elseif(isset($result['error'])): ?>
+  <p class="text-sm text-slate-500">Product info unavailable: <?=h($result['error'])?></p>
+  <?php else: ?>
+  <p class="text-sm text-slate-500">No product information found in Open Food Facts for this UPC.</p>
+  <?php endif; ?>
+  <?php endif; ?>
+</div>
+<script>
+document.getElementById('scan-btn')?.addEventListener('click',async function(){
+  if(!('BarcodeDetector' in window)){alert('Camera barcode scanning is not supported in this browser. Please type the UPC manually.');return;}
+  const video=document.getElementById('scan-video');video.classList.remove('hidden');
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
+    video.srcObject=stream;
+    const det=new BarcodeDetector({formats:['ean_13','ean_8','upc_a','upc_e','code_128']});
+    const timer=setInterval(async()=>{
+      try{
+        const codes=await det.detect(video);
+        if(codes.length){
+          clearInterval(timer);stream.getTracks().forEach(t=>t.stop());video.classList.add('hidden');
+          location='?page=barcode&upc='+codes[0].rawValue;
+        }
+      }catch(e){}
+    },500);
+  }catch(e){alert('Camera access denied: '+e.message);}
+});
+</script>
+<?php layout_foot(); }
+
+function view_subscriptions():void{
+    $sid=session_id();
+    $subs=[];
+    if(is_admin()){
+        $subs=db()->query('SELECT * FROM subscriptions ORDER BY created_at DESC')->fetchAll();
+    }
+    $cats=db()->query('SELECT id,name FROM food_categories ORDER BY name')->fetchAll();
+    $hazs=db()->query('SELECT id,name FROM hazards ORDER BY type,name LIMIT 20')->fetchAll();
+    layout_head('Email Alerts','subscriptions'); ?>
+<div class="max-w-2xl">
+  <!-- Subscribe form -->
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-4" x-data="{saving:false,done:false,state:'',category:'',severity:'',err:''}">
+    <h2 class="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><i data-lucide="mail" class="w-4 h-4 text-fw-500"></i>Subscribe to Recall Alerts</h2>
+    <p class="text-xs text-slate-500 mb-4">Receive an email digest whenever new recalls match your criteria. Alerts are sent weekly (or manually via admin).</p>
+    <div class="space-y-3">
+      <div><label class="text-xs font-medium text-slate-600 block mb-1">Email address *</label>
+        <input id="sub-email" type="email" required placeholder="you@example.com" class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500">
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div><label class="text-xs font-medium text-slate-600 block mb-1">State filter</label>
+          <select x-model="state" class="w-full text-sm border border-slate-300 rounded px-2 py-1.5">
+            <option value="">Any state</option>
+            <?php foreach(US_STATES as $c=>$n): ?><option value="<?=h($c)?>"><?=h($n)?></option><?php endforeach; ?>
+          </select>
+        </div>
+        <div><label class="text-xs font-medium text-slate-600 block mb-1">Min severity</label>
+          <select x-model="severity" class="w-full text-sm border border-slate-300 rounded px-2 py-1.5">
+            <option value="">Any severity</option>
+            <option value="3">Class I only</option>
+            <option value="2">Class I & II</option>
+          </select>
+        </div>
+        <div><label class="text-xs font-medium text-slate-600 block mb-1">Food category</label>
+          <select x-model="category" class="w-full text-sm border border-slate-300 rounded px-2 py-1.5">
+            <option value="">Any category</option>
+            <?php foreach($cats as $c): ?><option value="<?=(int)$c['id']?>"><?=h($c['name'])?></option><?php endforeach; ?>
+          </select>
+        </div>
+        <div><label class="text-xs font-medium text-slate-600 block mb-1">Recall status</label>
+          <select id="sub-status" class="w-full text-sm border border-slate-300 rounded px-2 py-1.5">
+            <option value="">All statuses</option>
+            <option value="ongoing">Active only</option>
+          </select>
+        </div>
+      </div>
+      <p x-show="err" x-text="err" class="text-xs text-red-600"></p>
+      <button @click="saving=true;err='';const email=document.getElementById('sub-email').value;if(!email){err='Email required';saving=false;return;}const f=new URLSearchParams({csrf:'<?=csrf()?>',email,state,category,severity,status:document.getElementById('sub-status').value});fetch('?api=subscription_add',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:f}).then(r=>r.json()).then(d=>{saving=false;if(d.ok){done=true;}else{err=d.error||'Error'}}).catch(()=>{saving=false;err='Request failed'})" :disabled="saving||done" class="bg-fw-500 text-white text-sm rounded px-4 py-2 font-medium hover:bg-fw-700 disabled:opacity-50">
+        <span x-show="!saving&&!done">Subscribe</span>
+        <span x-show="saving">Subscribing…</span>
+        <span x-show="done" class="text-green-200">✓ Subscribed!</span>
+      </button>
+    </div>
+  </div>
+
+  <?php if(is_admin()&&$subs): ?>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm">
+    <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+      <h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="users" class="w-4 h-4"></i>All Subscriptions (<?=count($subs)?>)</h2>
+      <button onclick="if(confirm('Send alerts now?'))fetch('?api=send_alerts',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'}}).then(r=>r.json()).then(d=>alert('Sent: '+d.sent+' emails'))" class="text-xs bg-fw-500 text-white px-3 py-1 rounded hover:bg-fw-700">Send Alerts Now</button>
+    </div>
+    <table class="fw-table w-full">
+      <thead><tr><th>Email</th><th>Filters</th><th>Active</th><th>Last Sent</th><th>Subscribed</th></tr></thead>
+      <tbody>
+      <?php foreach($subs as $s): ?>
+      <?php $f=json_decode($s['filter_json'],true)??[]; ?>
+      <tr>
+        <td><?=h($s['email'])?></td>
+        <td class="text-xs text-slate-500"><?=h($f?implode(', ',array_filter([$f['state']??'',$f['severity']??'',$f['category']??''])):' (all)')?></td>
+        <td class="text-center"><?=$s['active']?'<span class="text-green-600 text-xs font-semibold">Active</span>':'<span class="text-slate-400 text-xs">Off</span>'?></td>
+        <td class="text-xs"><?=h($s['last_sent_at']??'Never')?></td>
+        <td class="text-xs"><?=h($s['created_at'])?></td>
+      </tr>
+      <?php endforeach; ?>
+      </tbody>
+    </table>
+  </div>
+  <?php elseif(is_admin()): ?>
+  <p class="text-sm text-slate-500 text-center py-4">No subscriptions yet.</p>
+  <?php endif; ?>
+</div>
 <?php layout_foot(); }
 
 // ================================================================
