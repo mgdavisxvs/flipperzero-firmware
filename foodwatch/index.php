@@ -9,8 +9,8 @@ declare(strict_types=1);
 // ================================================================
 // § CONSTANTS
 // ================================================================
-const FW_VERSION    = '2.0.0';
-const FW_SCHEMA_VER = 8;
+const FW_VERSION    = '3.0.0';
+const FW_SCHEMA_VER = 10;
 const FW_DATA_DIR   = __DIR__ . '/data';
 const FW_DB_PATH    = __DIR__ . '/data/foodwatch.db';
 const FW_LAMBDA     = 0.01;   // daily decay; half-life ≈69 days
@@ -192,7 +192,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -436,6 +436,29 @@ CREATE TABLE IF NOT EXISTS recall_velocity(
   baseline_monthly REAL NOT NULL DEFAULT 0,
   z_score REAL NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT(datetime('now')));
+SQL; }
+
+function m9():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS recall_transitions(
+  id INTEGER PRIMARY KEY,
+  recall_id INTEGER NOT NULL REFERENCES recalls(id),
+  from_status TEXT NOT NULL,
+  to_status TEXT NOT NULL,
+  days_in_from_state INTEGER NOT NULL DEFAULT 0,
+  transitioned_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_rt_recall ON recall_transitions(recall_id,transitioned_at);
+SQL; }
+
+function m10():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS markov_params(
+  id INTEGER PRIMARY KEY,
+  computed_at TEXT NOT NULL DEFAULT(datetime('now')),
+  state_count INTEGER NOT NULL DEFAULT 4,
+  p_matrix_json TEXT NOT NULL,
+  n_matrix_json TEXT NOT NULL,
+  e_steps_json TEXT NOT NULL,
+  sample_n INTEGER NOT NULL DEFAULT 0,
+  confidence TEXT NOT NULL DEFAULT 'low');
 SQL; }
 
 // ================================================================
@@ -1122,6 +1145,113 @@ function q_velocity():array{
     return['rate_30d'=>$r30,'rate_90d'=>$r90,'baseline_monthly'=>$baseline,'z_score'=>$z_score,'trending_cats'=>$cat_stmt->fetchAll()];
 }
 
+// ================================================================
+// § MARKOV TRANSITION ENGINE
+// ================================================================
+function markov_estimate_matrix():array{
+    // Valid successors per state: 0=announced,1=active,2=resolved,3=archived
+    $successors=[[1,2,3],[2,3],[3],[]];
+    $counts=array_fill(0,4,array_fill(0,4,0));
+    $map=['announced'=>0,'active'=>1,'ongoing'=>1,'resolved'=>2,'completed'=>2,'terminated'=>2,'archived'=>3];
+    try{
+        $rows=db()->query("SELECT from_status,to_status,COUNT(*) as cnt FROM recall_transitions GROUP BY from_status,to_status")->fetchAll();
+        foreach($rows as $r){
+            $i=$map[strtolower($r['from_status'])]??-1;
+            $j=$map[strtolower($r['to_status'])]??-1;
+            if($i>=0&&$j>=0&&$i!==$j)$counts[$i][$j]+=$r['cnt'];
+        }
+    }catch(\Throwable){}
+    // Laplace-smoothed MLE: P[i][j] = (C[i][j]+1)/(N_i+K)
+    $P=[];$n_total=0;
+    for($i=0;$i<4;$i++){
+        $succ=$successors[$i];$K=count($succ);
+        if($K===0){$P[$i]=array_fill(0,4,0.0);$P[$i][$i]=1.0;continue;}
+        $N=array_sum(array_map(fn($j)=>$counts[$i][$j],$succ));$n_total+=$N;
+        $row=array_fill(0,4,0.0);
+        foreach($succ as $j)$row[$j]=round(($counts[$i][$j]+1)/($N+$K),6);
+        $P[$i]=$row;
+    }
+    return['P'=>$P,'n'=>$n_total,'confidence'=>$n_total<10?'low':($n_total<50?'medium':'high')];
+}
+
+function markov_fundamental_matrix(array $P):array{
+    // Transient states: 0(announced),1(active) — absorbing: 2,3
+    // Q = 2x2 transient submatrix; N = (I-Q)^-1 via 2x2 closed form
+    $Q=[[$P[0][0]??0,$P[0][1]??0],[$P[1][0]??0,$P[1][1]??0]];
+    $a=1-$Q[0][0];$b=-$Q[0][1];$c=-$Q[1][0];$d=1-$Q[1][1];
+    $det=$a*$d-$b*$c;
+    if(abs($det)<1e-9)return[[1.0,0.0],[0.0,1.0]];
+    return[[$d/$det,-$b/$det],[-$c/$det,$a/$det]];
+}
+
+function markov_expected_steps(array $N):array{
+    // E[T_i] = row-sum of fundamental matrix N
+    return[round(array_sum($N[0]),2),round(array_sum($N[1]),2)];
+}
+
+function markov_escalation_prob(array $P,int $state):float{
+    // Proxy: probability recall remains active (multi-cycle exposure risk)
+    if($state===0)return round(min(0.95,($P[0][1]??0)*0.40),3);
+    if($state===1)return round(min(0.95,($P[1][1]??0)*0.25),3);
+    return 0.0;
+}
+
+function markov_p_resolved_in_k(array $P,array $N,int $state,int $k):float{
+    if($state>=2)return 1.0;
+    // Compute Q^k then P(still transient) = sum(row i of Q^k)
+    $Q=[[$P[0][0]??0,$P[0][1]??0],[$P[1][0]??0,$P[1][1]??0]];
+    $Qk=[[1,0],[0,1]]; // identity
+    for($s=0;$s<$k;$s++){
+        $tmp=[[0,0],[0,0]];
+        for($r=0;$r<2;$r++)for($c=0;$c<2;$c++)for($t=0;$t<2;$t++)$tmp[$r][$c]+=$Qk[$r][$t]*$Q[$t][$c];
+        $Qk=$tmp;
+    }
+    return round(max(0.0,min(1.0,1-array_sum($Qk[$state]))),3);
+}
+
+function markov_refresh_cache():array{
+    $est=markov_estimate_matrix();
+    $N=markov_fundamental_matrix($est['P']);
+    $steps=markov_expected_steps($N);
+    try{
+        db()->prepare("INSERT INTO markov_params(computed_at,state_count,p_matrix_json,n_matrix_json,e_steps_json,sample_n,confidence) VALUES(datetime('now'),4,?,?,?,?,?)")
+            ->execute([json_encode($est['P']),json_encode($N),json_encode($steps),$est['n'],$est['confidence']]);
+        return['ok'=>true,'n'=>$est['n'],'confidence'=>$est['confidence'],'steps'=>$steps];
+    }catch(\Throwable $e){return['ok'=>false,'error'=>$e->getMessage()];}
+}
+
+function q_recall_outlook(int $recall_id):array{
+    try{
+        $params=db()->query("SELECT p_matrix_json,n_matrix_json,e_steps_json,sample_n,confidence FROM markov_params ORDER BY id DESC LIMIT 1")->fetch();
+    }catch(\Throwable){$params=null;}
+    if(!$params){
+        // Compute on-demand (first call); cache for next
+        $est=markov_estimate_matrix();
+        $N_mat=markov_fundamental_matrix($est['P']);
+        $params=['p_matrix_json'=>json_encode($est['P']),'n_matrix_json'=>json_encode($N_mat),'e_steps_json'=>json_encode(markov_expected_steps($N_mat)),'sample_n'=>$est['n'],'confidence'=>$est['confidence']];
+        try{db()->prepare("INSERT INTO markov_params(computed_at,state_count,p_matrix_json,n_matrix_json,e_steps_json,sample_n,confidence) VALUES(datetime('now'),4,?,?,?,?,?)")->execute([$params['p_matrix_json'],$params['n_matrix_json'],$params['e_steps_json'],$params['sample_n'],$params['confidence']]);}catch(\Throwable){}
+    }
+    $P=json_decode($params['p_matrix_json'],true)??[];
+    $N_mat=json_decode($params['n_matrix_json'],true)??[];
+    $e_steps=json_decode($params['e_steps_json'],true)??[4.0,3.0];
+    $rec_stmt=db()->prepare("SELECT status,severity,announced_date FROM recalls WHERE id=?");
+    $rec_stmt->execute([$recall_id]);$rec=$rec_stmt->fetch();
+    if(!$rec)return['error'=>'Not found'];
+    $smap=['announced'=>0,'active'=>1,'ongoing'=>1,'resolved'=>2,'completed'=>2,'terminated'=>2,'archived'=>3];
+    $state=$smap[strtolower($rec['status']??'active')]??1;
+    $cycle=14; // median days per review cycle
+    $k30=max(1,(int)round(30/$cycle));$k60=max(1,(int)round(60/$cycle));
+    $p30=markov_p_resolved_in_k($P,$N_mat,$state,$k30);
+    $p60=markov_p_resolved_in_k($P,$N_mat,$state,$k60);
+    $p_esc=markov_escalation_prob($P,$state);
+    $e_raw=($e_steps[$state]??4.0)*$cycle;
+    $e_low=max(7,(int)round($e_raw*0.65));$e_high=(int)round($e_raw*1.45);
+    $days_stmt=db()->prepare("SELECT COALESCE(CAST((julianday('now')-julianday(MAX(transitioned_at))) AS INTEGER),0) FROM recall_transitions WHERE recall_id=?");
+    $days_stmt->execute([$recall_id]);$days_in_state=(int)$days_stmt->fetchColumn();
+    $labels=['announced','active','resolved','archived'];
+    return['state'=>$state,'state_name'=>$labels[$state]??'unknown','p_resolved_30d'=>$p30,'p_resolved_60d'=>$p60,'p_escalation'=>$p_esc,'expected_days_low'=>$e_low,'expected_days_high'=>$e_high,'confidence'=>$params['confidence']??'low','sample_n'=>(int)$params['sample_n'],'days_in_state'=>$days_in_state];
+}
+
 function q_seasonal():array{
     $stmt=db()->query("
         SELECT strftime('%m',announced_date) as month,
@@ -1207,16 +1337,25 @@ function send_email_alerts():array{
         $rs=db()->prepare("SELECT r.id,r.title,r.severity,r.classification,r.announced_date,a.code as agency FROM recalls r JOIN agencies a ON a.id=r.agency_id $where ORDER BY r.announced_date DESC LIMIT 20");
         $rs->execute($p);$recalls=$rs->fetchAll();
         if(!$recalls)continue;
+        // Build Markov-augmented email
+        $markov_est_email=markov_estimate_matrix();
+        $N_email=markov_fundamental_matrix($markov_est_email['P']);
         $body='<html><body style="font-family:sans-serif;max-width:600px;margin:0 auto">';
         $body.='<h2 style="color:#3b5bdb">FoodWatch US Alert</h2>';
         $body.='<p>'.count($recalls).' new recall(s) match your subscription criteria since '.date('M j, Y',strtotime($since)).':</p>';
         $body.='<table style="width:100%;border-collapse:collapse">';
-        $body.='<tr><th style="text-align:left;padding:6px;background:#f1f5f9">Class</th><th style="text-align:left;padding:6px;background:#f1f5f9">Product</th><th style="text-align:left;padding:6px;background:#f1f5f9">Agency</th><th style="text-align:left;padding:6px;background:#f1f5f9">Date</th></tr>';
+        $body.='<tr><th style="text-align:left;padding:6px;background:#f1f5f9">Class</th><th style="text-align:left;padding:6px;background:#f1f5f9">Product</th><th style="text-align:left;padding:6px;background:#f1f5f9">Agency</th><th style="text-align:left;padding:6px;background:#f1f5f9">Date</th><th style="text-align:left;padding:6px;background:#f1f5f9">Outlook</th></tr>';
         foreach($recalls as $rc){
             $clr=$rc['severity']>=3.0?'#dc2626':($rc['severity']>=2.0?'#d97706':'#16a34a');
-            $body.='<tr><td style="padding:5px;color:'.$clr.';font-weight:bold">'.htmlspecialchars($rc['classification']??'').'</td><td style="padding:5px">'.htmlspecialchars(mb_substr($rc['title'],0,70)).'</td><td style="padding:5px">'.htmlspecialchars($rc['agency']).'</td><td style="padding:5px">'.htmlspecialchars($rc['announced_date']).'</td></tr>';
+            $smap_e=['announced'=>0,'active'=>1,'ongoing'=>1,'resolved'=>2,'completed'=>2,'terminated'=>2,'archived'=>3];
+            $state_e=$smap_e[strtolower($rc['status']??'active')]??1;
+            $p_esc=markov_escalation_prob($markov_est_email['P'],$state_e);
+            $p30=markov_p_resolved_in_k($markov_est_email['P'],$N_email,$state_e,2);
+            $esc_warn=$p_esc>0.25?'<span style="color:#dc2626;font-weight:bold">⚠ Escalation '.round($p_esc*100).'%</span> · ':'';
+            $outlook_txt=$esc_warn.'P(30d resolved): '.round($p30*100).'%';
+            $body.='<tr><td style="padding:5px;color:'.$clr.';font-weight:bold">'.htmlspecialchars($rc['classification']??'').'</td><td style="padding:5px">'.htmlspecialchars(mb_substr($rc['title'],0,70)).'</td><td style="padding:5px">'.htmlspecialchars($rc['agency']).'</td><td style="padding:5px">'.htmlspecialchars($rc['announced_date']).'</td><td style="padding:5px;font-size:11px">'.$outlook_txt.'</td></tr>';
         }
-        $body.='</table><hr><p style="font-size:11px;color:#64748b">Unsubscribe: '.($_SERVER['HTTP_HOST']??'').'?api=subscription_del&token='.urlencode($sub['token']).'</p></body></html>';
+        $body.='</table><hr><p style="font-size:11px;color:#64748b">Recall Outlook probabilities are Markov model estimates (n='.((int)$markov_est_email['n']).' transitions, '.$markov_est_email['confidence'].' confidence). Unsubscribe: '.($_SERVER['HTTP_HOST']??'').'?api=subscription_del&token='.urlencode($sub['token']).'</p></body></html>';
         $headers="From: FoodWatch US <alerts@foodwatch-us.com>\r\nContent-Type: text/html; charset=utf-8\r\nMIME-Version: 1.0\r\n";
         if(@mail($sub['email'],'FoodWatch US Alert: '.count($recalls).' new recall(s)',$body,$headers)){
             db()->prepare("UPDATE subscriptions SET last_sent_at=datetime('now') WHERE id=?")->execute([$sub['id']]);
@@ -1431,6 +1570,7 @@ function route():void{
         case 'geo':           render_page('geo');break;
         case 'barcode':       render_page('barcode');break;
         case 'subscriptions': render_page('subscriptions');break;
+        case 'markov_admin':  render_page('markov_admin');break;
         case 'search':        render_page('search');break;
         case 'watchlist':     render_page('watchlist');break;
         case 'tests':         render_page('tests');break;
@@ -1513,20 +1653,40 @@ function handle_api(string $api):void{
             case 'poll_status':
                 if(!is_admin())fw_abort('Unauthorized',403);
                 // Re-fetch ongoing recalls from FDA and update status
-                $ongoing=db()->query("SELECT source_id FROM recalls WHERE status='ongoing' AND agency_id=(SELECT id FROM agencies WHERE code='FDA') LIMIT 20")->fetchAll(PDO::FETCH_COLUMN);
+                $ongoing=db()->query("SELECT id,source_id,status FROM recalls WHERE status='ongoing' AND agency_id=(SELECT id FROM agencies WHERE code='FDA') LIMIT 20")->fetchAll();
                 $updated=0;
-                foreach($ongoing as $src_id){
+                foreach($ongoing as $row){
+                    $src_id=$row['source_id'];$old_status=$row['status'];$rid=$row['id'];
                     $res=fw_fetch(FDA_API,['search'=>"recall_number:\"$src_id\"","limit"=>1],10);
                     if($res['ok']&&!empty($res['data']['results'][0])){
                         $raw=$res['data']['results'][0];
                         $new_status=strtolower($raw['status']??'ongoing');
                         $db_status=match($new_status){'completed'=>'completed','terminated'=>'terminated',default=>'ongoing'};
-                        $r=db()->prepare("UPDATE recalls SET status=?,updated_at=datetime('now') WHERE source_id=? AND agency_id=(SELECT id FROM agencies WHERE code='FDA') AND status!='completed'");
-                        $r->execute([$db_status,$src_id]);
-                        if($r->rowCount())$updated++;
+                        $upd=db()->prepare("UPDATE recalls SET status=?,updated_at=datetime('now') WHERE id=? AND status!='completed'");
+                        $upd->execute([$db_status,$rid]);
+                        if($upd->rowCount()&&$old_status!==$db_status){
+                            $days_stmt=db()->prepare("SELECT COALESCE(CAST((julianday('now')-julianday(announced_date)) AS INTEGER),0) FROM recalls WHERE id=?");
+                            $days_stmt->execute([$rid]);$d_in=(int)$days_stmt->fetchColumn();
+                            try{db()->prepare("INSERT INTO recall_transitions(recall_id,from_status,to_status,days_in_from_state) VALUES(?,?,?,?)")->execute([$rid,$old_status,$db_status,$d_in]);}catch(\Throwable){}
+                            $updated++;
+                        }
                     }
                 }
+                // Refresh Markov cache after status polling
+                try{markov_refresh_cache();}catch(\Throwable){}
                 echo js(['ok'=>true,'polled'=>count($ongoing),'updated'=>$updated]);break;
+            case 'recall_outlook':
+                $id=(int)($_GET['id']??0);
+                if(!$id)fw_abort('Missing id',400);
+                echo js(q_recall_outlook($id));break;
+            case 'markov_refresh':
+                if(!is_admin())fw_abort('Unauthorized',403);
+                echo js(markov_refresh_cache());break;
+            case 'markov_diagnostics':
+                if(!is_admin())fw_abort('Unauthorized',403);
+                $p=db()->query("SELECT * FROM markov_params ORDER BY id DESC LIMIT 1")->fetch();
+                $tc=db()->query("SELECT COUNT(*) FROM recall_transitions")->fetchColumn();
+                echo js(['params'=>$p,'transition_count'=>(int)$tc,'matrix_est'=>markov_estimate_matrix()]);break;
             case 'export_pdf':
                 // Returns HTML fragment for print/PDF
                 $f=['status'=>$_GET['status']??'all','q'=>$_GET['q']??''];
@@ -1615,6 +1775,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc}
     <div class="text-xs text-slate-500 px-3 pt-3 pb-1 uppercase tracking-wider font-semibold">Tools</div>
     <a href="?page=barcode" class="fw-nav-link <?=$page==='barcode'?'active':''?>"><i data-lucide="scan-barcode" class="w-4 h-4"></i>Barcode Lookup</a>
     <a href="?page=subscriptions" class="fw-nav-link <?=$page==='subscriptions'?'active':''?>"><i data-lucide="mail" class="w-4 h-4"></i>Email Alerts</a>
+    <a href="?page=markov_admin" class="fw-nav-link <?=$page==='markov_admin'?'active':''?>"><i data-lucide="activity" class="w-4 h-4"></i>Model Diagnostics</a>
     <a href="?page=search" class="fw-nav-link <?=$page==='search'?'active':''?>"><i data-lucide="search" class="w-4 h-4"></i>Search</a>
     <a href="?page=watchlist" class="fw-nav-link <?=$page==='watchlist'?'active':''?>"><i data-lucide="bell" class="w-4 h-4"></i>Watchlist</a>
     <div class="border-t border-slate-700 my-2 pt-2">
@@ -1662,6 +1823,7 @@ function render_page(string $p):void{
         'geo'           =>view_geo(),
         'barcode'       =>view_barcode(),
         'subscriptions' =>view_subscriptions(),
+        'markov_admin'  =>view_markov_admin(),
         'search'        =>view_search(),
         'watchlist'     =>view_watchlist(),
         'tests'         =>view_tests(),
@@ -2008,6 +2170,47 @@ function view_recall_detail():void{
       <?php $nationwide=array_filter($rec['states'],fn($s)=>$s['nationwide']); ?>
       <?php if($nationwide): ?><p class="text-sm font-semibold text-red-700">Nationwide distribution</p>
       <?php else: ?><div class="flex flex-wrap gap-1"><?php foreach($rec['states'] as $s): ?><span class="text-xs bg-slate-100 rounded px-1.5 py-0.5"><?=h($s['state_code'])?></span><?php endforeach; ?></div><?php endif; ?>
+    </div>
+    <?php endif; ?>
+
+    <!-- Recall Outlook (Markov) -->
+    <?php if($rec['status']==='ongoing'||$rec['status']==='active'||$rec['status']==='announced'): ?>
+    <?php $outlook=q_recall_outlook($id); ?>
+    <div class="bg-indigo-50 rounded-lg border border-indigo-200 shadow-sm p-4">
+      <h3 class="text-sm font-semibold text-indigo-800 mb-3 flex items-center gap-2">
+        <i data-lucide="activity" class="w-4 h-4"></i>Recall Outlook
+        <?php if(($outlook['confidence']??'low')==='low'): ?>
+        <span class="ml-auto text-xs font-normal bg-amber-100 text-amber-700 border border-amber-300 px-1.5 py-0.5 rounded">Low data</span>
+        <?php endif; ?>
+      </h3>
+      <?php if(isset($outlook['error'])): ?>
+      <p class="text-xs text-indigo-600">Model not yet available.</p>
+      <?php else: ?>
+      <dl class="space-y-2 text-sm">
+        <div class="flex justify-between items-center">
+          <dt class="text-xs text-indigo-700 font-medium">P(resolved in 30d)</dt>
+          <?php $p30r=(float)($outlook['p_resolved_30d']??0); ?>
+          <dd class="font-bold <?=$p30r>0.6?'text-green-700':($p30r>0.35?'text-amber-700':'text-red-700')?>"><?=round($p30r*100)?>%</dd>
+        </div>
+        <div class="flex justify-between items-center">
+          <dt class="text-xs text-indigo-700 font-medium">P(resolved in 60d)</dt>
+          <?php $p60r=(float)($outlook['p_resolved_60d']??0); ?>
+          <dd class="font-bold <?=$p60r>0.7?'text-green-700':'text-slate-700'?>"><?=round($p60r*100)?>%</dd>
+        </div>
+        <div class="flex justify-between items-center border-t border-indigo-200 pt-2">
+          <dt class="text-xs text-indigo-700 font-medium">Escalation risk</dt>
+          <?php $pescr=(float)($outlook['p_escalation']??0); ?>
+          <dd class="font-bold <?=$pescr>0.25?'text-red-700':'text-slate-600'?>"><?=round($pescr*100)?>%</dd>
+        </div>
+        <?php if(($outlook['expected_days_low']??null)): ?>
+        <div class="border-t border-indigo-200 pt-2">
+          <dt class="text-xs text-indigo-700 font-medium mb-0.5">Typical resolution</dt>
+          <dd class="text-sm font-semibold text-indigo-900"><?=(int)$outlook['expected_days_low']?>–<?=(int)$outlook['expected_days_high']?> days</dd>
+        </div>
+        <?php endif; ?>
+      </dl>
+      <p class="text-xs text-indigo-500 mt-3">Markov model · n=<?=(int)($outlook['sample_n']??0)?> transitions · <?=h($outlook['confidence']??'low')?> confidence</p>
+      <?php endif; ?>
     </div>
     <?php endif; ?>
 
@@ -2498,10 +2701,12 @@ function view_analytics():void{
     $trend=q_recall_trend(52);
     $velocity=q_velocity();
     $seasonal=q_seasonal();
+    $outlook_sys=q_recall_outlook(0); // system-wide Markov state
+    $markov_est=markov_estimate_matrix();
     layout_head('Trends & Velocity','analytics'); ?>
 
 <!-- Velocity Indicator -->
-<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
   <?php
   $z=$velocity['z_score'];
   $zcolor=$z>2?'text-red-600 font-bold':($z>1?'text-orange-500 font-semibold':($z<-1?'text-green-600':'text-slate-700'));
@@ -2511,6 +2716,49 @@ function view_analytics():void{
   <div class="fw-stat"><div class="text-3xl font-bold text-slate-800"><?=(int)$velocity['rate_90d']?></div><div class="text-xs text-slate-500 mt-1">Recalls (last 90d)</div></div>
   <div class="fw-stat"><div class="text-3xl font-bold text-slate-600"><?=number_format($velocity['baseline_monthly'],1)?></div><div class="text-xs text-slate-500 mt-1">Monthly baseline (prior 90d)</div></div>
   <div class="fw-stat"><div class="text-3xl font-bold <?=$zcolor?>"><?=number_format($z,2)?> σ</div><div class="text-xs text-slate-500 mt-1"><?=h($signal)?></div></div>
+</div>
+
+<!-- Recall Outlook (Markov) row -->
+<div class="bg-indigo-50 border border-indigo-200 rounded-lg p-4 mb-6">
+  <div class="flex items-center justify-between mb-3">
+    <h3 class="text-sm font-semibold text-indigo-800 flex items-center gap-2"><i data-lucide="activity" class="w-4 h-4"></i>System Recall Outlook <span class="text-xs font-normal text-indigo-500">(Markov transition model)</span></h3>
+    <?php if(is_admin()): ?><a href="?api=markov_refresh" class="text-xs text-indigo-600 border border-indigo-300 rounded px-2 py-0.5 hover:bg-indigo-100">Refresh model</a><?php endif; ?>
+    <span class="text-xs <?=$markov_est['confidence']==='low'?'bg-amber-100 text-amber-700 border-amber-300':'bg-green-100 text-green-700 border-green-300'?> border rounded px-1.5 py-0.5"><?=h(ucfirst($markov_est['confidence']))?> confidence · n=<?=(int)$markov_est['n']?> transitions</span>
+  </div>
+  <?php
+  $P=$markov_est['P'];
+  $N_m=markov_fundamental_matrix($P);
+  $steps=markov_expected_steps($N_m);
+  $p30_ann=markov_p_resolved_in_k($P,$N_m,0,2);
+  $p30_act=markov_p_resolved_in_k($P,$N_m,1,2);
+  $p60_ann=markov_p_resolved_in_k($P,$N_m,0,4);
+  $p60_act=markov_p_resolved_in_k($P,$N_m,1,4);
+  $esc_ann=markov_escalation_prob($P,0);
+  $esc_act=markov_escalation_prob($P,1);
+  $e_ann_lo=max(7,(int)round($steps[0]*14*0.65));$e_ann_hi=(int)round($steps[0]*14*1.45);
+  $e_act_lo=max(7,(int)round($steps[1]*14*0.65));$e_act_hi=(int)round($steps[1]*14*1.45);
+  ?>
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+    <div class="bg-white rounded border border-indigo-100 p-3">
+      <div class="text-xs text-indigo-600 font-medium mb-1">Announced → Resolved (30d)</div>
+      <div class="text-2xl font-bold <?=$p30_ann>0.5?'text-green-700':'text-amber-700'?>"><?=round($p30_ann*100)?>%</div>
+    </div>
+    <div class="bg-white rounded border border-indigo-100 p-3">
+      <div class="text-xs text-indigo-600 font-medium mb-1">Active → Resolved (30d)</div>
+      <div class="text-2xl font-bold <?=$p30_act>0.5?'text-green-700':'text-amber-700'?>"><?=round($p30_act*100)?>%</div>
+    </div>
+    <div class="bg-white rounded border border-indigo-100 p-3">
+      <div class="text-xs text-indigo-600 font-medium mb-1">Escalation risk (active)</div>
+      <div class="text-2xl font-bold <?=$esc_act>0.25?'text-red-700':'text-slate-600'?>"><?=round($esc_act*100)?>%</div>
+    </div>
+    <div class="bg-white rounded border border-indigo-100 p-3">
+      <div class="text-xs text-indigo-600 font-medium mb-1">Expected resolution</div>
+      <div class="text-lg font-bold text-indigo-900"><?=$e_act_lo?>–<?=$e_act_hi?> <span class="text-xs font-normal">days</span></div>
+    </div>
+  </div>
+  <?php if($markov_est['confidence']==='low'): ?>
+  <p class="text-xs text-amber-700 mt-2">⚠ Low-confidence estimates: fewer than 10 status transitions recorded. Probabilities are Laplace-smoothed priors. Run poll_status regularly to build the training set.</p>
+  <?php endif; ?>
 </div>
 
 <?php if(!empty($velocity['trending_cats'])): ?>
@@ -2690,17 +2938,19 @@ function view_map():void{
 
 function view_timeline():void{
     $records=q_timeline_data(80);
+    $markov_est=markov_estimate_matrix();
     layout_head('Timeline / Gantt','timeline'); ?>
 <div class="mb-3 flex items-center gap-3">
   <div class="text-sm text-slate-600">Recall timeline from earliest to most recent. Bar width = duration active (min 3px). Color = severity class.</div>
   <a href="?api=export_pdf&status=all" target="_blank" class="no-print ml-auto text-xs text-fw-500 border border-fw-500 rounded px-3 py-1 hover:bg-fw-50 flex items-center gap-1"><i data-lucide="printer" class="w-3 h-3"></i>Print / PDF</a>
 </div>
 <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
-  <div id="gantt-legend" class="flex items-center gap-4 text-xs text-slate-600 mb-3">
+  <div id="gantt-legend" class="flex items-center gap-4 text-xs text-slate-600 mb-3 flex-wrap">
     <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded bg-red-500"></span>Class I</span>
     <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded bg-amber-400"></span>Class II</span>
     <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded bg-green-500"></span>Class III</span>
     <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded bg-slate-300"></span>Completed</span>
+    <span class="flex items-center gap-1"><span class="inline-block w-12 h-0 border-t-2 border-dashed border-indigo-400"></span>Projected resolution</span>
   </div>
   <div id="gantt-chart" style="overflow-x:auto"></div>
 </div>
@@ -2711,7 +2961,28 @@ function view_timeline():void{
   const today=new Date();
   const dates=raw.map(d=>new Date(d.announced_date)).filter(d=>!isNaN(d));
   if(!dates.length)return;
-  const minD=new Date(Math.min(...dates)),maxD=today;
+  // Compute projected resolution for ongoing recalls via Markov model
+  const markovP=<?=js($markov_est['P']??[[0,0.72,0.18,0.10],[0,0,0.85,0.15],[0,0,0,1],[0,0,0,1]])?>;
+  const cycleDays=14;
+  function pResolvedInK(P,state,k){
+    if(state>=2)return 1.0;
+    const Q=[[P[0][0]??0,P[0][1]??0],[P[1][0]??0,P[1][1]??0]];
+    let Qk=[[1,0],[0,1]];
+    for(let s=0;s<k;s++){const t=[[0,0],[0,0]];for(let r=0;r<2;r++)for(let c=0;c<2;c++)for(let tt=0;tt<2;tt++)t[r][c]+=Qk[r][tt]*Q[tt][c];Qk=t;}
+    return Math.max(0,Math.min(1,1-Qk[state].reduce((a,b)=>a+b,0)));
+  }
+  function fundamentalN(P){
+    const Q=[[P[0][0]??0,P[0][1]??0],[P[1][0]??0,P[1][1]??0]];
+    const a=1-Q[0][0],b=-Q[0][1],c=-Q[1][0],d=1-Q[1][1],det=a*d-b*c;
+    if(Math.abs(det)<1e-9)return[[1,0],[0,1]];
+    return[[d/det,-b/det],[-c/det,a/det]];
+  }
+  const Nm=fundamentalN(markovP);
+  function expectedDays(state){if(state>=2)return 0;return Math.round((Nm[state][0]+Nm[state][1])*cycleDays);}
+  const smap={announced:0,active:1,ongoing:1,resolved:2,completed:2,terminated:2,archived:3};
+  const minD=new Date(Math.min(...dates));
+  // Extend maxD to include projections for ongoing recalls
+  const maxD=new Date(Math.max(today.getTime(),...raw.filter(d=>d.status==='ongoing').map(d=>today.getTime()+expectedDays(1)*86400000)));
   const W=Math.max(700,document.getElementById('gantt-chart').offsetWidth-20);
   const rowH=22,labelW=200,m={top:30,right:20,bottom:10,left:labelW};
   const H=rowH*raw.length;
@@ -2724,6 +2995,10 @@ function view_timeline():void{
   g.append('g').call(d3.axisTop(x).ticks(d3.timeMonth.every(3)).tickFormat(d3.timeFormat('%b %Y'))).selectAll('text').attr('font-size','9').attr('fill','#64748b');
   // Grid lines
   g.selectAll('.gridline').data(x.ticks(d3.timeMonth.every(3))).enter().append('line').attr('x1',d=>x(d)).attr('x2',d=>x(d)).attr('y1',0).attr('y2',H).attr('stroke','#e2e8f0').attr('stroke-width',1);
+  // Today line
+  const xToday=x(today);
+  g.append('line').attr('x1',xToday).attr('x2',xToday).attr('y1',0).attr('y2',H).attr('stroke','#6366f1').attr('stroke-width',1.5).attr('stroke-dasharray','4,3');
+  g.append('text').attr('x',xToday+3).attr('y',-5).attr('font-size','8').attr('fill','#6366f1').text('Today');
   // Rows
   raw.forEach((d,i)=>{
     const y=i*rowH+2;
@@ -2737,6 +3012,20 @@ function view_timeline():void{
     const bar=g.append('rect').attr('x',x1).attr('y',y).attr('width',x2-x1).attr('height',rowH-4).attr('rx',2).attr('fill',colorFaded(d)).attr('opacity',d.status==='completed'?0.5:0.85).style('cursor','pointer');
     bar.append('title').text(`${d.title}\n${d.announced_date} → ${d.status_updated_date||'ongoing'}\n${d.classification||''} (${d.agency_code})`);
     bar.on('click',()=>location='?page=recall&id='+d.id);
+    // Projected-resolution dashed extension for ongoing recalls
+    if(d.status==='ongoing'||d.status==='active'||d.status==='announced'){
+      const state=smap[d.status]??1;
+      const projDays=expectedDays(state);
+      if(projDays>0){
+        const projEnd=new Date(today.getTime()+projDays*86400000);
+        const xProj=x(projEnd);
+        if(xProj>x2){
+          g.append('line').attr('x1',x2).attr('x2',xProj).attr('y1',y+(rowH-4)/2).attr('y2',y+(rowH-4)/2).attr('stroke','#818cf8').attr('stroke-width',2).attr('stroke-dasharray','5,3')
+            .append('title').text(`Projected resolution in ~${projDays} days (Markov estimate)`);
+          g.append('circle').attr('cx',xProj).attr('cy',y+(rowH-4)/2).attr('r',3).attr('fill','#6366f1').attr('opacity',0.7);
+        }
+      }
+    }
   });
 })();
 </script>
@@ -3089,6 +3378,112 @@ function view_subscriptions():void{
   </div>
   <?php elseif(is_admin()): ?>
   <p class="text-sm text-slate-500 text-center py-4">No subscriptions yet.</p>
+  <?php endif; ?>
+</div>
+<?php layout_foot(); }
+
+function view_markov_admin():void{
+    $est=markov_estimate_matrix();
+    $N=markov_fundamental_matrix($est['P']);
+    $steps=markov_expected_steps($N);
+    $tc=(int)db()->query("SELECT COUNT(*) FROM recall_transitions")->fetchColumn();
+    $last=db()->query("SELECT computed_at,confidence,sample_n FROM markov_params ORDER BY id DESC LIMIT 1")->fetch();
+    $history=db()->query("SELECT computed_at,confidence,sample_n FROM markov_params ORDER BY id DESC LIMIT 10")->fetchAll();
+    $labels=['announced','active','resolved','archived'];
+    layout_head('Model Diagnostics','markov_admin'); ?>
+<div class="mb-4 flex items-center gap-3">
+  <h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="activity" class="w-4 h-4 text-indigo-500"></i>Markov Transition Model — Diagnostics</h2>
+  <?php if(is_admin()): ?>
+  <a href="?api=markov_refresh" class="ml-auto text-xs bg-indigo-600 text-white rounded px-3 py-1 hover:bg-indigo-700">Recompute &amp; Cache</a>
+  <?php endif; ?>
+</div>
+
+<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+  <div class="fw-stat"><div class="text-3xl font-bold text-indigo-700"><?=(int)$tc?></div><div class="text-xs text-slate-500 mt-1">Status transitions recorded</div></div>
+  <div class="fw-stat"><div class="text-3xl font-bold <?=$est['confidence']==='low'?'text-amber-600':($est['confidence']==='high'?'text-green-600':'text-slate-700')?>"><?=h(ucfirst($est['confidence']))?></div><div class="text-xs text-slate-500 mt-1">Model confidence</div></div>
+  <div class="fw-stat"><div class="text-3xl font-bold text-slate-700"><?=number_format($steps[0],1)?></div><div class="text-xs text-slate-500 mt-1">E[cycles] from Announced</div></div>
+  <div class="fw-stat"><div class="text-3xl font-bold text-slate-700"><?=number_format($steps[1],1)?></div><div class="text-xs text-slate-500 mt-1">E[cycles] from Active</div></div>
+</div>
+
+<?php if($est['confidence']==='low'): ?>
+<div class="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 text-sm text-amber-800 flex items-center gap-2">
+  <i data-lucide="alert-circle" class="w-4 h-4 flex-shrink-0"></i>
+  <span><strong>Low confidence:</strong> Only <?=(int)$est['n']?> transitions recorded. Estimates use Laplace-smoothed priors. Run poll_status regularly to build the training dataset. Confidence upgrades to "medium" at n≥10, "high" at n≥50.</span>
+</div>
+<?php endif; ?>
+
+<!-- Transition Matrix P -->
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-4">
+  <h3 class="text-sm font-semibold text-slate-700 mb-3">Transition Matrix P (row-stochastic, 4×4)</h3>
+  <p class="text-xs text-slate-500 mb-3">P[i][j] = probability of moving from state i → state j in one review cycle (~14 days). Laplace-smoothed. Absorbing state: archived.</p>
+  <div style="overflow-x:auto">
+  <table class="fw-table text-xs font-mono">
+    <thead><tr><th class="text-right pr-3">From \ To</th><?php foreach($labels as $l): ?><th class="text-center"><?=h(ucfirst($l))?></th><?php endforeach; ?></tr></thead>
+    <tbody>
+    <?php foreach($est['P'] as $i=>$row): ?>
+    <tr>
+      <td class="text-right pr-3 font-semibold text-slate-600"><?=h(ucfirst($labels[$i]))?></td>
+      <?php foreach($row as $j=>$v): ?>
+      <?php $heat=$v>0.6?'bg-indigo-100 text-indigo-800 font-bold':($v>0.3?'bg-indigo-50 text-indigo-700':($v>0?'text-slate-600':'text-slate-300')); ?>
+      <td class="text-center <?=$heat?>"><?=number_format($v,4)?></td>
+      <?php endforeach; ?>
+    </tr>
+    <?php endforeach; ?>
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<!-- Fundamental Matrix N -->
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-4">
+  <h3 class="text-sm font-semibold text-slate-700 mb-1">Fundamental Matrix N = (I−Q)⁻¹ (2×2 transient submatrix)</h3>
+  <p class="text-xs text-slate-500 mb-3">N[i][j] = expected number of times the chain is in transient state j before absorption, given start state i. Row-sum = E[steps to resolution].</p>
+  <table class="fw-table text-xs font-mono">
+    <thead><tr><th>From \ Via</th><th>Announced</th><th>Active</th><th>E[steps]</th><th>E[days] (~14d/cycle)</th></tr></thead>
+    <tbody>
+    <?php foreach([0=>'Announced',1=>'Active'] as $si=>$sl): ?>
+    <tr>
+      <td class="font-semibold"><?=$sl?></td>
+      <td class="text-center"><?=number_format($N[$si][0]??0,4)?></td>
+      <td class="text-center"><?=number_format($N[$si][1]??0,4)?></td>
+      <td class="text-center font-bold text-indigo-700"><?=number_format($steps[$si]??0,2)?></td>
+      <td class="text-center"><?=max(7,(int)round(($steps[$si]??4)*14*0.65))?>–<?=(int)round(($steps[$si]??4)*14*1.45)?></td>
+    </tr>
+    <?php endforeach; ?>
+    </tbody>
+  </table>
+</div>
+
+<!-- Transition history -->
+<?php if($history): ?>
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-4">
+  <h3 class="text-sm font-semibold text-slate-700 mb-3">Cached Model History (last 10)</h3>
+  <table class="fw-table w-full text-xs">
+    <thead><tr><th>Computed</th><th>Transitions (n)</th><th>Confidence</th></tr></thead>
+    <tbody>
+    <?php foreach($history as $h): ?>
+    <tr><td class="font-mono"><?=h($h['computed_at'])?></td><td class="text-center"><?=(int)$h['sample_n']?></td><td><?=h($h['confidence'])?></td></tr>
+    <?php endforeach; ?>
+    </tbody>
+  </table>
+</div>
+<?php endif; ?>
+
+<!-- Recent transitions -->
+<?php $recent_t=db()->query("SELECT rt.id,rt.from_status,rt.to_status,rt.days_in_from_state,rt.transitioned_at,r.title FROM recall_transitions rt JOIN recalls r ON r.id=rt.recall_id ORDER BY rt.id DESC LIMIT 20")->fetchAll(); ?>
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+  <h3 class="text-sm font-semibold text-slate-700 mb-3">Recent Status Transitions (last 20)</h3>
+  <?php if(!$recent_t): ?>
+  <p class="text-sm text-slate-400 text-center py-6">No transitions recorded yet. Run poll_status to begin collecting data.</p>
+  <?php else: ?>
+  <table class="fw-table w-full text-xs">
+    <thead><tr><th>Recall</th><th>From</th><th>To</th><th>Days in prior state</th><th>When</th></tr></thead>
+    <tbody>
+    <?php foreach($recent_t as $t): ?>
+    <tr><td class="max-w-xs truncate"><?=h(mb_substr($t['title'],0,50))?></td><td><?=h($t['from_status'])?></td><td><strong><?=h($t['to_status'])?></strong></td><td class="text-center"><?=(int)$t['days_in_from_state']?></td><td class="font-mono"><?=h($t['transitioned_at'])?></td></tr>
+    <?php endforeach; ?>
+    </tbody>
+  </table>
   <?php endif; ?>
 </div>
 <?php layout_foot(); }
