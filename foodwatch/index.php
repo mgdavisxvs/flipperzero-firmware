@@ -9,8 +9,8 @@ declare(strict_types=1);
 // ================================================================
 // § CONSTANTS
 // ================================================================
-const FW_VERSION    = '4.0.0';
-const FW_SCHEMA_VER = 11;
+const FW_VERSION    = '4.0.1';
+const FW_SCHEMA_VER = 12;
 const FW_DATA_DIR   = __DIR__ . '/data';
 const FW_DB_PATH    = __DIR__ . '/data/foodwatch.db';
 const FW_LAMBDA     = 0.01;   // global daily decay fallback; per-category λ_c overrides via food_categories.lambda_decay
@@ -204,7 +204,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -477,6 +477,13 @@ function m11():string{
     return "ALTER TABLE food_categories ADD COLUMN lambda_decay REAL NOT NULL DEFAULT 0.01;";
 }
 
+function m12():string{ return <<<'SQL'
+ALTER TABLE distributors ADD COLUMN city TEXT NOT NULL DEFAULT '';
+ALTER TABLE distributors ADD COLUMN state TEXT NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dist_norm ON distributors(normalized_name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_store_ret_state ON stores(retailer_id,state) WHERE state IS NOT NULL;
+SQL; }
+
 // ================================================================
 // § ENTITY RESOLUTION
 // ================================================================
@@ -600,6 +607,26 @@ function extract_retailers_from_text(string $text):array{
     return $found;
 }
 
+// Extract distributor names from distribution/reason text using "distributed by" / "distributor:" patterns
+function extract_distributors_from_text(string $text):array{
+    $found=[];
+    // Match "distributed by X", "distributor: X", "dist. by X", "sold/supplied by X"
+    $patterns=[
+        '/distribut(?:ed|or)\s*(?:by|:)\s*([A-Z][A-Za-z0-9&\',. ]{3,50}?)(?:\s*(?:LLC|Inc|Corp|Co\.|Ltd|LP)\.?)?(?:[,;\n]|$)/i',
+        '/(?:supplied|shipped|sold)\s+by\s+([A-Z][A-Za-z0-9&\',. ]{3,50}?)(?:\s*(?:LLC|Inc|Corp|Co\.|Ltd|LP)\.?)?(?:[,;\n]|$)/i',
+    ];
+    foreach($patterns as $pat){
+        if(preg_match_all($pat,$text,$m)){
+            foreach($m[1] as $name){
+                $name=trim($name);
+                if($name&&strlen($name)>3&&strlen($name)<80)
+                    $found[]=$name;
+            }
+        }
+    }
+    return array_unique($found);
+}
+
 function get_hazard_id(string $slug):?int{
     $r=db()->prepare('SELECT id FROM hazards WHERE slug=?');
     $r->execute([$slug]);
@@ -696,6 +723,7 @@ function parse_fda_record(array $r,int $agency_id):array|string{
     $hazards=classify_hazards($reason.' '.$title);
     $states=extract_states($dist.' '.$reason);
     $retailers=extract_retailers_from_text($dist.' '.$reason);
+    $distributors=extract_distributors_from_text($dist.' '.$reason);
 
     $mfr_id=0;
     if($firm){
@@ -723,7 +751,7 @@ function parse_fda_record(array $r,int $agency_id):array|string{
         'source_publication_date'=>$date,
         'raw_payload'=>json_encode($r),
         '_mfr_id'=>$mfr_id,'_hazards'=>$hazards,
-        '_states'=>$states,'_retailers'=>$retailers,
+        '_states'=>$states,'_retailers'=>$retailers,'_distributors'=>$distributors,
         '_code_info'=>trim($r['code_info']??''),
         '_brand'=>$firm,
     ];
@@ -805,6 +833,7 @@ function parse_fsis_record(array $r,int $agency_id):array|string{
     $hazards=classify_hazards($reason.' '.$title);
     $states=extract_states($dist.' '.$reason);
     $retailers=extract_retailers_from_text($dist.' '.$reason);
+    $distributors=extract_distributors_from_text($dist.' '.$reason);
 
     $mfr_id=0;
     if($firm)$mfr_id=resolve_manufacturer($firm);
@@ -828,7 +857,7 @@ function parse_fsis_record(array $r,int $agency_id):array|string{
         'units'=>'lbs','food_category_id'=>$cat_id,
         'source_publication_date'=>$date,'raw_payload'=>json_encode($r),
         '_mfr_id'=>$mfr_id,'_hazards'=>$hazards,
-        '_states'=>$states,'_retailers'=>$retailers,
+        '_states'=>$states,'_retailers'=>$retailers,'_distributors'=>$distributors,
         '_code_info'=>'','_brand'=>$firm,
     ];
 }
@@ -854,6 +883,7 @@ function upsert_recall(array $r,array $raw):string{
         update_recall_states($rid,$r['_states']);
         update_recall_retailers($rid,$r['_retailers']);
         update_recall_hazards($rid,$r['_hazards']);
+        if(!empty($r['_distributors']))update_recall_distributors($rid,$r['_distributors']);
         score_recall_retailers($rid);
         update_fts($rid);
         return 'updated';
@@ -877,6 +907,7 @@ function upsert_recall(array $r,array $raw):string{
     update_recall_states($rid,$r['_states']);
     update_recall_retailers($rid,$r['_retailers']);
     update_recall_hazards($rid,$r['_hazards']);
+    if(!empty($r['_distributors']))update_recall_distributors($rid,$r['_distributors']);
 
     // Source record
     $db->prepare('INSERT OR IGNORE INTO source_records(recall_id,agency_id,source_id,source_url,raw_json,parser_version)VALUES(?,?,?,?,?,?)')->execute([$rid,$r['agency_id'],$r['source_id'],$r['source_url'],json_encode($r['raw_payload']),'1.0']);
@@ -902,9 +933,31 @@ function update_recall_states(int $rid,array $states):void{
 }
 
 function update_recall_retailers(int $rid,array $retailers):void{
+    // Fetch recall's states for store population (OR03/D-005)
+    try{
+        $state_rows=db()->prepare('SELECT state_code FROM recall_states WHERE recall_id=?');
+        $state_rows->execute([$rid]);
+        $recall_states=array_column($state_rows->fetchAll(),'state_code');
+    }catch(\Throwable){$recall_states=[];}
+
     foreach($retailers as [$name,$conf]){
         $ret_id=resolve_retailer($name);
         db()->prepare('INSERT OR IGNORE INTO recall_retailers(recall_id,retailer_id,relationship_type,confidence)VALUES(?,?,?,?)')->execute([$rid,$ret_id,'retailer',$conf]);
+        // Populate stores: one virtual record per (retailer, state) pair derived from this recall's geography
+        foreach($recall_states as $sc){
+            try{
+                db()->prepare('INSERT OR IGNORE INTO stores(retailer_id,name,state)VALUES(?,?,?)')->execute([$ret_id,$name.' ('.$sc.')',$sc]);
+            }catch(\Throwable){}
+        }
+    }
+}
+
+function update_recall_distributors(int $rid,array $distributors):void{
+    foreach($distributors as $name){
+        $dist_id=resolve_distributor($name);
+        try{
+            db()->prepare('INSERT OR IGNORE INTO recall_distributors(recall_id,distributor_id,relationship_type,confidence)VALUES(?,?,?,?)')->execute([$rid,$dist_id,'distributor','probable']);
+        }catch(\Throwable){}
     }
 }
 
@@ -1030,6 +1083,8 @@ function q_stats(string $state=''):array{
 
     $newest=$db->query("SELECT title,announced_date FROM recalls ORDER BY announced_date DESC LIMIT 1")->fetch();
     $last_sync=$db->query("SELECT MAX(completed_at) FROM ingestion_runs WHERE status IN('completed','partial')")->fetchColumn();
+    $total_stores=(int)$db->query("SELECT COUNT(*) FROM stores")->fetchColumn();
+    $total_distributors=(int)$db->query("SELECT COUNT(*) FROM distributors")->fetchColumn();
 
     // API health summary for dashboard badge
     try{
@@ -1038,7 +1093,7 @@ function q_stats(string $state=''):array{
         foreach($api_rows as $ah){$api_health[$ah['agency_code']]=$ah;}
     }catch(\Throwable){$api_health=[];}
 
-    return compact('total','active','severe','retailers','cats','total_retailers','total_cats','newest','last_sync','api_health');
+    return compact('total','active','severe','retailers','cats','total_retailers','total_cats','newest','last_sync','api_health','total_stores','total_distributors');
 }
 
 function q_recalls(int $page=1,int $per=25,array $f=[]):array{
@@ -1990,10 +2045,12 @@ function view_dashboard():void{
 </div>
 
 <!-- Stats row -->
-<div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
+<div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3 mb-6">
   <div class="fw-stat"><div class="text-2xl font-bold text-slate-800"><?=number_format($stats['active'])?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="alert-circle" class="w-3 h-3 text-red-500"></i>Active Recalls</div></div>
   <div class="fw-stat"><div class="text-2xl font-bold text-red-600"><?=number_format($stats['severe'])?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="shield-alert" class="w-3 h-3 text-red-600"></i>Class I (Severe)</div></div>
   <div class="fw-stat"><div class="text-2xl font-bold text-slate-800"><?=number_format($stats['total_retailers'])?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="store" class="w-3 h-3"></i>Retailers Affected</div></div>
+  <div class="fw-stat"><div class="text-2xl font-bold text-slate-800"><?=number_format($stats['total_stores']??0)?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="map-pin" class="w-3 h-3"></i>Store Locations</div></div>
+  <div class="fw-stat"><div class="text-2xl font-bold text-slate-800"><?=number_format($stats['total_distributors']??0)?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="truck" class="w-3 h-3"></i>Distributors</div></div>
   <div class="fw-stat"><div class="text-2xl font-bold text-slate-800"><?=number_format($stats['total_cats'])?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="tag" class="w-3 h-3"></i>Food Categories</div></div>
   <div class="fw-stat"><div class="text-2xl font-bold text-slate-800"><?=number_format($stats['total'])?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="database" class="w-3 h-3"></i>Total Records</div></div>
   <div class="fw-stat"><div class="text-sm font-semibold text-slate-700 truncate"><?=h(mb_substr($stats['newest']['title']??'—',0,30))?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="clock" class="w-3 h-3"></i>Newest Recall</div></div>
@@ -2650,7 +2707,7 @@ function view_watchlist():void{
     <p class="text-sm font-medium text-blue-800">Get email alerts for your watched items</p>
     <p class="text-xs text-blue-600 mt-0.5">Subscribe to receive notifications when new recalls match your watchlist.</p>
   </div>
-  <a href="?page=subscribe" class="bg-blue-600 text-white text-xs rounded px-3 py-1.5 hover:bg-blue-700 flex-shrink-0">Subscribe →</a>
+  <a href="?page=subscriptions" class="bg-blue-600 text-white text-xs rounded px-3 py-1.5 hover:bg-blue-700 flex-shrink-0">Subscribe →</a>
 </div>
 
 <div class="bg-white rounded-lg border border-slate-200 shadow-sm">
