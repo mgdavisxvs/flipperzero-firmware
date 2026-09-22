@@ -10,7 +10,7 @@ declare(strict_types=1);
 // § CONSTANTS
 // ================================================================
 const FW_VERSION    = '4.0.1';
-const FW_SCHEMA_VER = 12;
+const FW_SCHEMA_VER = 13;
 const FW_DATA_DIR   = __DIR__ . '/data';
 const FW_DB_PATH    = __DIR__ . '/data/foodwatch.db';
 const FW_LAMBDA     = 0.01;   // global daily decay fallback; per-category λ_c overrides via food_categories.lambda_decay
@@ -130,6 +130,7 @@ const HAZ_TYPE_MAP = [
 ini_set('session.cookie_httponly','1');
 ini_set('session.use_strict_mode','1');
 ini_set('session.cookie_samesite','Strict');
+ini_set('session.cookie_secure','1');
 if (session_status()===PHP_SESSION_NONE) session_start();
 if (empty($_SESSION['csrf'])) $_SESSION['csrf']=bin2hex(random_bytes(32));
 
@@ -143,7 +144,9 @@ function csrf_ok():bool{
 function is_admin():bool{ return !empty($_SESSION['fw_admin']); }
 function admin_login(string $u,string $p):bool{
     $eu=getenv('FW_ADMIN_USER')?:'admin';
-    $ep=getenv('FW_ADMIN_PASS')?:'foodwatch2024';
+    $ep=getenv('FW_ADMIN_PASS');
+    // Deny all login if FW_ADMIN_PASS env var is not set — no fallback credentials
+    if($ep===false||$ep==='')return false;
     if(hash_equals($eu,$u)&&hash_equals($ep,$p)){$_SESSION['fw_admin']=true;return true;}
     return false;
 }
@@ -204,7 +207,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -484,6 +487,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_dist_norm ON distributors(normalized_name)
 CREATE UNIQUE INDEX IF NOT EXISTS idx_store_ret_state ON stores(retailer_id,state) WHERE state IS NOT NULL;
 SQL; }
 
+function m13():string{ return <<<'SQL'
+ALTER TABLE subscriptions ADD COLUMN confirm_sent_at TEXT;
+SQL; }
+
 // ================================================================
 // § ENTITY RESOLUTION
 // ================================================================
@@ -607,24 +614,34 @@ function extract_retailers_from_text(string $text):array{
     return $found;
 }
 
-// Extract distributor names from distribution/reason text using "distributed by" / "distributor:" patterns
+// Extract distributor names (with optional city/state) from distribution text
+// Returns array of ['name'=>string,'city'=>string,'state'=>string]
 function extract_distributors_from_text(string $text):array{
     $found=[];
-    // Match "distributed by X", "distributor: X", "dist. by X", "sold/supplied by X"
+    $state_abbr=implode('|',array_keys(US_STATES));
+    // Match "distributed by X, City, ST" | "distributor: X" | "supplied/sold by X"
     $patterns=[
-        '/distribut(?:ed|or)\s*(?:by|:)\s*([A-Z][A-Za-z0-9&\',. ]{3,50}?)(?:\s*(?:LLC|Inc|Corp|Co\.|Ltd|LP)\.?)?(?:[,;\n]|$)/i',
-        '/(?:supplied|shipped|sold)\s+by\s+([A-Z][A-Za-z0-9&\',. ]{3,50}?)(?:\s*(?:LLC|Inc|Corp|Co\.|Ltd|LP)\.?)?(?:[,;\n]|$)/i',
+        '/distribut(?:ed|or)\s*(?:by|:)\s*([A-Z][A-Za-z0-9&\',.\- ]{3,60}?)(?:,\s*([A-Za-z ]{2,30}),?\s*('.$state_abbr.'))?(?:[,;\n.]|$)/i',
+        '/(?:supplied|shipped|sold)\s+by\s+([A-Z][A-Za-z0-9&\',.\- ]{3,60}?)(?:,\s*([A-Za-z ]{2,30}),?\s*('.$state_abbr.'))?(?:[,;\n.]|$)/i',
     ];
+    $seen=[];
     foreach($patterns as $pat){
-        if(preg_match_all($pat,$text,$m)){
-            foreach($m[1] as $name){
-                $name=trim($name);
-                if($name&&strlen($name)>3&&strlen($name)<80)
-                    $found[]=$name;
+        if(preg_match_all($pat,$text,$m,PREG_SET_ORDER)){
+            foreach($m as $match){
+                $name=trim($match[1]);
+                // Strip trailing legal suffixes
+                $name=preg_replace('/\s*(?:LLC|Inc\.?|Corp\.?|Co\.|Ltd\.?|LP|LLP)\.?$/i','',$name);
+                $name=trim($name,' ,');
+                if(!$name||strlen($name)<4||strlen($name)>80)continue;
+                if(isset($seen[$name]))continue;
+                $seen[$name]=true;
+                $city=isset($match[2])?trim($match[2]):'';
+                $state=isset($match[3])?strtoupper(trim($match[3])):'';
+                $found[]=['name'=>$name,'city'=>$city,'state'=>$state];
             }
         }
     }
-    return array_unique($found);
+    return $found;
 }
 
 function get_hazard_id(string $slug):?int{
@@ -762,6 +779,106 @@ function parse_fda_date(string $d):?string{
     $d=preg_replace('/\D/','',$d);
     if(strlen($d)===8)return substr($d,0,4).'-'.substr($d,4,2).'-'.substr($d,6,2);
     return null;
+}
+
+// ================================================================
+// § CDC INGESTION (NORS — National Outbreak Reporting System)
+// ================================================================
+// CDC tracks foodborne illness outbreaks; supplemental to FDA/FSIS recall data.
+// Source: https://data.cdc.gov/resource/9c27-af9b.json (NORS food outbreaks)
+const CDC_NORS_API = 'https://data.cdc.gov/resource/9c27-af9b.json';
+
+function ingest_cdc(bool $full=false):array{
+    $agency_id=resolve_agency('CDC');
+    $run_id=start_run('CDC');
+    $stats=['fetched'=>0,'inserted'=>0,'updated'=>0,'rejected'=>0,'errors'=>[]];
+
+    try{
+        $limit=200;$offset=0;
+        do{
+            $res=fw_fetch(CDC_NORS_API,['$limit'=>$limit,'$offset'=>$offset,'$order'=>'year DESC','$where'=>"primary_mode LIKE '%Food%'"],INGEST_TIMEOUT);
+            if(!$res['ok']){
+                $stats['errors'][]='CDC NORS API: '.($res['error']??'unknown');
+                update_api_health('CDC',$res['status']??0,false);
+                break;
+            }
+            update_api_health('CDC',200,true);
+            $results=$res['data'];
+            if(!is_array($results)||empty($results))break;
+
+            foreach($results as $raw){
+                $stats['fetched']++;
+                try{
+                    $r=parse_cdc_record($raw,$agency_id);
+                    if($r==='skip')continue;
+                    $action=upsert_recall($r,$raw);
+                    $stats[$action]++;
+                }catch(\Throwable $e){
+                    $stats['rejected']++;
+                    $stats['errors'][]='CDC parse: '.$e->getMessage();
+                }
+            }
+            $offset+=$limit;
+        }while(count($results)===$limit && $offset<2000);
+    }catch(\Throwable $e){
+        $stats['errors'][]='CDC fatal: '.$e->getMessage();
+    }
+
+    finish_run($run_id,$stats);
+    return $stats;
+}
+
+function parse_cdc_record(array $r,int $agency_id):array|string{
+    $src_id='CDC-NORS-'.trim($r['cdcid']??$r['year'].'-'.($r['state']??'XX').'-'.substr(md5(json_encode($r)),0,8));
+    if(!$src_id||$src_id==='CDC-NORS-')return 'skip';
+
+    $etiology=trim($r['etiology']??$r['confirmed_etiology']??'Unknown pathogen');
+    $food=trim($r['food_vehicle']??$r['implicated_food']??'Unknown food');
+    $state_raw=trim($r['state']??'');
+    $year=trim($r['year']??'');
+    $ill=(int)($r['illnesses']??0);
+    $hosp=(int)($r['hospitalizations']??0);
+    $deaths=(int)($r['deaths']??0);
+
+    $title="CDC Outbreak: $etiology in $food";
+    if(!$food||$food==='Unknown food')$title="CDC Outbreak: $etiology ($year)";
+    $reason="Foodborne illness outbreak. Etiology: $etiology. Food vehicle: $food. Illnesses: $ill, Hospitalizations: $hosp, Deaths: $deaths.";
+
+    // Map etiology to severity
+    $sev=3.0; // CDC outbreaks default Class I — public health emergency
+    if($deaths>0)$sev=3.0;
+    elseif($hosp>0)$sev=2.0;
+    elseif($ill<5)$sev=1.0;
+
+    $date=$year?$year.'-01-01':null;
+    $cat_id=resolve_food_category($food.' '.$etiology);
+    $hazards=classify_hazards($etiology.' '.$reason);
+    $states=[];
+    if($state_raw&&isset(US_STATES[$state_raw])){
+        $states=[[$state_raw,0]];
+    }elseif(strtolower($state_raw)==='multistate'){
+        $states=[['nationwide',1]];
+    }
+
+    $mfr_id=0;
+    $setting=trim($r['setting']??'');
+    if($setting)$mfr_id=resolve_manufacturer($setting);
+
+    return[
+        'agency_id'=>$agency_id,'source_id'=>$src_id,
+        'source_url'=>'https://wwwn.cdc.gov/FoodNetFast/PathogenSurveillance/AnnualSummary',
+        'title'=>$title,'reason'=>$reason,'status'=>'completed',
+        'classification'=>'Class I','severity'=>$sev,'severity_label'=>'Class I',
+        'voluntary_mandated'=>'Agency Action',
+        'announced_date'=>$date,'initiation_date'=>$date,
+        'distribution_description'=>$state_raw,
+        'quantity_recalled'=>$ill>0?"$ill illnesses":'',
+        'food_category_id'=>$cat_id,
+        'source_publication_date'=>$date,'raw_payload'=>json_encode($r),
+        '_mfr_id'=>$mfr_id,'_hazards'=>$hazards,
+        '_states'=>$states,'_retailers'=>[],'_distributors'=>[],
+        '_code_info'=>'',"_brand"=>$setting,
+    ];
 }
 
 // ================================================================
@@ -953,8 +1070,12 @@ function update_recall_retailers(int $rid,array $retailers):void{
 }
 
 function update_recall_distributors(int $rid,array $distributors):void{
-    foreach($distributors as $name){
-        $dist_id=resolve_distributor($name);
+    foreach($distributors as $d){
+        // Support both old string format and new ['name','city','state'] format
+        if(is_string($d)){$name=$d;$city='';$state='';}
+        else{$name=$d['name']??$d;$city=$d['city']??'';$state=$d['state']??'';}
+        if(!$name)continue;
+        $dist_id=resolve_distributor($name,$city,$state);
         try{
             db()->prepare('INSERT OR IGNORE INTO recall_distributors(recall_id,distributor_id,relationship_type,confidence)VALUES(?,?,?,?)')->execute([$rid,$dist_id,'distributor','probable']);
         }catch(\Throwable){}
@@ -999,6 +1120,13 @@ function event_risk(float $sev,float $geo,float $dist_conf,float $rec_weight,flo
 }
 
 function score_recall_retailers(int $rid):void{
+    // Static cache so bulk ingest computes the matrix once, not per-recall
+    static $cached_est=null,$cached_N=null;
+    if($cached_est===null){
+        $cached_est=markov_estimate_matrix();
+        $cached_N=markov_fundamental_matrix($cached_est['P']);
+    }
+
     $rec=db()->prepare('SELECT severity,announced_date,food_category_id,status FROM recalls WHERE id=?');
     $rec->execute([$rid]);$rec=$rec->fetch();
     if(!$rec)return;
@@ -1012,9 +1140,7 @@ function score_recall_retailers(int $rid):void{
     $cur_status=$rec['status']??'ongoing';
     $s_idx=match($cur_status){'ongoing'=>1,'completed'=>2,'terminated'=>3,default=>0};
     if($s_idx<2){
-        $est=markov_estimate_matrix();
-        $N_m=markov_fundamental_matrix($est['P']);
-        $p30_resolved=markov_p_resolved_in_k($est['P'],$N_m,$s_idx,2);
+        $p30_resolved=markov_p_resolved_in_k($cached_est['P'],$cached_N,$s_idx,2);
         $markov_discount=max(0.0,1.0-$p30_resolved); // probability STILL active
     }
 
@@ -1031,6 +1157,32 @@ function score_recall_retailers(int $rid):void{
 function rescore_all():void{
     $ids=db()->query('SELECT id FROM recalls')->fetchAll(PDO::FETCH_COLUMN);
     foreach($ids as $rid)score_recall_retailers((int)$rid);
+    persist_risk_snapshots();
+}
+
+function persist_risk_snapshots():void{
+    // Aggregate daily risk snapshots per retailer from retail_exposures
+    try{
+        $stmt=db()->query("
+            SELECT re.retailer_id,
+              COUNT(DISTINCT CASE WHEN rc.status='ongoing' THEN re.recall_id END) as active_count,
+              ROUND(SUM(re.event_risk),4) as total_risk,
+              COUNT(DISTINCT CASE WHEN rc.severity>=3.0 THEN re.recall_id END) as severe_count,
+              COUNT(DISTINCT CASE WHEN h.type='biological' THEN re.recall_id END) as biological_count,
+              COUNT(DISTINCT CASE WHEN h.type='allergen' THEN re.recall_id END) as allergen_count,
+              COUNT(DISTINCT CASE WHEN h.type='physical' THEN re.recall_id END) as physical_count,
+              COUNT(DISTINCT CASE WHEN h.type='chemical' THEN re.recall_id END) as chemical_count,
+              COUNT(DISTINCT CASE WHEN re.is_private_label=1 THEN re.recall_id END) as private_label_count
+            FROM retail_exposures re
+            JOIN recalls rc ON rc.id=re.recall_id
+            LEFT JOIN recall_hazards rh ON rh.recall_id=re.recall_id
+            LEFT JOIN hazards h ON h.id=rh.hazard_id
+            GROUP BY re.retailer_id");
+        $ins=db()->prepare("INSERT OR REPLACE INTO risk_snapshots(retailer_id,snapshot_date,active_count,total_risk,severe_count,biological_count,allergen_count,physical_count,chemical_count,private_label_count)VALUES(?,date('now'),?,?,?,?,?,?,?,?)");
+        foreach($stmt->fetchAll() as $row){
+            $ins->execute([$row['retailer_id'],$row['active_count'],$row['total_risk'],$row['severe_count'],$row['biological_count'],$row['allergen_count'],$row['physical_count'],$row['chemical_count'],$row['private_label_count']]);
+        }
+    }catch(\Throwable){}
 }
 
 // ================================================================
@@ -1126,11 +1278,21 @@ function q_recalls(int $page=1,int $per=25,array $f=[]):array{
     $stmt=$db->prepare($sql);$stmt->execute([...$p,$per,$offset]);
     $records=$stmt->fetchAll();
 
+    // Batch-fetch hazards and states to avoid N+1 queries
+    $ids=array_column($records,'id');
+    $hazards_map=[];$states_map=[];
+    if($ids){
+        $pl=implode(',',array_fill(0,count($ids),'?'));
+        $hs_all=$db->prepare("SELECT rh.recall_id,h.type,h.name FROM recall_hazards rh JOIN hazards h ON h.id=rh.hazard_id WHERE rh.recall_id IN($pl)");
+        $hs_all->execute($ids);
+        foreach($hs_all->fetchAll() as $row){$hazards_map[$row['recall_id']][]=['type'=>$row['type'],'name'=>$row['name']];}
+        $ss_all=$db->prepare("SELECT recall_id,state_code FROM recall_states WHERE recall_id IN($pl)");
+        $ss_all->execute($ids);
+        foreach($ss_all->fetchAll() as $row){$states_map[$row['recall_id']][]=$row['state_code'];}
+    }
     foreach($records as &$rec){
-        $hs=$db->prepare('SELECT h.type,h.name FROM recall_hazards rh JOIN hazards h ON h.id=rh.hazard_id WHERE rh.recall_id=?');
-        $hs->execute([$rec['id']]);$rec['hazards']=$hs->fetchAll();
-        $ss=$db->prepare('SELECT state_code FROM recall_states WHERE recall_id=? LIMIT 10');
-        $ss->execute([$rec['id']]);$rec['states']=array_column($ss->fetchAll(),'state_code');
+        $rec['hazards']=$hazards_map[$rec['id']]??[];
+        $rec['states']=$states_map[$rec['id']]??[];
     }unset($rec);
     return['records'=>$records,'total'=>$total,'pages'=>(int)ceil($total/$per)];
 }
@@ -1204,10 +1366,6 @@ function q_timeline(int $days=30):array{
     $since=date('Y-m-d',strtotime("-$days days"));
     $stmt=db()->prepare("SELECT r.id,r.title,r.severity,r.severity_label,r.announced_date,a.code as agency,r.status,fc.name as category FROM recalls r JOIN agencies a ON a.id=r.agency_id LEFT JOIN food_categories fc ON fc.id=r.food_category_id WHERE r.announced_date>=? ORDER BY r.announced_date DESC LIMIT 50");
     $stmt->execute([$since]);return $stmt->fetchAll();
-}
-
-function q_ingestion_runs(int $limit=10):array{
-    return db()->prepare('SELECT * FROM ingestion_runs ORDER BY started_at DESC LIMIT ?')->execute([$limit])->fetchAll(); // can't chain
 }
 
 function q_runs(int $limit=10):array{
@@ -1299,7 +1457,13 @@ function q_velocity():array{
     $baseline=round($r90p/3.0,1);
     $z_score=$baseline>0?round(($r30-$baseline)/max(1,sqrt($baseline)),2):0.0;
     $cat_stmt=db()->query("SELECT fc.name,COUNT(DISTINCT r.id) as cnt FROM recalls r JOIN food_categories fc ON fc.id=r.food_category_id WHERE r.announced_date>=date('now','-30 days') GROUP BY fc.id ORDER BY cnt DESC LIMIT 5");
-    return['rate_30d'=>$r30,'rate_90d'=>$r90,'baseline_monthly'=>$baseline,'z_score'=>$z_score,'trending_cats'=>$cat_stmt->fetchAll()];
+    $result=['rate_30d'=>$r30,'rate_90d'=>$r90,'baseline_monthly'=>$baseline,'z_score'=>$z_score,'trending_cats'=>$cat_stmt->fetchAll()];
+    // Persist to recall_velocity for historical tracking
+    try{
+        db()->prepare("INSERT OR REPLACE INTO recall_velocity(computed_date,rate_30d,rate_90d,baseline_monthly,z_score)VALUES(date('now'),?,?,?,?)")
+            ->execute([$r30,$r90,$baseline,$z_score]);
+    }catch(\Throwable){}
+    return $result;
 }
 
 // ================================================================
@@ -1499,7 +1663,7 @@ function q_geo_risk():array{
 function subscription_token():string{ return bin2hex(random_bytes(16)); }
 
 function send_email_alerts():array{
-    $stmt=db()->query("SELECT * FROM subscriptions WHERE active=1");
+    $stmt=db()->query("SELECT * FROM subscriptions WHERE active=1 AND confirmed=1");
     $subs=$stmt->fetchAll();
     $sent=0;$errors=[];
     foreach($subs as $sub){
@@ -1737,6 +1901,7 @@ function route():void{
         case 'recalls':       render_page('recalls');break;
         case 'recall':        render_page('recall');break;
         case 'retailers':     render_page('retailers');break;
+        case 'retailer':      render_page('retailer');break;
         case 'manufacturers': render_page('manufacturers');break;
         case 'categories':    render_page('categories');break;
         case 'analytics':     render_page('analytics');break;
@@ -1776,7 +1941,7 @@ function handle_api(string $api):void{
                 if(!is_admin())fw_abort('Unauthorized',403);
                 if(!csrf_ok())fw_abort('CSRF',403);
                 $src=$_POST['src']??$_GET['src']??'fda';
-                $res=$src==='fsis'?ingest_fsis():ingest_fda();
+                $res=$src==='fsis'?ingest_fsis():($src==='cdc'?ingest_cdc():ingest_fda());
                 echo js(['ok'=>true,'stats'=>$res]);break;
             case 'rescore':
                 if(!is_admin())fw_abort('Unauthorized',403);
@@ -1814,8 +1979,24 @@ function handle_api(string $api):void{
                 $f=['status'=>$_POST['status']??'','severity'=>$_POST['severity']??'','state'=>$_POST['state']??'','category'=>$_POST['category']??''];
                 $f=array_filter($f);
                 $tok=subscription_token();
-                db()->prepare("INSERT OR IGNORE INTO subscriptions(email,filter_json,token)VALUES(?,?,?)")->execute([$email,json_encode($f),$tok]);
-                echo js(['ok'=>true,'message'=>"Subscribed $email"]);break;
+                db()->prepare("INSERT OR IGNORE INTO subscriptions(email,filter_json,token,confirmed,confirm_sent_at)VALUES(?,?,?,0,datetime('now'))")
+                    ->execute([$email,json_encode($f),$tok]);
+                // Send double opt-in confirmation email
+                $confirm_url='http'.(!empty($_SERVER['HTTPS'])?'s':'').'://'.(($_SERVER['HTTP_HOST']??'localhost')).'?api=confirm_subscription&token='.urlencode($tok);
+                $body='<html><body style="font-family:sans-serif;max-width:600px;margin:0 auto"><h2 style="color:#3b5bdb">Confirm Your FoodWatch US Subscription</h2><p>You requested food recall alerts. Click below to confirm your email address:</p><p><a href="'.htmlspecialchars($confirm_url).'" style="background:#3b5bdb;color:#fff;padding:10px 20px;border-radius:4px;text-decoration:none;font-weight:bold;display:inline-block">Confirm Subscription</a></p><p style="font-size:12px;color:#64748b">If you did not request this, ignore this email. Link expires in 72 hours.</p></body></html>';
+                @mail($email,'Confirm your FoodWatch US subscription',$body,"From: FoodWatch US <alerts@foodwatch-us.com>\r\nContent-Type: text/html; charset=utf-8\r\nMIME-Version: 1.0\r\n");
+                echo js(['ok'=>true,'message'=>"Confirmation email sent to $email — check your inbox."]);break;
+            case 'confirm_subscription':
+                $tok=trim($_GET['token']??'');
+                if(!$tok)fw_abort('Missing token',400);
+                $sq=db()->prepare("SELECT id,email,confirmed FROM subscriptions WHERE token=?");$sq->execute([$tok]);$sub=$sq->fetch();
+                if(!$sub)fw_abort('Invalid or expired token',400);
+                if($sub['confirmed'])echo js(['ok'=>true,'message'=>'Already confirmed.']);
+                else{
+                    db()->prepare("UPDATE subscriptions SET confirmed=1 WHERE token=?")->execute([$tok]);
+                    echo js(['ok'=>true,'message'=>'Subscription confirmed! You will now receive recall alerts.']);
+                }
+                break;
             case 'subscription_del':
                 $tok=trim($_GET['token']??$_POST['token']??'');
                 if($tok)db()->prepare("UPDATE subscriptions SET active=0 WHERE token=?")->execute([$tok]);
@@ -1849,8 +2030,9 @@ function handle_api(string $api):void{
                         }
                     }
                 }
-                // Refresh Markov cache after status polling
+                // Refresh Markov cache and risk snapshots after status polling
                 try{markov_refresh_cache();}catch(\Throwable){}
+                try{persist_risk_snapshots();}catch(\Throwable){}
                 echo js(['ok'=>true,'polled'=>count($ongoing),'updated'=>$updated]);break;
             case 'recall_outlook':
                 $id=(int)($_GET['id']??0);
@@ -1925,10 +2107,16 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc}
 @media print{nav,form,button,.no-print{display:none!important}main{margin-left:0!important}body{background:#fff}}
 </style>
 </head>
-<body class="h-full" x-data>
+<body class="h-full" x-data="{navOpen:false}">
 <div class="min-h-full flex">
+<!-- Mobile nav toggle -->
+<button @click="navOpen=!navOpen" class="fixed top-3 left-3 z-30 md:hidden bg-slate-800 text-white rounded p-1.5 shadow-lg" aria-label="Toggle menu">
+  <i data-lucide="menu" class="w-5 h-5"></i>
+</button>
+<!-- Sidebar overlay for mobile -->
+<div x-show="navOpen" @click="navOpen=false" class="fixed inset-0 bg-black/40 z-20 md:hidden" x-transition:enter="transition-opacity ease-out duration-200" x-transition:enter-start="opacity-0" x-transition:leave="transition-opacity ease-in duration-150" x-transition:leave-end="opacity-0"></div>
 <!-- Sidebar -->
-<nav class="w-56 bg-slate-800 flex flex-col fixed h-full z-10 shadow-xl">
+<nav :class="navOpen?'translate-x-0':'-translate-x-full md:translate-x-0'" class="w-56 bg-slate-800 flex flex-col fixed h-full z-20 shadow-xl transition-transform duration-200 ease-in-out">
   <div class="p-4 border-b border-slate-700">
     <a href="?" class="flex items-center gap-2">
       <span class="text-white font-bold text-lg tracking-tight">FoodWatch</span>
@@ -1963,7 +2151,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc}
   <div class="p-3 border-t border-slate-700 text-xs text-slate-500">v<?=FW_VERSION?></div>
 </nav>
 <!-- Main content -->
-<main class="ml-56 flex-1 min-h-full">
+<main class="md:ml-56 flex-1 min-h-full">
 <div class="sticky top-0 z-10 bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between">
   <h1 class="text-sm font-semibold text-slate-700"><?=h($title)?></h1>
   <form action="?" method="get" class="flex items-center gap-2">
@@ -1990,6 +2178,7 @@ function render_page(string $p):void{
         'recalls'       =>view_recalls(),
         'recall'        =>view_recall_detail(),
         'retailers'     =>view_retailers(),
+        'retailer'      =>view_retailer_detail(),
         'manufacturers' =>view_manufacturers(),
         'categories'    =>view_categories(),
         'analytics'     =>view_analytics(),
@@ -2360,44 +2549,41 @@ function view_recall_detail():void{
     </div>
     <?php endif; ?>
 
-    <!-- Recall Outlook (Markov) -->
+    <!-- Recall Outlook (Markov) — async loaded to avoid blocking page render -->
     <?php if($rec['status']==='ongoing'||$rec['status']==='active'||$rec['status']==='announced'): ?>
-    <?php $outlook=q_recall_outlook($id); ?>
-    <div class="bg-indigo-50 rounded-lg border border-indigo-200 shadow-sm p-4">
+    <div class="bg-indigo-50 rounded-lg border border-indigo-200 shadow-sm p-4"
+         x-data="{loading:true,outlook:null,err:null}"
+         x-init="fetch('?api=recall_outlook&id=<?=(int)$id?>').then(r=>r.json()).then(d=>{outlook=d;loading=false}).catch(()=>{err=true;loading=false})">
       <h3 class="text-sm font-semibold text-indigo-800 mb-3 flex items-center gap-2">
         <i data-lucide="activity" class="w-4 h-4"></i>Recall Outlook
-        <?php if(($outlook['confidence']??'low')==='low'): ?>
-        <span class="ml-auto text-xs font-normal bg-amber-100 text-amber-700 border border-amber-300 px-1.5 py-0.5 rounded">Low data</span>
-        <?php endif; ?>
+        <span x-show="!loading&&outlook&&outlook.confidence==='low'" class="ml-auto text-xs font-normal bg-amber-100 text-amber-700 border border-amber-300 px-1.5 py-0.5 rounded">Low data</span>
       </h3>
-      <?php if(isset($outlook['error'])): ?>
-      <p class="text-xs text-indigo-600">Model not yet available.</p>
-      <?php else: ?>
-      <dl class="space-y-2 text-sm">
+      <div x-show="loading" class="text-xs text-indigo-500 animate-pulse">Computing model…</div>
+      <div x-show="!loading&&(err||outlook?.error)" class="text-xs text-indigo-600">Model not yet available.</div>
+      <div x-show="!loading&&!err&&outlook&&(outlook.sample_n??0)<10" class="text-xs text-indigo-600 italic">
+        Insufficient transition data (n=<span x-text="outlook?.sample_n??0"></span>) — model requires ≥10 observed transitions for reliable estimates. Run poll_status to collect more data.
+      </div>
+      <dl x-show="!loading&&!err&&outlook&&(outlook.sample_n??0)>=10" class="space-y-2 text-sm">
         <div class="flex justify-between items-center">
           <dt class="text-xs text-indigo-700 font-medium">P(resolved in 30d)</dt>
-          <?php $p30r=(float)($outlook['p_resolved_30d']??0); ?>
-          <dd class="font-bold <?=$p30r>0.6?'text-green-700':($p30r>0.35?'text-amber-700':'text-red-700')?>"><?=round($p30r*100)?>%</dd>
+          <dd class="font-bold" :class="(outlook?.p_resolved_30d??0)>0.6?'text-green-700':((outlook?.p_resolved_30d??0)>0.35?'text-amber-700':'text-red-700')" x-text="Math.round((outlook?.p_resolved_30d??0)*100)+'%'"></dd>
         </div>
         <div class="flex justify-between items-center">
           <dt class="text-xs text-indigo-700 font-medium">P(resolved in 60d)</dt>
-          <?php $p60r=(float)($outlook['p_resolved_60d']??0); ?>
-          <dd class="font-bold <?=$p60r>0.7?'text-green-700':'text-slate-700'?>"><?=round($p60r*100)?>%</dd>
+          <dd class="font-bold" :class="(outlook?.p_resolved_60d??0)>0.7?'text-green-700':'text-slate-700'" x-text="Math.round((outlook?.p_resolved_60d??0)*100)+'%'"></dd>
         </div>
         <div class="flex justify-between items-center border-t border-indigo-200 pt-2">
           <dt class="text-xs text-indigo-700 font-medium">Escalation risk</dt>
-          <?php $pescr=(float)($outlook['p_escalation']??0); ?>
-          <dd class="font-bold <?=$pescr>0.25?'text-red-700':'text-slate-600'?>"><?=round($pescr*100)?>%</dd>
+          <dd class="font-bold" :class="(outlook?.p_escalation??0)>0.25?'text-red-700':'text-slate-600'" x-text="Math.round((outlook?.p_escalation??0)*100)+'%'"></dd>
         </div>
-        <?php if(($outlook['expected_days_low']??null)): ?>
-        <div class="border-t border-indigo-200 pt-2">
+        <div x-show="outlook?.expected_days_low" class="border-t border-indigo-200 pt-2">
           <dt class="text-xs text-indigo-700 font-medium mb-0.5">Typical resolution</dt>
-          <dd class="text-sm font-semibold text-indigo-900"><?=(int)$outlook['expected_days_low']?>–<?=(int)$outlook['expected_days_high']?> days</dd>
+          <dd class="text-sm font-semibold text-indigo-900" x-text="(outlook?.expected_days_low??'?')+'–'+(outlook?.expected_days_high??'?')+' days'"></dd>
         </div>
-        <?php endif; ?>
       </dl>
-      <p class="text-xs text-indigo-500 mt-3">Markov model · n=<?=(int)($outlook['sample_n']??0)?> transitions · <?=h($outlook['confidence']??'low')?> confidence</p>
-      <?php endif; ?>
+      <p x-show="!loading&&!err&&outlook&&(outlook.sample_n??0)>=10" class="text-xs text-indigo-500 mt-3">
+        Markov model · n=<span x-text="outlook?.sample_n??0"></span> transitions · <span x-text="outlook?.confidence??'low'"></span> confidence
+      </p>
     </div>
     <?php endif; ?>
 
@@ -2472,7 +2658,7 @@ function view_retailers():void{
     <?php foreach($retailers as $r): ?>
     <?php $risk=(float)($r['total_risk']??0); ?>
     <tr>
-      <td class="font-medium text-fw-500"><a href="?page=recalls&retailer=<?=(int)$r['id']?>"><?=h($r['name'])?></a></td>
+      <td class="font-medium text-fw-500"><a href="?page=retailer&id=<?=(int)$r['id']?>"><?=h($r['name'])?></a></td>
       <td class="text-center"><span class="font-bold <?=$r['active_recalls']>0?'text-red-600':'text-slate-400'?>"><?=(int)$r['active_recalls']?></span><br><span class="text-xs text-slate-400">raw count</span></td>
       <td class="text-center">
         <span class="font-bold <?=$risk>5?'text-red-600':($risk>2?'text-orange-500':'text-slate-700')?>"><?=number_format($risk,2)?></span>
@@ -2493,6 +2679,166 @@ function view_retailers():void{
 <div class="mt-3 text-xs text-slate-500 space-y-1">
   <p><strong>Risk Score formula:</strong> EventRisk = Severity(1–3) × GeographicRelevance(0–1) × DistributionConfidence(confirmed=1.0, probable=0.75, inferred=0.5, unknown=0.25) × RecencyWeight(e<sup>−λt</sup>, λ=0.01/day). RetailerExposure = Σ all EventRisk values for that retailer.</p>
   <p><strong>Important:</strong> Raw recall counts and risk scores reflect distribution exposure, not causal responsibility. "Private Label" column tracks retailer-owned brand products only.</p>
+</div>
+<?php layout_foot(); }
+
+function q_retailer(int $id):?array{
+    $db=db();
+    $r=$db->prepare("SELECT rt.id,rt.name,rt.normalized_name,rt.is_chain,
+        COUNT(DISTINCT CASE WHEN rc.status='ongoing' THEN re.recall_id END) as active_recalls,
+        ROUND(SUM(re.event_risk),3) as total_risk,
+        COUNT(DISTINCT re.recall_id) as total_recalls,
+        COUNT(DISTINCT CASE WHEN rc.severity>=3.0 THEN re.recall_id END) as severe_recalls,
+        COUNT(DISTINCT CASE WHEN re.is_private_label=1 THEN re.recall_id END) as private_label_recalls,
+        MAX(re.event_risk) as max_event_risk
+        FROM retailers rt
+        LEFT JOIN retail_exposures re ON re.retailer_id=rt.id
+        LEFT JOIN recalls rc ON rc.id=re.recall_id
+        WHERE rt.id=? GROUP BY rt.id");
+    $r->execute([$id]);$row=$r->fetch();
+    if(!$row)return null;
+    // Active recalls
+    $rs=$db->prepare("SELECT r.id,r.title,r.severity,r.severity_label,r.classification,r.announced_date,r.status,re.event_risk,fc.name as category,a.code as agency
+        FROM retail_exposures re
+        JOIN recalls r ON r.id=re.recall_id
+        JOIN agencies a ON a.id=r.agency_id
+        LEFT JOIN food_categories fc ON fc.id=r.food_category_id
+        WHERE re.retailer_id=? ORDER BY r.status='ongoing' DESC,re.event_risk DESC LIMIT 50");
+    $rs->execute([$id]);$row['recalls']=$rs->fetchAll();
+    // State breakdown
+    $ss=$db->prepare("SELECT rs.state_code,COUNT(DISTINCT rs.recall_id) as cnt FROM recall_states rs JOIN recall_retailers rr ON rr.recall_id=rs.recall_id WHERE rr.retailer_id=? AND rs.state_code!='nationwide' GROUP BY rs.state_code ORDER BY cnt DESC LIMIT 20");
+    $ss->execute([$id]);$row['states']=$ss->fetchAll();
+    // Historical snapshots
+    $snap=$db->prepare("SELECT snapshot_date,active_count,total_risk,severe_count FROM risk_snapshots WHERE retailer_id=? ORDER BY snapshot_date DESC LIMIT 30");
+    $snap->execute([$id]);$row['snapshots']=$snap->fetchAll();
+    // Stores
+    $st=$db->prepare("SELECT state,COUNT(*) as cnt FROM stores WHERE retailer_id=? GROUP BY state ORDER BY cnt DESC LIMIT 20");
+    $st->execute([$id]);$row['store_states']=$st->fetchAll();
+    return $row;
+}
+
+function view_retailer_detail():void{
+    $id=(int)($_GET['id']??0);
+    if(!$id)fw_abort('Missing retailer ID');
+    $r=q_retailer($id);
+    if(!$r)fw_abort('Retailer not found',404);
+
+    layout_head(h($r['name']),'retailers'); ?>
+<div class="mb-4">
+  <a href="?page=retailers" class="text-sm text-fw-500 hover:underline flex items-center gap-1"><i data-lucide="arrow-left" class="w-3 h-3"></i>Back to Retailer Exposure</a>
+</div>
+
+<div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+  <div class="lg:col-span-2 space-y-4">
+    <!-- Header stats -->
+    <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+      <div class="flex items-center gap-3 mb-4">
+        <i data-lucide="store" class="w-8 h-8 text-fw-500"></i>
+        <div>
+          <h2 class="text-xl font-bold text-slate-800"><?=h($r['name'])?></h2>
+          <p class="text-sm text-slate-500"><?=$r['is_chain']?'Chain Retailer':'Independent'?></p>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div class="text-center"><div class="text-2xl font-bold <?=$r['active_recalls']>0?'text-red-600':'text-slate-400'?>"><?=(int)$r['active_recalls']?></div><div class="text-xs text-slate-500">Active Recalls</div></div>
+        <div class="text-center"><div class="text-2xl font-bold text-slate-800"><?=number_format((float)$r['total_risk'],2)?></div><div class="text-xs text-slate-500">Total Risk Score</div></div>
+        <div class="text-center"><div class="text-2xl font-bold text-slate-800"><?=(int)$r['total_recalls']?></div><div class="text-xs text-slate-500">Total Recalls</div></div>
+        <div class="text-center"><div class="text-2xl font-bold <?=$r['severe_recalls']>0?'text-red-600':'text-slate-400'?>"><?=(int)$r['severe_recalls']?></div><div class="text-xs text-slate-500">Class I (Severe)</div></div>
+      </div>
+    </div>
+
+    <!-- Associated Recalls -->
+    <div class="bg-white rounded-lg border border-slate-200 shadow-sm">
+      <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+        <h3 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="alert-triangle" class="w-4 h-4 text-red-500"></i>Associated Recalls</h3>
+        <span class="text-xs text-slate-500"><?=(int)$r['total_recalls']?> total</span>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="fw-table w-full">
+          <thead><tr><th>Severity</th><th>Product</th><th>Agency</th><th>Category</th><th>Date</th><th>Status</th><th>Event Risk</th></tr></thead>
+          <tbody>
+          <?php foreach($r['recalls'] as $rc): ?>
+          <tr>
+            <td><?=sev_badge((float)$rc['severity'],$rc['severity_label']??'')?></td>
+            <td><a href="?page=recall&id=<?=(int)$rc['id']?>" class="text-fw-500 hover:underline"><?=h(mb_substr($rc['title'],0,70))?></a></td>
+            <td class="font-mono text-xs"><?=h($rc['agency']??'')?></td>
+            <td class="text-xs"><?=h($rc['category']??'—')?></td>
+            <td class="text-xs whitespace-nowrap"><?=h($rc['announced_date']??'—')?></td>
+            <td><?=status_badge($rc['status'])?></td>
+            <td class="text-xs text-center font-mono"><?=number_format((float)$rc['event_risk'],3)?></td>
+          </tr>
+          <?php endforeach; ?>
+          <?php if(empty($r['recalls'])): ?><tr><td colspan="7" class="text-center py-8 text-slate-400">No recall associations on record.</td></tr><?php endif; ?>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Risk history sparkline -->
+    <?php if(count($r['snapshots'])>1): ?>
+    <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
+      <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="trending-up" class="w-4 h-4"></i>Risk Score History</h3>
+      <div id="retailer-risk-chart" class="h-32"></div>
+      <script>
+      (function(){
+        const snaps=<?=js(array_reverse($r['snapshots']))?>;
+        if(!snaps.length)return;
+        const el=document.getElementById('retailer-risk-chart');
+        const w=el.offsetWidth||400,h=100,m={t:5,r:10,b:20,l:40};
+        const svg=d3.select('#retailer-risk-chart').append('svg').attr('width','100%').attr('height',h+m.t+m.b);
+        const g=svg.append('g').attr('transform',`translate(${m.l},${m.t})`);
+        const x=d3.scalePoint().domain(snaps.map(d=>d.snapshot_date)).range([0,w-m.l-m.r]);
+        const y=d3.scaleLinear().domain([0,d3.max(snaps,d=>+d.total_risk)||1]).range([h,0]);
+        g.append('path').datum(snaps).attr('fill','none').attr('stroke','#3b5bdb').attr('stroke-width',2)
+          .attr('d',d3.line().x(d=>x(d.snapshot_date)).y(d=>y(+d.total_risk)).curve(d3.curveMonotoneX));
+        g.append('g').attr('transform',`translate(0,${h})`).call(d3.axisBottom(x).tickValues([snaps[0].snapshot_date,snaps[snaps.length-1].snapshot_date]).tickFormat(d=>d)).selectAll('text').attr('font-size','9');
+        g.append('g').call(d3.axisLeft(y).ticks(3)).selectAll('text').attr('font-size','9');
+      })();
+      </script>
+    </div>
+    <?php endif; ?>
+  </div>
+
+  <!-- Sidebar -->
+  <div class="space-y-4">
+    <!-- Geographic reach -->
+    <?php if($r['states']): ?>
+    <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
+      <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="map-pin" class="w-4 h-4"></i>Affected States (from recalls)</h3>
+      <div class="flex flex-wrap gap-1">
+        <?php foreach($r['states'] as $s): ?>
+        <span class="text-xs bg-slate-100 rounded px-1.5 py-0.5 flex items-center gap-1">
+          <?=h($s['state_code'])?><span class="text-slate-400">(<?=$s['cnt']?>)</span>
+        </span>
+        <?php endforeach; ?>
+      </div>
+    </div>
+    <?php endif; ?>
+
+    <!-- Store footprint -->
+    <?php if($r['store_states']): ?>
+    <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
+      <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="store" class="w-4 h-4"></i>Known Store Footprint</h3>
+      <?php foreach($r['store_states'] as $s): ?>
+      <div class="flex justify-between text-sm mb-1"><span><?=h($s['state']?:'—')?></span><span class="font-medium"><?=(int)$s['cnt']?> stores</span></div>
+      <?php endforeach; ?>
+    </div>
+    <?php endif; ?>
+
+    <!-- Latest snapshot -->
+    <?php if($r['snapshots']): ?>
+    <?php $snap=$r['snapshots'][0]; ?>
+    <div class="bg-blue-50 rounded-lg border border-blue-200 shadow-sm p-4">
+      <h3 class="text-sm font-semibold text-blue-800 mb-3 flex items-center gap-2"><i data-lucide="bar-chart-2" class="w-4 h-4"></i>Latest Risk Snapshot</h3>
+      <dl class="space-y-1.5 text-sm">
+        <div class="flex justify-between"><dt class="text-xs text-blue-700">Date</dt><dd><?=h($snap['snapshot_date'])?></dd></div>
+        <div class="flex justify-between"><dt class="text-xs text-blue-700">Active count</dt><dd class="font-semibold"><?=(int)$snap['active_count']?></dd></div>
+        <div class="flex justify-between"><dt class="text-xs text-blue-700">Risk total</dt><dd class="font-semibold"><?=number_format((float)$snap['total_risk'],3)?></dd></div>
+        <div class="flex justify-between"><dt class="text-xs text-blue-700">Severe</dt><dd class="<?=$snap['severe_count']>0?'text-red-600 font-bold':'text-slate-500'?>"><?=(int)$snap['severe_count']?></dd></div>
+      </dl>
+    </div>
+    <?php endif; ?>
+  </div>
 </div>
 <?php layout_foot(); }
 
@@ -2818,7 +3164,7 @@ function view_admin():void{
 <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-6" x-data="{loading:null,msg:''}">
   <h2 class="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><i data-lucide="refresh-cw" class="w-4 h-4"></i>Data Ingestion</h2>
   <div class="flex flex-wrap gap-3 mb-3">
-    <?php foreach(['fda'=>'FDA openFDA','fsis'=>'USDA FSIS'] as $src=>$label): ?>
+    <?php foreach(['fda'=>'FDA openFDA','fsis'=>'USDA FSIS','cdc'=>'CDC NORS'] as $src=>$label): ?>
     <button @click="loading='<?=$src?>';msg='';fetch('?api=ingest',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',src:'<?=$src?>'})}).then(r=>r.json()).then(d=>{loading=null;msg=(d.stats?`<?=h($label)?>: ${d.stats.inserted} new, ${d.stats.updated} updated, ${d.stats.rejected} rejected`:'Done');setTimeout(()=>location.reload(),2000)}).catch(e=>{loading=null;msg='Error: '+e})" :disabled="loading" class="bg-fw-500 text-white text-sm px-4 py-2 rounded font-medium hover:bg-fw-700 disabled:opacity-50 flex items-center gap-2">
       <i data-lucide="download" class="w-4 h-4"></i>
       <span x-show="loading!=='<?=$src?>'">Fetch <?=h($label)?></span>
