@@ -9,8 +9,8 @@ declare(strict_types=1);
 // ================================================================
 // § CONSTANTS
 // ================================================================
-const FW_VERSION    = '5.6.0';
-const FW_SCHEMA_VER = 24;
+const FW_VERSION    = '5.7.0';
+const FW_SCHEMA_VER = 26;
 // Pre-shared secret for IONOS crontab → cron_alerts endpoint; override before deploy
 const FW_CRON_SECRET = 'change-me-before-deploy';
 const FW_DATA_DIR   = __DIR__ . '/data';
@@ -310,7 +310,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -765,6 +765,29 @@ CREATE TABLE IF NOT EXISTS recall_flags(
   updated_at TEXT NOT NULL DEFAULT(datetime('now')),
   UNIQUE(recall_id));
 CREATE INDEX IF NOT EXISTS idx_rf_recall ON recall_flags(recall_id);
+SQL; }
+
+function m25():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS recall_history(
+  id INTEGER PRIMARY KEY,
+  recall_id INTEGER NOT NULL REFERENCES recalls(id) ON DELETE CASCADE,
+  actor_type TEXT NOT NULL DEFAULT 'admin',
+  action TEXT NOT NULL,
+  old_value TEXT NOT NULL DEFAULT '',
+  new_value TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_rh_recall ON recall_history(recall_id, created_at);
+SQL; }
+
+function m26():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS recall_tags(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  recall_id INTEGER NOT NULL REFERENCES recalls(id) ON DELETE CASCADE,
+  tag TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT(datetime('now')),
+  UNIQUE(user_id, recall_id, tag));
+CREATE INDEX IF NOT EXISTS idx_rt_user_recall ON recall_tags(user_id, recall_id);
 SQL; }
 
 // ================================================================
@@ -2565,6 +2588,17 @@ function run_tests():array{
         'activity_tab'          =>'test_activity_tab',
         'sparkline_fn'          =>'test_sparkline_fn',
         'activity_logging'      =>'test_activity_logging',
+        // Sprint 12
+        'recall_history_schema' =>'test_recall_history_schema',
+        'recall_tags_schema'    =>'test_recall_tags_schema',
+        'history_log_on_flag'   =>'test_history_log_on_flag',
+        'tag_add_api'           =>'test_tag_add_api',
+        'tag_display_detail'    =>'test_tag_display_detail',
+        'history_panel_detail'  =>'test_history_panel_detail',
+        'export_json_flags'     =>'test_export_json_flags',
+        'export_json_enriched'  =>'test_export_json_enriched',
+        'v1_flags_resource'     =>'test_v1_flags_resource',
+        'recall_tags_auth'      =>'test_recall_tags_auth',
         // Sprint 9
         'fts_snippet'           =>'test_fts_snippet',
         'similar_recalls'       =>'test_similar_recalls',
@@ -3111,6 +3145,60 @@ function test_activity_logging():array{
     $ok=str_contains($src,"INSERT INTO user_activity")&&str_contains($src,"'login'");
     return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'login activity INSERT present':'login activity logging missing'];
 }
+// ── Sprint 12 tests ──────────────────────────────────────────────
+function test_recall_history_schema():array{
+    try{$cols=db()->query("PRAGMA table_info(recall_history)")->fetchAll(\PDO::FETCH_COLUMN,1);}catch(\Throwable){$cols=[];}
+    $ok=in_array('recall_id',$cols)&&in_array('action',$cols)&&in_array('actor_type',$cols)&&in_array('old_value',$cols)&&in_array('new_value',$cols);
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_history table columns verified':'recall_history schema missing: '.implode(',',array_diff(['recall_id','action','actor_type','old_value','new_value'],$cols))];
+}
+function test_recall_tags_schema():array{
+    try{$cols=db()->query("PRAGMA table_info(recall_tags)")->fetchAll(\PDO::FETCH_COLUMN,1);}catch(\Throwable){$cols=[];}
+    $ok=in_array('user_id',$cols)&&in_array('recall_id',$cols)&&in_array('tag',$cols);
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_tags table (user_id, recall_id, tag) verified':'recall_tags schema incomplete'];
+}
+function test_history_log_on_flag():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"INSERT INTO recall_history")&&str_contains($src,"'flag_set'")&&str_contains($src,"'flag_del'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_history audit logging on flag set/del present':'history logging missing'];
+}
+function test_tag_add_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'tag_add':")&&str_contains($src,"case 'tag_del':")&&str_contains($src,"case 'tags_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'tag_add/del/list API cases present':'tag API cases missing'];
+}
+function test_tag_display_detail():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'tags_list&recall_id=')&&str_contains($src,'tag_add')&&str_contains($src,'tag_del')&&str_contains($src,'My Tags');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'Tags panel in recall_detail present (tags_list + tag_add + tag_del + My Tags)':'tags panel missing'];
+}
+function test_history_panel_detail():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'recall_history_rows')&&str_contains($src,'Flag History')&&str_contains($src,"case 'history_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'Flag History panel and history_list API present':'history panel/API missing'];
+}
+function test_export_json_flags():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'flag_export')&&str_contains($src,'fst_export')&&str_contains($src,"'admin_flag'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'export_json flag enrichment (flag_export, fst_export, admin_flag) present':'export_json flag enrichment missing'];
+}
+function test_export_json_enriched():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'$enriched=array_map')&&str_contains($src,'array_merge($r,')&&str_contains($src,"'admin_flag'=>");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'export_json uses array_map enrichment with admin_flag merge':'export_json enrichment pattern missing'];
+}
+function test_v1_flags_resource():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'flags':")&&str_contains($src,'recall_flags rf JOIN recalls r')&&str_contains($src,"'resource'=>'flags'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'v1/flags resource in switch + docs endpoint present':'v1/flags resource missing'];
+}
+function test_recall_tags_auth():array{
+    $src=file_get_contents(__FILE__);
+    // anchor on the SPRINT 12 comment preceding the case block to avoid matching string literals in test functions
+    $pos=strpos($src,'// SPRINT 12: recall tags');
+    $upos=$pos!==false?strpos($src,'is_user()',$pos):false;
+    $ok=$pos!==false&&$upos!==false&&($upos-$pos)<500;
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'tag_add guarded by is_user() (found within 500 chars of SPRINT 12 comment)':'tag_add missing is_user() auth guard'];
+}
 // ── Sprint 10 tests ──────────────────────────────────────────────
 function test_recall_notes_schema():array{
     try{
@@ -3420,9 +3508,18 @@ function handle_api(string $api):void{
             case 'export_json':
                 $f=['status'=>$_GET['status']??'all','state'=>$_GET['state']??'','category'=>$_GET['cat']??'','hazard'=>$_GET['haz']??'','agency'=>$_GET['agency']??'','severity'=>$_GET['sev']??'','sort'=>$_GET['sort']??'date','q'=>$_GET['q']??''];
                 $data=q_recalls(1,2000,$f);
+                $flag_export=[];
+                $rids_export=array_column($data['records'],'id');
+                if($rids_export){
+                    $fpl_export=implode(',',array_fill(0,count($rids_export),'?'));
+                    $fst_export=db()->prepare("SELECT recall_id,flag,admin_note,updated_at FROM recall_flags WHERE recall_id IN($fpl_export)");
+                    $fst_export->execute($rids_export);
+                    foreach($fst_export->fetchAll() as $fr)$flag_export[(int)$fr['recall_id']]=['flag'=>$fr['flag'],'admin_note'=>$fr['admin_note'],'flag_updated_at'=>$fr['updated_at']];
+                }
+                $enriched=array_map(fn($r)=>array_merge($r,['admin_flag'=>$flag_export[(int)$r['id']]??null]),$data['records']);
                 header('Content-Type: application/json; charset=utf-8');
                 header('Content-Disposition: attachment; filename="foodwatch-recalls-'.date('Y-m-d').'.json"');
-                echo json_encode(['generated_at'=>date('c'),'total'=>$data['total'],'records'=>$data['records']],JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT);
+                echo json_encode(['generated_at'=>date('c'),'total'=>$data['total'],'records'=>$enriched],JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT);
                 exit;
             case 'user_register':
                 if(!csrf_ok())fw_abort('CSRF',403);
@@ -3521,12 +3618,21 @@ function handle_api(string $api):void{
                 $rf_flag=trim($_POST['flag']??'');
                 $rf_note=mb_substr(trim($_POST['admin_note']??''),0,500);
                 if(!$rf_rid||!in_array($rf_flag,['verified','escalated','watch','closed']))fw_abort('Invalid recall_id or flag',400);
+                $rfs_old=db()->prepare("SELECT flag FROM recall_flags WHERE recall_id=?");
+                $rfs_old->execute([$rf_rid]);
+                $rfs_prev=(string)($rfs_old->fetchColumn()?:'');
                 db()->prepare("INSERT INTO recall_flags(recall_id,flag,admin_note)VALUES(?,?,?) ON CONFLICT(recall_id) DO UPDATE SET flag=excluded.flag,admin_note=excluded.admin_note,updated_at=datetime('now')")->execute([$rf_rid,$rf_flag,$rf_note]);
+                try{db()->prepare("INSERT INTO recall_history(recall_id,actor_type,action,old_value,new_value)VALUES(?,?,?,?,?)")->execute([$rf_rid,'admin','flag_set',$rfs_prev,$rf_flag]);}catch(\Throwable){}
                 echo js(['ok'=>true]);break;
             case 'recall_flag_del':
                 if(!is_admin())fw_abort('Unauthorized',403);
                 if(!csrf_ok())fw_abort('CSRF',403);
-                db()->prepare("DELETE FROM recall_flags WHERE recall_id=?")->execute([(int)($_POST['recall_id']??0)]);
+                $rfd_rid=(int)($_POST['recall_id']??0);
+                $rfd_old=db()->prepare("SELECT flag FROM recall_flags WHERE recall_id=?");
+                $rfd_old->execute([$rfd_rid]);
+                $rfd_prev=(string)($rfd_old->fetchColumn()?:'');
+                db()->prepare("DELETE FROM recall_flags WHERE recall_id=?")->execute([$rfd_rid]);
+                try{if($rfd_prev)db()->prepare("INSERT INTO recall_history(recall_id,actor_type,action,old_value,new_value)VALUES(?,?,?,?,?)")->execute([$rfd_rid,'admin','flag_del',$rfd_prev,'']);}catch(\Throwable){}
                 echo js(['ok'=>true]);break;
             case 'recall_flags_list':
                 $rf_rid_q=(int)($_GET['recall_id']??0);
@@ -3552,6 +3658,42 @@ function handle_api(string $api):void{
                 if(!is_user())fw_abort('Login required',401);
                 $s=db()->prepare("SELECT action,meta,created_at FROM user_activity WHERE user_id=? ORDER BY created_at DESC LIMIT 50");
                 $s->execute([current_user()['id']]);echo js($s->fetchAll());break;
+            // SPRINT 12: recall tags
+            case 'tag_add':
+                if(!is_user())fw_abort('Login required',401);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $tag_rid=(int)($_POST['recall_id']??0);
+                $tag_val=mb_strtolower(trim(preg_replace('/[^a-z0-9\-_]/','',mb_strtolower(trim($_POST['tag']??'')))));
+                if(!$tag_rid||mb_strlen($tag_val)<1||mb_strlen($tag_val)>20)fw_abort('Invalid tag or recall_id',400);
+                $tc_s=db()->prepare("SELECT COUNT(*) FROM recall_tags WHERE user_id=? AND recall_id=?");
+                $tc_s->execute([current_user()['id'],$tag_rid]);
+                if((int)$tc_s->fetchColumn()>=20)fw_abort('Tag limit reached (max 20 per recall)',400);
+                db()->prepare("INSERT OR IGNORE INTO recall_tags(user_id,recall_id,tag)VALUES(?,?,?)")->execute([current_user()['id'],$tag_rid,$tag_val]);
+                log_activity('tag_add',['recall_id'=>$tag_rid,'tag'=>$tag_val]);
+                echo js(['ok'=>true]);break;
+            case 'tag_del':
+                if(!is_user())fw_abort('Login required',401);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $tagd_rid=(int)($_POST['recall_id']??0);
+                $tagd_val=mb_strtolower(trim($_POST['tag']??''));
+                db()->prepare("DELETE FROM recall_tags WHERE user_id=? AND recall_id=? AND tag=?")->execute([current_user()['id'],$tagd_rid,$tagd_val]);
+                echo js(['ok'=>true]);break;
+            case 'tags_list':
+                if(!is_user())fw_abort('Login required',401);
+                $tagq_rid=(int)($_GET['recall_id']??0);
+                if($tagq_rid){
+                    $ts=db()->prepare("SELECT tag,created_at FROM recall_tags WHERE user_id=? AND recall_id=? ORDER BY created_at ASC");
+                    $ts->execute([current_user()['id'],$tagq_rid]);echo js($ts->fetchAll());
+                }else{
+                    $ts=db()->prepare("SELECT recall_id,tag,created_at FROM recall_tags WHERE user_id=? ORDER BY recall_id,created_at ASC LIMIT 200");
+                    $ts->execute([current_user()['id']]);echo js($ts->fetchAll());
+                }break;
+            // SPRINT 12: recall flag history
+            case 'history_list':
+                $hl_rid=(int)($_GET['recall_id']??0);
+                if(!$hl_rid)fw_abort('recall_id required',400);
+                $hs=db()->prepare("SELECT actor_type,action,old_value,new_value,created_at FROM recall_history WHERE recall_id=? ORDER BY created_at DESC LIMIT 50");
+                $hs->execute([$hl_rid]);echo js($hs->fetchAll());break;
             case 'v1':
                 $auth=$_SERVER['HTTP_AUTHORIZATION']??'';
                 $raw_key=str_starts_with($auth,'Bearer ')?trim(substr($auth,7)):trim($_GET['api_key']??'');
@@ -3583,6 +3725,20 @@ function handle_api(string $api):void{
                         if(!$eid)fw_abort('Requires ?resource=equivalences&id=<recall_id>',400);
                         $eq=db()->prepare("SELECT r2_id as id,sim FROM recall_equivalences WHERE r1_id=? UNION SELECT r1_id as id,sim FROM recall_equivalences WHERE r2_id=? ORDER BY sim DESC LIMIT 20");
                         $eq->execute([$eid,$eid]);echo js($eq->fetchAll());break;
+                    // SPRINT 12: admin-flagged recalls
+                    case 'flags':
+                        $fl_page=max(1,(int)($_GET['page']??1));
+                        $fl_per=min(100,(int)($_GET['per']??50));
+                        $fl_off=($fl_page-1)*$fl_per;
+                        $fl_type=trim($_GET['flag']??'');
+                        if($fl_type&&in_array($fl_type,['verified','escalated','watch','closed'],true)){
+                            $fls=db()->prepare("SELECT rf.recall_id,rf.flag,rf.admin_note,rf.updated_at,r.title,r.status,r.severity_label FROM recall_flags rf JOIN recalls r ON r.id=rf.recall_id WHERE rf.flag=? ORDER BY rf.updated_at DESC LIMIT ? OFFSET ?");
+                            $fls->execute([$fl_type,$fl_per,$fl_off]);
+                        }else{
+                            $fls=db()->prepare("SELECT rf.recall_id,rf.flag,rf.admin_note,rf.updated_at,r.title,r.status,r.severity_label FROM recall_flags rf JOIN recalls r ON r.id=rf.recall_id ORDER BY rf.updated_at DESC LIMIT ? OFFSET ?");
+                            $fls->execute([$fl_per,$fl_off]);
+                        }
+                        echo js(['page'=>$fl_page,'per'=>$fl_per,'records'=>$fls->fetchAll()]);break;
                     case 'docs':
                         echo js(['version'=>'v1','base'=>'?api=v1&resource=','endpoints'=>[
                             ['resource'=>'recalls','params'=>['id','page','per','status','q','category','state','severity','agency','hazard','sort'],'desc'=>'List or fetch a single recall'],
@@ -3595,9 +3751,10 @@ function handle_api(string $api):void{
                             ['resource'=>'markov','params'=>[],'desc'=>'Markov resolution probability dashboard'],
                             ['resource'=>'co_escalation','params'=>[],'desc'=>'Co-escalation cluster detection'],
                             ['resource'=>'equivalences','params'=>['id'],'desc'=>'Semantically similar recalls for a given recall id'],
+                            ['resource'=>'flags','params'=>['flag','page','per'],'desc'=>'Admin-flagged recalls with flag type and admin notes'],
                             ['resource'=>'docs','params'=>[],'desc'=>'This endpoint listing'],
                         ]]);break;
-                    default: fw_abort('Unknown v1 resource. Valid: recalls, retailers, manufacturers, categories, stats, brands, geo_risk, markov, co_escalation, equivalences, docs',404);
+                    default: fw_abort('Unknown v1 resource. Valid: recalls, retailers, manufacturers, categories, stats, brands, geo_risk, markov, co_escalation, equivalences, flags, docs',404);
                 }
                 exit;
             // SPRINT 6: password reset
@@ -4205,6 +4362,12 @@ function view_recall_detail():void{
         $rfs=db()->prepare("SELECT flag,admin_note,updated_at FROM recall_flags WHERE recall_id=?");
         $rfs->execute([$id]);$recall_flag=$rfs->fetch()?:null;
     }catch(\Throwable){}
+    // Sprint 12: load flag history
+    $recall_history_rows=[];
+    try{
+        $rh_s=db()->prepare("SELECT actor_type,action,old_value,new_value,created_at FROM recall_history WHERE recall_id=? ORDER BY created_at DESC LIMIT 20");
+        $rh_s->execute([$id]);$recall_history_rows=$rh_s->fetchAll();
+    }catch(\Throwable){}
     layout_head(mb_substr($rec['title'],0,60),'recall'); ?>
 
 <div class="mb-4 flex items-center gap-3">
@@ -4464,6 +4627,27 @@ function view_recall_detail():void{
       </div>
     </div>
     <?php endif; ?>
+    <!-- Sprint 12: Flag History panel -->
+    <?php if($recall_history_rows): ?>
+    <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
+      <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="history" class="w-4 h-4 text-violet-500"></i>Flag History</h3>
+      <div class="space-y-2">
+      <?php foreach($recall_history_rows as $rhr): ?>
+      <div class="text-xs border-l-2 border-violet-200 pl-2">
+        <span class="font-medium text-slate-700"><?=h(str_replace('_',' ',$rhr['action']))?></span>
+        <?php if($rhr['old_value']!==''&&$rhr['new_value']!==''): ?>
+        <span class="text-slate-400"> <?=h($rhr['old_value'])?> → <?=h($rhr['new_value'])?></span>
+        <?php elseif($rhr['new_value']!==''): ?>
+        <span class="text-slate-500"> → <?=h($rhr['new_value'])?></span>
+        <?php elseif($rhr['old_value']!==''): ?>
+        <span class="text-slate-400"> (removed <?=h($rhr['old_value'])?>)</span>
+        <?php endif; ?>
+        <span class="text-slate-400 block mt-0.5"><?=h(substr($rhr['created_at'],0,16))?> · <?=h($rhr['actor_type'])?></span>
+      </div>
+      <?php endforeach; ?>
+      </div>
+    </div>
+    <?php endif; ?>
   </div>
 </div>
 
@@ -4507,6 +4691,35 @@ function view_recall_detail():void{
             <button @click="if(confirm('Delete this note?'))fetch('?api=note_del',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',id:n.id})}).then(()=>{notes=notes.filter(x=>x.id!==n.id)})" class="text-xs text-red-500 hover:underline">Delete</button>
           </div>
         </div>
+      </template>
+    </div>
+  </div>
+</div>
+<!-- Sprint 12: Recall Tags panel -->
+<div class="mt-4 bg-white rounded-lg border border-slate-200 shadow-sm"
+  x-data="{tags:[],loading:true,newTag:'',saving:false,err:''}"
+  x-init="fetch('?api=tags_list&recall_id=<?=(int)$id?>').then(r=>r.json()).then(d=>{tags=d;loading=false})">
+  <div class="px-4 py-3 border-b border-slate-200 flex items-center gap-2">
+    <i data-lucide="tag" class="w-4 h-4 text-slate-500"></i>
+    <h3 class="text-sm font-semibold text-slate-700">My Tags</h3>
+    <span class="text-xs text-slate-400 ml-1">Private labels on this recall</span>
+  </div>
+  <div class="p-4">
+    <div class="flex gap-2 mb-3">
+      <input x-model="newTag" @keydown.enter.prevent="$el.nextElementSibling.click()" type="text" maxlength="20" placeholder="Add tag (a-z 0-9 - _)…"
+        class="flex-1 text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+      <button @click="if(!newTag.trim())return;saving=true;err='';fetch('?api=tag_add',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',recall_id:'<?=(int)$id?>',tag:newTag.trim()})}).then(r=>r.json()).then(d=>{saving=false;if(!d.ok){err='Could not add tag.';return;}tags.push({tag:newTag.trim().toLowerCase().replace(/[^a-z0-9\-_]/g,''),created_at:new Date().toISOString()});newTag=''}).catch(()=>{saving=false;err='Error.'})"
+        :disabled="saving||!newTag.trim()" class="bg-fw-500 text-white text-xs px-3 py-1.5 rounded font-medium hover:bg-fw-700 disabled:opacity-50 shrink-0">Add</button>
+    </div>
+    <p x-show="err" x-text="err" class="text-xs text-red-600 mb-2"></p>
+    <div x-show="loading" class="text-xs text-slate-400 animate-pulse">Loading…</div>
+    <div x-show="!loading&&tags.length===0" class="text-xs text-slate-400">No tags yet. Tags help you categorize recalls in your personal tracking.</div>
+    <div x-show="tags.length>0" class="flex flex-wrap gap-1.5">
+      <template x-for="t in tags" :key="t.tag">
+        <span class="inline-flex items-center gap-1 text-xs bg-indigo-100 text-indigo-700 border border-indigo-200 px-2.5 py-1 rounded-full">
+          <span x-text="t.tag"></span>
+          <button @click="fetch('?api=tag_del',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',recall_id:'<?=(int)$id?>',tag:t.tag})}).then(()=>{tags=tags.filter(x=>x.tag!==t.tag)})" class="ml-0.5 text-indigo-400 hover:text-indigo-800 font-bold leading-none">&times;</button>
+        </span>
       </template>
     </div>
   </div>
