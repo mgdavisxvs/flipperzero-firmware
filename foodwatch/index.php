@@ -10,7 +10,7 @@ declare(strict_types=1);
 // § CONSTANTS
 // ================================================================
 const FW_VERSION    = '4.1.0';
-const FW_SCHEMA_VER = 15;
+const FW_SCHEMA_VER = 18;
 const FW_DATA_DIR   = __DIR__ . '/data';
 const FW_DB_PATH    = __DIR__ . '/data/foodwatch.db';
 const FW_LAMBDA     = 0.01;   // global daily decay fallback; per-category λ_c overrides via food_categories.lambda_decay
@@ -269,7 +269,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -595,6 +595,57 @@ function m15():string{ return <<<'SQL'
 ALTER TABLE watchlists ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_wl_user ON watchlists(user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_wl_user_unique ON watchlists(user_id,watch_type,watch_value) WHERE user_id IS NOT NULL;
+SQL; }
+
+function m16():string{ return <<<'SQL'
+ALTER TABLE subscriptions ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_sub_user ON subscriptions(user_id);
+
+CREATE TABLE IF NOT EXISTS recall_equivalences(
+  id INTEGER PRIMARY KEY,
+  r1_id INTEGER REFERENCES recalls(id) ON DELETE CASCADE,
+  r2_id INTEGER REFERENCES recalls(id) ON DELETE CASCADE,
+  sim REAL NOT NULL,
+  detected_at TEXT DEFAULT(datetime('now')),
+  UNIQUE(r1_id,r2_id));
+CREATE INDEX IF NOT EXISTS idx_re_r1 ON recall_equivalences(r1_id);
+CREATE INDEX IF NOT EXISTS idx_re_r2 ON recall_equivalences(r2_id);
+
+CREATE TABLE IF NOT EXISTS watchlist_checks(
+  id INTEGER PRIMARY KEY,
+  watch_id INTEGER REFERENCES watchlists(id) ON DELETE CASCADE,
+  checked_at TEXT DEFAULT(datetime('now')),
+  match_count INTEGER DEFAULT 0);
+CREATE INDEX IF NOT EXISTS idx_wc_watch ON watchlist_checks(watch_id);
+
+CREATE TABLE IF NOT EXISTS state_population(
+  state_code TEXT PRIMARY KEY,
+  population INTEGER NOT NULL);
+
+ALTER TABLE retail_exposures ADD COLUMN risk_normalized REAL DEFAULT 0;
+SQL; }
+
+function m17():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS markov_params_strat(
+  id INTEGER PRIMARY KEY,
+  severity_class TEXT NOT NULL,
+  computed_at TEXT NOT NULL DEFAULT(datetime('now')),
+  state_count INTEGER NOT NULL DEFAULT 4,
+  p_matrix_json TEXT NOT NULL,
+  n_matrix_json TEXT NOT NULL,
+  e_steps_json TEXT NOT NULL,
+  cycle_days REAL NOT NULL DEFAULT 14,
+  sample_n INTEGER NOT NULL DEFAULT 0,
+  confidence TEXT NOT NULL DEFAULT 'low',
+  UNIQUE(severity_class));
+SQL; }
+
+function m18():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS api_rate_limits_minute(
+  key_id INTEGER NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+  window_minute TEXT NOT NULL,
+  request_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(key_id,window_minute));
 SQL; }
 
 // ================================================================
