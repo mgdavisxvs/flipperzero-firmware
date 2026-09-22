@@ -3002,18 +3002,28 @@ function view_watchlist():void{
     $n_total=(int)db()->query('SELECT COUNT(*) FROM recalls')->fetchColumn();
     $ramsey_threshold=max(3,(int)ceil(log(max(2,$n_total))+2));
 
-    // Per-item active recall counts for Ramsey alerting
+    // Per-item active recall counts for Ramsey alerting — all queries use parameterized bindings
+    static $wl_stmts=[];
     $item_alerts=[];
     foreach($items as $it){
         $cnt=0;
-        $wv=db()->quote($it['watch_value']);
-        try{$cnt=match($it['watch_type']){
-            'retailer'=>(int)db()->query("SELECT COUNT(DISTINCT r.id) FROM recalls r JOIN recall_retailers rr ON rr.recall_id=r.id JOIN retailers rt ON rt.id=rr.retailer_id WHERE r.status='ongoing' AND LOWER(rt.name) LIKE LOWER('%".$it['watch_value']."%')")->fetchColumn(),
-            'brand'=>(int)db()->query("SELECT COUNT(DISTINCT r.id) FROM recalls r JOIN recall_products rp ON rp.recall_id=r.id JOIN brands b ON b.id=rp.brand_id WHERE r.status='ongoing' AND LOWER(b.name) LIKE LOWER('%".$it['watch_value']."%')")->fetchColumn(),
-            'category'=>(int)db()->query("SELECT COUNT(*) FROM recalls r JOIN food_categories fc ON fc.id=r.food_category_id WHERE r.status='ongoing' AND LOWER(fc.name) LIKE LOWER('%".$it['watch_value']."%')")->fetchColumn(),
-            'state'=>(int)db()->query("SELECT COUNT(*) FROM recalls r JOIN recall_states rs ON rs.recall_id=r.id WHERE r.status='ongoing' AND rs.state_code='".$it['watch_value']."'")->fetchColumn(),
-            default=>0,
-        };}catch(\Throwable){$cnt=0;}
+        $wv=$it['watch_value'];
+        try{
+            switch($it['watch_type']){
+                case 'retailer':
+                    $s=$wl_stmts['retailer']??=db()->prepare("SELECT COUNT(DISTINCT r.id) FROM recalls r JOIN recall_retailers rr ON rr.recall_id=r.id JOIN retailers rt ON rt.id=rr.retailer_id WHERE r.status='ongoing' AND LOWER(rt.name) LIKE ?");
+                    $s->execute(['%'.strtolower($wv).'%']);$cnt=(int)$s->fetchColumn();break;
+                case 'brand':
+                    $s=$wl_stmts['brand']??=db()->prepare("SELECT COUNT(DISTINCT r.id) FROM recalls r JOIN recall_products rp ON rp.recall_id=r.id JOIN brands b ON b.id=rp.brand_id WHERE r.status='ongoing' AND LOWER(b.name) LIKE ?");
+                    $s->execute(['%'.strtolower($wv).'%']);$cnt=(int)$s->fetchColumn();break;
+                case 'category':
+                    $s=$wl_stmts['category']??=db()->prepare("SELECT COUNT(*) FROM recalls r JOIN food_categories fc ON fc.id=r.food_category_id WHERE r.status='ongoing' AND LOWER(fc.name) LIKE ?");
+                    $s->execute(['%'.strtolower($wv).'%']);$cnt=(int)$s->fetchColumn();break;
+                case 'state':
+                    $s=$wl_stmts['state']??=db()->prepare("SELECT COUNT(*) FROM recalls r JOIN recall_states rs ON rs.recall_id=r.id WHERE r.status='ongoing' AND rs.state_code=?");
+                    $s->execute([$wv]);$cnt=(int)$s->fetchColumn();break;
+            }
+        }catch(\Throwable){$cnt=0;}
         $item_alerts[$it['id']]=['count'=>$cnt,'alert'=>$cnt>=$ramsey_threshold];
     }
 
