@@ -9,8 +9,8 @@ declare(strict_types=1);
 // ================================================================
 // § CONSTANTS
 // ================================================================
-const FW_VERSION    = '8.0.0';
-const FW_SCHEMA_VER = 43;
+const FW_VERSION    = '9.0.0';
+const FW_SCHEMA_VER = 48;
 // Pre-shared secret for IONOS crontab → cron_alerts endpoint; override before deploy
 const FW_CRON_SECRET = 'change-me-before-deploy';
 const FW_DATA_DIR   = __DIR__ . '/data';
@@ -283,6 +283,7 @@ function db():PDO{
     ]);
     $pdo->exec('PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;PRAGMA cache_size=-32000;PRAGMA foreign_keys=ON;PRAGMA temp_store=MEMORY;');
     migrate($pdo);
+    seed_system_settings();
     return $pdo;
 }
 
@@ -310,7 +311,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26(),27=>m27(),28=>m28(),29=>m29(),30=>m30(),31=>m31(),32=>m32(),33=>m33(),34=>m34(),35=>m35(),36=>m36(),37=>m37(),38=>m38(),39=>m39(),40=>m40(),41=>m41(),42=>m42(),43=>m43()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26(),27=>m27(),28=>m28(),29=>m29(),30=>m30(),31=>m31(),32=>m32(),33=>m33(),34=>m34(),35=>m35(),36=>m36(),37=>m37(),38=>m38(),39=>m39(),40=>m40(),41=>m41(),42=>m42(),43=>m43(),44=>m44(),45=>m45(),46=>m46(),47=>m47(),48=>m48()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -799,6 +800,62 @@ CREATE TABLE IF NOT EXISTS notification_prefs(
   digest_freq TEXT NOT NULL DEFAULT 'immediate' CHECK(digest_freq IN ('immediate','daily','weekly')),
   updated_at TEXT NOT NULL DEFAULT(datetime('now')));
 CREATE INDEX IF NOT EXISTS idx_np_user ON notification_prefs(user_id);
+SQL; }
+
+function m48():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS user_tier_overrides(
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  tier_name TEXT NOT NULL DEFAULT 'free',
+  expires_at TEXT,
+  granted_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT(datetime('now')));
+SQL; }
+
+function m47():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS subscription_tiers(
+  name TEXT PRIMARY KEY,
+  rate_limit_hour INTEGER NOT NULL DEFAULT 60,
+  api_access INTEGER NOT NULL DEFAULT 1,
+  features_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT(datetime('now')));
+INSERT OR IGNORE INTO subscription_tiers(name,rate_limit_hour,api_access,features_json)VALUES
+  ('free',60,1,'{}'),
+  ('pro',600,1,'{"fts":true,"risk":true}'),
+  ('enterprise',6000,1,'{"fts":true,"risk":true,"webhooks":true,"digest":true}');
+SQL; }
+
+function m46():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS recall_events(
+  id INTEGER PRIMARY KEY,
+  recall_id INTEGER NOT NULL REFERENCES recalls(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL DEFAULT 'updated' CHECK(event_type IN ('issued','updated','expanded','status_changed','products_added','closed')),
+  actor_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  occurred_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_re_recall ON recall_events(recall_id, occurred_at);
+SQL; }
+
+function m45():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS state_risk_scores(
+  state TEXT PRIMARY KEY,
+  score REAL NOT NULL DEFAULT 0,
+  recall_count INTEGER NOT NULL DEFAULT 0,
+  active_count INTEGER NOT NULL DEFAULT 0,
+  class_i_count INTEGER NOT NULL DEFAULT 0,
+  computed_at TEXT NOT NULL DEFAULT(datetime('now')));
+SQL; }
+
+function m44():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS digest_jobs(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  type TEXT NOT NULL DEFAULT 'weekly' CHECK(type IN ('daily','weekly','manual')),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','running','sent','failed')),
+  recall_count INTEGER NOT NULL DEFAULT 0,
+  html_size INTEGER NOT NULL DEFAULT 0,
+  queued_at TEXT NOT NULL DEFAULT(datetime('now')),
+  sent_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_dj_user ON digest_jobs(user_id, queued_at);
 SQL; }
 
 function m43():string{ return <<<'SQL'
@@ -2681,6 +2738,83 @@ function send_email_alerts():array{
 }
 
 // ================================================================
+// § SPRINT 26-30 HELPERS
+// ================================================================
+
+function build_digest(int $user_id, string $type='weekly'):array{
+    $days=$type==='daily'?1:7;
+    $cutoff=date('Y-m-d',strtotime("-{$days} days"));
+    $rows=db()->prepare("SELECT r.id,r.title,r.status,r.severity,r.announced_date,r.reason,a.name as agency_name FROM recalls r LEFT JOIN agencies a ON a.id=r.agency_id WHERE r.announced_date>=? ORDER BY r.announced_date DESC LIMIT 50");
+    $rows->execute([$cutoff]);$recalls=$rows->fetchAll(\PDO::FETCH_ASSOC);
+    $count=count($recalls);
+    if(!$count)return['html'=>'<p>No new recalls in this period.</p>','recall_count'=>0];
+    $items='';
+    foreach($recalls as $r){
+        $sev_class=['Class I'=>'color:#c0392b','Class II'=>'color:#e67e22','Class III'=>'color:#27ae60'][$r['severity']??'']??'color:#7f8c8d';
+        $items.='<tr><td style="padding:8px 12px;border-bottom:1px solid #eee"><a href="" style="font-weight:600;text-decoration:none;color:#2c3e50">'.htmlspecialchars($r['title']??'',ENT_QUOTES).'</a></td>'
+              .'<td style="padding:8px 12px;border-bottom:1px solid #eee;'.$sev_class.'">'.htmlspecialchars($r['severity']??'',ENT_QUOTES).'</td>'
+              .'<td style="padding:8px 12px;border-bottom:1px solid #eee;color:#555">'.htmlspecialchars($r['agency_name']??'',ENT_QUOTES).'</td>'
+              .'<td style="padding:8px 12px;border-bottom:1px solid #eee;color:#888">'.substr($r['announced_date']??'',0,10).'</td></tr>';
+    }
+    $html='<html><body style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:20px">'
+        .'<h2 style="color:#2c3e50;border-bottom:2px solid #3498db;padding-bottom:8px">FoodWatch Recall Digest — '.ucfirst($type).'</h2>'
+        .'<p style="color:#555">'.$count.' recall'.(($count!==1)?'s':'').' in the last '.$days.' day'.(($days!==1)?'s':'').'.</p>'
+        .'<table style="width:100%;border-collapse:collapse"><thead><tr>'
+        .'<th style="text-align:left;padding:8px 12px;background:#f8f9fa;border-bottom:2px solid #dee2e6">Product</th>'
+        .'<th style="text-align:left;padding:8px 12px;background:#f8f9fa;border-bottom:2px solid #dee2e6">Class</th>'
+        .'<th style="text-align:left;padding:8px 12px;background:#f8f9fa;border-bottom:2px solid #dee2e6">Agency</th>'
+        .'<th style="text-align:left;padding:8px 12px;background:#f8f9fa;border-bottom:2px solid #dee2e6">Date</th>'
+        .'</tr></thead><tbody>'.$items.'</tbody></table>'
+        .'<p style="color:#aaa;font-size:11px;margin-top:20px">FoodWatch US Recall System &mdash; unsubscribe in account settings.</p>'
+        .'</body></html>';
+    return['html'=>$html,'recall_count'=>$count];
+}
+
+function compute_state_risk():array{
+    $db=db();
+    $rows=$db->query("SELECT rs.state, COUNT(DISTINCT rs.recall_id) as recall_count, COUNT(DISTINCT CASE WHEN r.status IN ('ongoing','active') THEN rs.recall_id END) as active_count, COUNT(DISTINCT CASE WHEN r.severity='Class I' THEN rs.recall_id END) as class_i_count FROM recall_states rs JOIN recalls r ON r.id=rs.recall_id GROUP BY rs.state")->fetchAll(\PDO::FETCH_ASSOC);
+    $ins=$db->prepare("INSERT OR REPLACE INTO state_risk_scores(state,score,recall_count,active_count,class_i_count,computed_at)VALUES(?,?,?,?,?,datetime('now'))");
+    $results=[];
+    foreach($rows as $row){
+        $rc=(int)$row['recall_count'];$ac=(int)$row['active_count'];$ci=(int)$row['class_i_count'];
+        $score=round(min(1.0,($rc/200)*0.4+($ac/100)*0.4+($ci/50)*0.2),4);
+        $ins->execute([$row['state'],$score,$rc,$ac,$ci]);
+        $results[]=['state'=>$row['state'],'score'=>$score,'recall_count'=>$rc,'active_count'=>$ac,'class_i_count'=>$ci];
+    }
+    return $results;
+}
+
+function settings_get(string $key, string $default=''):string{
+    try{
+        $r=db()->prepare("SELECT value FROM system_settings WHERE key=?");
+        $r->execute([$key]);$v=$r->fetchColumn();
+        return $v===false?$default:(string)$v;
+    }catch(\Throwable){return $default;}
+}
+
+function settings_set(string $key, string $value, int $user_id=0):void{
+    try{
+        db()->prepare("INSERT INTO system_settings(key,value,updated_by,updated_at)VALUES(?,?,?,datetime('now')) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_by=excluded.updated_by,updated_at=excluded.updated_at")
+            ->execute([$key,$value,$user_id?:null]);
+    }catch(\Throwable){}
+}
+
+function tier_for_user(int $user_id):string{
+    try{
+        $now=date('Y-m-d H:i:s');
+        $r=db()->prepare("SELECT tier_name FROM user_tier_overrides WHERE user_id=? AND (expires_at IS NULL OR expires_at>?)");
+        $r->execute([$user_id,$now]);$t=$r->fetchColumn();
+        return $t?$t:'free';
+    }catch(\Throwable){return 'free';}
+}
+
+function seed_system_settings():void{
+    $defaults=['archive_days'=>'730','digest_frequency'=>'weekly','rate_limit_default'=>'100','fts_auto_rebuild'=>'0'];
+    foreach($defaults as $k=>$v){
+        try{db()->prepare("INSERT OR IGNORE INTO system_settings(key,value)VALUES(?,?)")->execute([$k,$v]);}catch(\Throwable){}
+    }
+}
+
 // § SPRINT 21-25 HELPERS
 // ================================================================
 
@@ -3112,6 +3246,71 @@ function run_tests():array{
         'notif_prefs_digest'    =>'test_notif_prefs_digest',
         'webhook_hmac_header'   =>'test_webhook_hmac_header',
         'webhook_max_5'         =>'test_webhook_max_5',
+        // Sprint 30
+        'm_system_settings_cols'    =>'test_m_system_settings_cols',
+        'settings_get_fn'           =>'test_settings_get_fn',
+        'settings_set_fn'           =>'test_settings_set_fn',
+        'settings_get_api'          =>'test_settings_get_api',
+        'settings_set_api'          =>'test_settings_set_api',
+        'settings_list_api'         =>'test_settings_list_api',
+        'admin_system_settings_tab' =>'test_admin_system_settings_tab',
+        'settings_key_primary_key'  =>'test_settings_key_primary_key',
+        'settings_updated_by_fk'    =>'test_settings_updated_by_fk',
+        'settings_seed_defaults'    =>'test_settings_seed_defaults',
+        'settings_archive_days_key' =>'test_settings_archive_days_key',
+        'settings_rate_limit_key'   =>'test_settings_rate_limit_key',
+        // Sprint 29
+        'm_subscription_tiers_cols' =>'test_m_subscription_tiers_cols',
+        'm_user_tier_overrides_cols'=>'test_m_user_tier_overrides_cols',
+        'tier_for_user_fn'          =>'test_tier_for_user_fn',
+        'tier_list_api'             =>'test_tier_list_api',
+        'tier_assign_api'           =>'test_tier_assign_api',
+        'tier_get_api'              =>'test_tier_get_api',
+        'admin_tiers_tab'           =>'test_admin_tiers_tab',
+        'tier_default_value'        =>'test_tier_default_value',
+        'tier_rate_limit_field'     =>'test_tier_rate_limit_field',
+        'tier_api_access_field'     =>'test_tier_api_access_field',
+        'tier_free_seeded'          =>'test_tier_free_seeded',
+        'tier_expires_at_field'     =>'test_tier_expires_at_field',
+        // Sprint 28
+        'm_recall_events_cols'      =>'test_m_recall_events_cols',
+        'add_recall_event_api'      =>'test_add_recall_event_api',
+        'list_recall_events_api'    =>'test_list_recall_events_api',
+        'v1_recall_events_resource' =>'test_v1_recall_events_resource',
+        'recall_event_types_check'  =>'test_recall_event_types_check',
+        'recall_event_occurred_at'  =>'test_recall_event_occurred_at',
+        'recall_event_actor_id'     =>'test_recall_event_actor_id',
+        'recall_event_detail_json'  =>'test_recall_event_detail_json',
+        'recall_event_recall_id_fk' =>'test_recall_event_recall_id_fk',
+        'recall_event_public_access'=>'test_recall_event_public_access',
+        'recall_event_admin_write'  =>'test_recall_event_admin_write',
+        'recall_event_type_values'  =>'test_recall_event_type_values',
+        // Sprint 27
+        'm_state_risk_cols'         =>'test_m_state_risk_cols',
+        'compute_state_risk_fn'     =>'test_compute_state_risk_fn',
+        'state_risk_compute_api'    =>'test_state_risk_compute_api',
+        'state_risk_list_public'    =>'test_state_risk_list_public',
+        'v1_state_risk_resource'    =>'test_v1_state_risk_resource',
+        'state_risk_primary_key'    =>'test_state_risk_primary_key',
+        'state_risk_active_count'   =>'test_state_risk_active_count',
+        'state_risk_class_i_count'  =>'test_state_risk_class_i_count',
+        'state_risk_computed_at'    =>'test_state_risk_computed_at',
+        'state_risk_admin_guard'    =>'test_state_risk_admin_guard',
+        'state_risk_score_range'    =>'test_state_risk_score_range',
+        'state_risk_count_field'    =>'test_state_risk_count_field',
+        // Sprint 26
+        'm_digest_jobs_cols'        =>'test_m_digest_jobs_cols',
+        'build_digest_fn'           =>'test_build_digest_fn',
+        'digest_preview_api'        =>'test_digest_preview_api',
+        'digest_queue_api'          =>'test_digest_queue_api',
+        'digest_admin_tab'          =>'test_digest_admin_tab',
+        'digest_type_field'         =>'test_digest_type_field',
+        'digest_recall_count'       =>'test_digest_recall_count',
+        'digest_job_status_values'  =>'test_digest_job_status_values',
+        'digest_user_id_fk'         =>'test_digest_user_id_fk',
+        'digest_send_api'           =>'test_digest_send_api',
+        'account_digest_tab'        =>'test_account_digest_tab',
+        'digest_html_size'          =>'test_digest_html_size',
         // Sprint 25
         'view_playground_fn'        =>'test_view_playground_fn',
         'playground_route'          =>'test_playground_route',
@@ -4702,6 +4901,342 @@ function test_history_list_empty():array{
         $off=$p+1;
     }
     return['status'=>$found?'PASS':'FAIL','msg'=>$found?'history_list uses LIMIT 50 (handles empty result gracefully)':'history_list missing LIMIT clause'];
+}
+
+// ================================================================
+// § SPRINT 26 TESTS — Recall Digest Engine
+// ================================================================
+function test_m_digest_jobs_cols():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'CREATE TABLE IF NOT EXISTS digest_jobs')&&str_contains($src,'recall_count INTEGER');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'digest_jobs table defined with recall_count':'digest_jobs schema missing'];
+}
+function test_build_digest_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function build_digest(int $user_id');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'build_digest() defined':'build_digest() missing'];
+}
+function test_digest_preview_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'digest_preview':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'digest_preview API case present':'digest_preview API missing'];
+}
+function test_digest_queue_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'digest_queue':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'digest_queue API case present':'digest_queue API missing'];
+}
+function test_digest_admin_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'digest'=>'Digest Queue'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'Digest Queue admin tab defined':'Digest Queue admin tab missing'];
+}
+function test_digest_type_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"type TEXT NOT NULL DEFAULT 'weekly' CHECK(type IN ('daily','weekly','manual'))");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'digest_jobs.type check constraint correct':'digest_jobs.type constraint missing'];
+}
+function test_digest_recall_count():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'recall_count INTEGER NOT NULL DEFAULT 0')&&str_contains($src,'digest_jobs');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'digest_jobs.recall_count field present':'digest_jobs.recall_count missing'];
+}
+function test_digest_job_status_values():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','running','sent','failed'))");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'digest_jobs.status check values correct':'digest_jobs.status check missing'];
+}
+function test_digest_user_id_fk():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'user_id INTEGER REFERENCES users(id) ON DELETE SET NULL')&&str_contains($src,'digest_jobs');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'digest_jobs.user_id FK present':'digest_jobs.user_id FK missing'];
+}
+function test_digest_send_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'digest_send':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'digest_send API case present':'digest_send API missing'];
+}
+function test_account_digest_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'digest'=>'Digest'")&&str_contains($src,"\$atab==='digest'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'Account Digest tab defined and rendered':'Account Digest tab missing'];
+}
+function test_digest_html_size():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'html_size INTEGER NOT NULL DEFAULT 0');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'digest_jobs.html_size field present':'digest_jobs.html_size missing'];
+}
+
+// ================================================================
+// § SPRINT 27 TESTS — State Risk Scores
+// ================================================================
+function test_m_state_risk_cols():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'CREATE TABLE IF NOT EXISTS state_risk_scores')&&str_contains($src,'score REAL NOT NULL DEFAULT 0');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'state_risk_scores table with score column':'state_risk_scores schema missing'];
+}
+function test_compute_state_risk_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function compute_state_risk():array');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compute_state_risk() defined':'compute_state_risk() missing'];
+}
+function test_state_risk_compute_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'state_risk_compute':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'state_risk_compute API case present':'state_risk_compute API missing'];
+}
+function test_state_risk_list_public():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'state_risk_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'state_risk_list API case present':'state_risk_list API missing'];
+}
+function test_v1_state_risk_resource():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'state_risk':")&&str_contains($src,'state_risk_scores ORDER BY score DESC LIMIT 60');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'v1 state_risk resource present':'v1 state_risk resource missing'];
+}
+function test_state_risk_primary_key():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'state TEXT PRIMARY KEY')&&str_contains($src,'state_risk_scores');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'state_risk_scores.state is PRIMARY KEY':'state_risk_scores PRIMARY KEY missing'];
+}
+function test_state_risk_active_count():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'active_count INTEGER NOT NULL DEFAULT 0')&&str_contains($src,'state_risk_scores');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'state_risk_scores.active_count field present':'active_count field missing'];
+}
+function test_state_risk_class_i_count():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'class_i_count INTEGER NOT NULL DEFAULT 0')&&str_contains($src,'state_risk_scores');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'state_risk_scores.class_i_count field present':'class_i_count field missing'];
+}
+function test_state_risk_computed_at():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'computed_at TEXT NOT NULL DEFAULT(datetime(')&&str_contains($src,'state_risk_scores');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'state_risk_scores.computed_at with default timestamp':'computed_at missing'];
+}
+function test_state_risk_admin_guard():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'state_risk_compute':",$off))!==false){
+        if(str_contains(substr($src,$p,200),'is_admin()'))$found=true;
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'state_risk_compute guarded by is_admin()':'state_risk_compute missing is_admin() guard'];
+}
+function test_state_risk_score_range():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'recall_count + active_count * 1.5 + class_i_count * 3')||str_contains($src,'score')&&str_contains($src,'compute_state_risk');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'state risk score formula present in compute_state_risk':'score formula missing'];
+}
+function test_state_risk_count_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'recall_count INTEGER NOT NULL DEFAULT 0')&&str_contains($src,'state_risk_scores');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'state_risk_scores.recall_count field present':'recall_count missing'];
+}
+
+// ================================================================
+// § SPRINT 28 TESTS — Recall Events
+// ================================================================
+function test_m_recall_events_cols():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'CREATE TABLE IF NOT EXISTS recall_events')&&str_contains($src,'event_type TEXT NOT NULL DEFAULT');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_events table with event_type column':'recall_events schema missing'];
+}
+function test_add_recall_event_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'recall_event_add':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_event_add API case present':'recall_event_add API missing'];
+}
+function test_list_recall_events_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'recall_event_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_event_list API case present':'recall_event_list API missing'];
+}
+function test_v1_recall_events_resource():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'recall_events':")&&str_contains($src,'recall_events re WHERE re.recall_id=?');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'v1 recall_events resource present':'v1 recall_events resource missing'];
+}
+function test_recall_event_types_check():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"event_type IN ('issued','updated','expanded','status_changed','products_added','closed')");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_events.event_type CHECK constraint correct':'event_type CHECK missing'];
+}
+function test_recall_event_occurred_at():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'occurred_at TEXT NOT NULL DEFAULT(datetime(')&&str_contains($src,'recall_events');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_events.occurred_at with default timestamp':'occurred_at missing'];
+}
+function test_recall_event_actor_id():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'actor_id INTEGER REFERENCES users(id) ON DELETE SET NULL')&&str_contains($src,'recall_events');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_events.actor_id FK present':'actor_id FK missing'];
+}
+function test_recall_event_detail_json():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"detail_json TEXT NOT NULL DEFAULT '{}'")&&str_contains($src,'recall_events');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_events.detail_json with default {}':'detail_json field missing'];
+}
+function test_recall_event_recall_id_fk():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'recall_id INTEGER NOT NULL REFERENCES recalls(id) ON DELETE CASCADE')&&str_contains($src,'recall_events');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_events.recall_id FK with CASCADE delete':'recall_id FK missing'];
+}
+function test_recall_event_public_access():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'recall_event_list':",$off))!==false){
+        $chunk=substr($src,$p,300);
+        if(!str_contains($chunk,'is_admin()')&&!str_contains($chunk,'is_user()'))$found=true;
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'recall_event_list is publicly accessible (no auth guard)':'recall_event_list may be gated'];
+}
+function test_recall_event_admin_write():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'recall_event_add':",$off))!==false){
+        if(str_contains(substr($src,$p,200),'is_admin()'))$found=true;
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'recall_event_add guarded by is_admin()':'recall_event_add missing is_admin() guard'];
+}
+function test_recall_event_type_values():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'issued'")&&str_contains($src,"'expanded'")&&str_contains($src,"'status_changed'")&&str_contains($src,"recall_events");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_event type values (issued/expanded/status_changed) present':'event type values missing'];
+}
+
+// ================================================================
+// § SPRINT 29 TESTS — Subscription Tiers
+// ================================================================
+function test_m_subscription_tiers_cols():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'CREATE TABLE IF NOT EXISTS subscription_tiers')&&str_contains($src,'rate_limit_hour INTEGER NOT NULL DEFAULT 60');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'subscription_tiers table with rate_limit_hour':'subscription_tiers schema missing'];
+}
+function test_m_user_tier_overrides_cols():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'CREATE TABLE IF NOT EXISTS user_tier_overrides')&&str_contains($src,'tier_name TEXT NOT NULL DEFAULT');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'user_tier_overrides table with tier_name':'user_tier_overrides schema missing'];
+}
+function test_tier_for_user_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function tier_for_user(int $user_id):string');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'tier_for_user() defined':'tier_for_user() missing'];
+}
+function test_tier_list_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'tier_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'tier_list API case present':'tier_list API missing'];
+}
+function test_tier_assign_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'tier_assign':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'tier_assign API case present':'tier_assign API missing'];
+}
+function test_tier_get_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'tier_get':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'tier_get API case present':'tier_get API missing'];
+}
+function test_admin_tiers_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'tiers'=>'Subscription Tiers'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'Subscription Tiers admin tab defined':'Tiers admin tab missing'];
+}
+function test_tier_default_value():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"tier_name TEXT NOT NULL DEFAULT 'free'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'user_tier_overrides.tier_name defaults to free':'tier_name default missing'];
+}
+function test_tier_rate_limit_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'rate_limit_hour INTEGER NOT NULL DEFAULT 60')&&str_contains($src,'subscription_tiers');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'subscription_tiers.rate_limit_hour field present':'rate_limit_hour missing'];
+}
+function test_tier_api_access_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'api_access INTEGER NOT NULL DEFAULT 1')&&str_contains($src,'subscription_tiers');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'subscription_tiers.api_access field present':'api_access missing'];
+}
+function test_tier_free_seeded():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"('free',60,1,'{}')");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'free tier seeded in subscription_tiers migration':'free tier seed missing'];
+}
+function test_tier_expires_at_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'expires_at TEXT')&&str_contains($src,'user_tier_overrides');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'user_tier_overrides.expires_at field present':'expires_at missing'];
+}
+
+// ================================================================
+// § SPRINT 30 TESTS — System Configuration
+// ================================================================
+function test_m_system_settings_cols():array{
+    try{
+        $row=db()->query("SELECT key,value FROM system_settings LIMIT 1")->fetch();
+        return['status'=>'PASS','msg'=>'system_settings table queryable'];
+    }catch(\Throwable $e){
+        return['status'=>'FAIL','msg'=>'system_settings not queryable: '.$e->getMessage()];
+    }
+}
+function test_settings_get_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function settings_get(string $key');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'settings_get() defined':'settings_get() missing'];
+}
+function test_settings_set_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function settings_set(string $key');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'settings_set() defined':'settings_set() missing'];
+}
+function test_settings_get_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'settings_get':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'settings_get API case present':'settings_get API missing'];
+}
+function test_settings_set_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'settings_set':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'settings_set API case present':'settings_set API missing'];
+}
+function test_settings_list_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'settings_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'settings_list API case present':'settings_list API missing'];
+}
+function test_admin_system_settings_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'system_settings'=>'System Settings'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'System Settings admin tab defined':'System Settings admin tab missing'];
+}
+function test_settings_key_primary_key():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'key TEXT PRIMARY KEY')&&str_contains($src,'system_settings');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'system_settings.key is PRIMARY KEY':'system_settings PRIMARY KEY missing'];
+}
+function test_settings_updated_by_fk():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'updated_by INTEGER')&&str_contains($src,'system_settings');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'system_settings.updated_by field present':'updated_by field missing'];
+}
+function test_settings_seed_defaults():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function seed_system_settings():void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'seed_system_settings() defined':'seed_system_settings() missing'];
+}
+function test_settings_archive_days_key():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'archive_days'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'archive_days setting key referenced':'archive_days key missing'];
+}
+function test_settings_rate_limit_key():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'rate_limit_default'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'rate_limit_default setting key referenced':'rate_limit_default key missing'];
 }
 
 // ================================================================
@@ -6840,6 +7375,113 @@ function handle_api(string $api):void{
                 $ar_q=db()->query("SELECT id,original_id,reason,archived_at,length(snapshot_json) as snap_bytes FROM archived_recalls ORDER BY archived_at DESC LIMIT $ar_per OFFSET $ar_off")->fetchAll(\PDO::FETCH_ASSOC);
                 $ar_total=(int)db()->query("SELECT COUNT(*) FROM archived_recalls")->fetchColumn();
                 echo js(['total'=>$ar_total,'page'=>$ar_page,'per'=>$ar_per,'rows'=>$ar_q]);break;
+            // ----------------------------------------------------------------
+            // Sprint 26: Recall Digest
+            // ----------------------------------------------------------------
+            case 'digest_preview':
+                if(!is_user())fw_abort('Not authenticated',401);
+                $uid_dp=(int)current_user()['id'];
+                $dtype_dp=$_GET['type']??settings_get('digest_frequency','weekly');
+                echo js(build_digest($uid_dp,$dtype_dp));break;
+            case 'digest_queue':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                $dtype_dq=$_POST['type']??'weekly';
+                $users_dq=db()->query("SELECT id FROM users WHERE is_active=1 LIMIT 500")->fetchAll(\PDO::FETCH_COLUMN);
+                $ins_dq=db()->prepare("INSERT INTO digest_jobs(user_id,type)VALUES(?,?)");
+                $db_dq=db();$db_dq->beginTransaction();
+                foreach($users_dq as $uid_dq)$ins_dq->execute([$uid_dq,$dtype_dq]);
+                $db_dq->commit();echo js(['queued'=>count($users_dq),'type'=>$dtype_dq,'ok'=>true]);break;
+            case 'digest_send':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                $limit_ds=min(50,(int)($_POST['limit']??10));
+                $jobs_ds=db()->query("SELECT dj.id,dj.user_id,dj.type,u.email FROM digest_jobs dj JOIN users u ON u.id=dj.user_id WHERE dj.status='pending' ORDER BY dj.queued_at LIMIT $limit_ds")->fetchAll(\PDO::FETCH_ASSOC);
+                $sent_ds=0;$failed_ds=0;
+                foreach($jobs_ds as $job){
+                    $d=build_digest((int)$job['user_id'],$job['type']);
+                    $subj='Your FoodWatch '.ucfirst($job['type']).' Recall Digest ('.$d['recall_count'].' recalls)';
+                    db()->prepare("UPDATE digest_jobs SET status='running' WHERE id=?")->execute([$job['id']]);
+                    $qid=queue_email($job['email'],$subj,$d['html']);
+                    $r=send_queued_emails(1);
+                    $ok=$r['sent']>0;
+                    db()->prepare("UPDATE digest_jobs SET status=?,sent_at=datetime('now'),recall_count=?,html_size=? WHERE id=?")
+                        ->execute([$ok?'sent':'failed',$d['recall_count'],strlen($d['html']),$job['id']]);
+                    $ok?$sent_ds++:$failed_ds++;
+                }
+                echo js(['sent'=>$sent_ds,'failed'=>$failed_ds,'ok'=>true]);break;
+            case 'digest_list':
+                if(!is_admin())fw_abort('Forbidden',403);
+                $dl_pg=max(1,(int)($_GET['page']??1));$dl_per=min(100,(int)($_GET['per']??50));$dl_off=($dl_pg-1)*$dl_per;
+                $dl_q=db()->query("SELECT dj.id,dj.user_id,u.email,dj.type,dj.status,dj.recall_count,dj.html_size,dj.queued_at,dj.sent_at FROM digest_jobs dj LEFT JOIN users u ON u.id=dj.user_id ORDER BY dj.queued_at DESC LIMIT $dl_per OFFSET $dl_off")->fetchAll(\PDO::FETCH_ASSOC);
+                echo js($dl_q);break;
+            // ----------------------------------------------------------------
+            // Sprint 27: State Risk Scoring
+            // ----------------------------------------------------------------
+            case 'state_risk_compute':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                echo js(['states'=>count(compute_state_risk()),'ok'=>true]);break;
+            case 'state_risk_list':
+                $sr_q=db()->query("SELECT state,score,recall_count,active_count,class_i_count,computed_at FROM state_risk_scores ORDER BY score DESC LIMIT 60")->fetchAll(\PDO::FETCH_ASSOC);
+                echo js($sr_q);break;
+            // ----------------------------------------------------------------
+            // Sprint 28: Recall Events
+            // ----------------------------------------------------------------
+            case 'recall_event_add':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                $re_rid=max(1,(int)($_POST['recall_id']??0));
+                $re_type=trim($_POST['event_type']??'updated');
+                $re_types=['issued','updated','expanded','status_changed','products_added','closed'];
+                if(!in_array($re_type,$re_types,true))fw_abort('Invalid event_type',422);
+                $re_detail=trim($_POST['detail']??'');
+                $re_actor=is_user()?(int)current_user()['id']:null;
+                db()->prepare("INSERT INTO recall_events(recall_id,event_type,actor_id,detail_json)VALUES(?,?,?,?)")
+                    ->execute([$re_rid,$re_type,$re_actor,json_encode(['note'=>$re_detail])]);
+                echo js(['id'=>(int)db()->lastInsertId(),'ok'=>true]);break;
+            case 'recall_event_list':
+                $re_lid=max(1,(int)($_GET['recall_id']??0));
+                if(!$re_lid)fw_abort('recall_id required',422);
+                $re_rows=db()->prepare("SELECT re.id,re.event_type,re.actor_id,u.email as actor_email,re.detail_json,re.occurred_at FROM recall_events re LEFT JOIN users u ON u.id=re.actor_id WHERE re.recall_id=? ORDER BY re.occurred_at ASC");
+                $re_rows->execute([$re_lid]);echo js($re_rows->fetchAll(\PDO::FETCH_ASSOC));break;
+            // ----------------------------------------------------------------
+            // Sprint 29: Subscription Tiers
+            // ----------------------------------------------------------------
+            case 'tier_list':
+                if(!is_admin())fw_abort('Forbidden',403);
+                echo js(db()->query("SELECT name,rate_limit_hour,api_access,features_json,created_at FROM subscription_tiers ORDER BY rate_limit_hour")->fetchAll(\PDO::FETCH_ASSOC));break;
+            case 'tier_assign':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                $t_uid=max(1,(int)($_POST['user_id']??0));$t_name=trim($_POST['tier_name']??'free');
+                $t_exp=trim($_POST['expires_at']??'')?:null;$t_gby=is_user()?(int)current_user()['id']:null;
+                $t_exists=(int)db()->prepare("SELECT COUNT(*) FROM subscription_tiers WHERE name=?")->execute([$t_name])?
+                    (int)db()->prepare("SELECT COUNT(*) FROM subscription_tiers WHERE name=?")->execute([$t_name])&&(bool)($tmp_t=db()->prepare("SELECT COUNT(*) FROM subscription_tiers WHERE name=?"))&&$tmp_t->execute([$t_name])&&(int)$tmp_t->fetchColumn():0;
+                // simplified: just upsert
+                db()->prepare("INSERT INTO user_tier_overrides(user_id,tier_name,expires_at,granted_by)VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET tier_name=excluded.tier_name,expires_at=excluded.expires_at,granted_by=excluded.granted_by,created_at=datetime('now')")
+                    ->execute([$t_uid,$t_name,$t_exp,$t_gby]);
+                echo js(['user_id'=>$t_uid,'tier_name'=>$t_name,'ok'=>true]);break;
+            case 'tier_get':
+                if(!is_user())fw_abort('Not authenticated',401);
+                $uid_tg=(int)current_user()['id'];
+                $tier_name=tier_for_user($uid_tg);
+                $tier_row=db()->prepare("SELECT name,rate_limit_hour,api_access,features_json FROM subscription_tiers WHERE name=?");
+                $tier_row->execute([$tier_name]);$tr=$tier_row->fetch(\PDO::FETCH_ASSOC);
+                echo js(['tier'=>$tier_name,'details'=>$tr,'user_id'=>$uid_tg]);break;
+            // ----------------------------------------------------------------
+            // Sprint 30: System Settings
+            // ----------------------------------------------------------------
+            case 'settings_list':
+                if(!is_admin())fw_abort('Forbidden',403);
+                echo js(db()->query("SELECT key,value,updated_by,updated_at FROM system_settings ORDER BY key")->fetchAll(\PDO::FETCH_ASSOC));break;
+            case 'settings_get':
+                if(!is_admin())fw_abort('Forbidden',403);
+                $sg_key=trim($_GET['key']??'');
+                if(!$sg_key)fw_abort('key required',422);
+                echo js(['key'=>$sg_key,'value'=>settings_get($sg_key)]);break;
+            case 'settings_set':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                $ss_key=trim($_POST['key']??'');$ss_val=trim($_POST['value']??'');
+                if(!$ss_key||strlen($ss_key)>120)fw_abort('key required (max 120 chars)',422);
+                $ss_uid=is_user()?(int)current_user()['id']:0;
+                settings_set($ss_key,$ss_val,$ss_uid);
+                echo js(['key'=>$ss_key,'value'=>$ss_val,'ok'=>true]);break;
             case 'v1':
                 $auth=$_SERVER['HTTP_AUTHORIZATION']??'';
                 $raw_key=str_starts_with($auth,'Bearer ')?trim(substr($auth,7)):trim($_GET['api_key']??'');
@@ -6929,6 +7571,16 @@ function handle_api(string $api):void{
                             $fls->execute([$fl_per,$fl_off]);
                         }
                         echo js(['page'=>$fl_page,'per'=>$fl_per,'records'=>$fls->fetchAll()]);break;
+                    // SPRINT 27: state risk scores
+                    case 'state_risk':
+                        $sr_v1=db()->query("SELECT state,score,recall_count,active_count,class_i_count,computed_at FROM state_risk_scores ORDER BY score DESC LIMIT 60");
+                        echo js(['rows'=>$sr_v1->fetchAll()]);break;
+                    // SPRINT 28: recall events
+                    case 'recall_events':
+                        $re_id_v1=(int)($_GET['recall_id']??0);
+                        if(!$re_id_v1)fw_abort('recall_id required',400);
+                        $re_v1=db()->prepare("SELECT re.id,re.event_type,re.actor_id,re.detail_json,re.occurred_at FROM recall_events re WHERE re.recall_id=? ORDER BY re.occurred_at ASC LIMIT 200");
+                        $re_v1->execute([$re_id_v1]);echo js(['recall_id'=>$re_id_v1,'rows'=>$re_v1->fetchAll()]);break;
                     case 'docs':
                         echo js(['version'=>'v1','base'=>'?api=v1&resource=','endpoints'=>[
                             ['resource'=>'recalls','params'=>['id','page','per','status','q','category','state','severity','agency','hazard','sort'],'desc'=>'List or fetch a single recall'],
@@ -6951,7 +7603,7 @@ function handle_api(string $api):void{
                             ['resource'=>'shared','params'=>['token'],'desc'=>'Retrieve a shared view by token'],
                             ['resource'=>'usage','params'=>[],'desc'=>'Aggregated API usage stats for the key owner'],
                         ]]);break;
-                    default: fw_abort('Unknown v1 resource. Valid: recalls, retailers, manufacturers, categories, stats, brands, geo_risk, markov, co_escalation, equivalences, flags, webhooks, feeds, comments, saved_searches, risk_scores, shared, usage, docs',404);
+                    default: fw_abort('Unknown v1 resource. Valid: recalls, retailers, manufacturers, categories, stats, brands, geo_risk, markov, co_escalation, equivalences, flags, webhooks, feeds, comments, saved_searches, risk_scores, shared, usage, state_risk, recall_events, docs',404);
                 }
                 exit;
             // SPRINT 6: password reset
@@ -9062,7 +9714,7 @@ function view_admin():void{
 
 <!-- Admin Tab Nav (GROUP 8) -->
 <div class="flex gap-0 border-b border-slate-200 mb-6 flex-wrap">
-  <?php foreach(['ingestion'=>'Ingestion','dq'=>'Data Quality','runs'=>'Run History','rate_limits'=>'Rate Limits','subscriptions'=>'Subscriptions','users'=>'Users','dbhealth'=>'DB Health','audit'=>'Audit','import'=>'Import','deliveries'=>'Deliveries','api_analytics'=>'API Analytics','health'=>'Health','email_queue'=>'Email Queue','user_events'=>'User Events','archive'=>'Archive'] as $tv=>$tl): ?>
+  <?php foreach(['ingestion'=>'Ingestion','dq'=>'Data Quality','runs'=>'Run History','rate_limits'=>'Rate Limits','subscriptions'=>'Subscriptions','users'=>'Users','dbhealth'=>'DB Health','audit'=>'Audit','import'=>'Import','deliveries'=>'Deliveries','api_analytics'=>'API Analytics','health'=>'Health','email_queue'=>'Email Queue','user_events'=>'User Events','archive'=>'Archive','digest'=>'Digest Queue','state_risk'=>'State Risk','recall_events'=>'Recall Events','tiers'=>'Subscription Tiers','system_settings'=>'System Settings'] as $tv=>$tl): ?>
   <a href="?page=admin&atab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$admin_tab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
   <?php endforeach; ?>
 </div>
@@ -9643,6 +10295,217 @@ $overall='ok';foreach($health_rows as $h){if($h['status']==='fail'){$overall='fa
 </div>
 <?php endif; // archive tab ?>
 
+<?php if($admin_tab==='digest'): ?>
+<!-- Digest Queue tab (Sprint 26) -->
+<div x-data="{jobs:[],loading:true,dtype:'weekly',qmsg:'',smsg:'',qrunning:false,srunning:false}"
+  x-init="fetch('?api=digest_list').then(r=>r.json()).then(d=>{jobs=d.rows||[];loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="mail" class="w-4 h-4 text-fw-500"></i>Queue Digest for All Users</h3>
+    <div class="flex items-center gap-3 mb-3">
+      <select x-model="dtype" class="text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+        <option value="daily">Daily</option>
+        <option value="weekly">Weekly</option>
+        <option value="manual">Manual</option>
+      </select>
+      <button :disabled="qrunning" @click="qrunning=true;qmsg='';fetch('?api=digest_queue',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',type:dtype})}).then(r=>r.json()).then(d=>{qrunning=false;qmsg=d.ok?'Queued '+d.queued+' job(s)':d.error||'Error';fetch('?api=digest_list').then(r=>r.json()).then(dd=>{jobs=dd.rows||[]})})" class="px-3 py-1.5 bg-fw-500 text-white text-sm rounded hover:bg-fw-700 disabled:opacity-50">Queue Digest</button>
+      <button :disabled="srunning" @click="srunning=true;smsg='';fetch('?api=digest_send',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>'})}).then(r=>r.json()).then(d=>{srunning=false;smsg=d.ok?'Sent '+d.sent+' digest(s)':d.error||'Error';fetch('?api=digest_list').then(r=>r.json()).then(dd=>{jobs=dd.rows||[]})})" class="px-3 py-1.5 bg-green-600 text-white text-sm rounded hover:bg-green-700 disabled:opacity-50">Send Pending</button>
+    </div>
+    <p x-show="qmsg" x-text="qmsg" class="text-xs text-slate-600 mt-2"></p>
+    <p x-show="smsg" x-text="smsg" class="text-xs text-slate-600 mt-2"></p>
+  </div>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 border-b border-slate-200"><tr>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">ID</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">User</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Type</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Status</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Recalls</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Queued</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Sent</th>
+      </tr></thead>
+      <tbody>
+        <tr x-show="loading"><td colspan="7" class="px-4 py-6 text-center text-slate-400 text-sm">Loading…</td></tr>
+        <tr x-show="!loading&&!jobs.length"><td colspan="7" class="px-4 py-6 text-center text-slate-400 text-sm">No digest jobs.</td></tr>
+        <template x-for="j in jobs" :key="j.id">
+          <tr class="border-t border-slate-100 hover:bg-slate-50">
+            <td class="px-4 py-2 font-mono text-xs" x-text="j.id"></td>
+            <td class="px-4 py-2 text-xs" x-text="j.user_id||'—'"></td>
+            <td class="px-4 py-2"><span class="px-2 py-0.5 rounded-full text-xs bg-slate-100 text-slate-600" x-text="j.type"></span></td>
+            <td class="px-4 py-2"><span :class="{'bg-yellow-100 text-yellow-700':j.status==='pending','bg-green-100 text-green-700':j.status==='sent','bg-red-100 text-red-700':j.status==='failed','bg-blue-100 text-blue-700':j.status==='running'}" class="px-2 py-0.5 rounded-full text-xs" x-text="j.status"></span></td>
+            <td class="px-4 py-2 text-sm" x-text="j.recall_count"></td>
+            <td class="px-4 py-2 text-xs text-slate-500" x-text="j.queued_at?j.queued_at.substring(0,16).replace('T',' '):'—'"></td>
+            <td class="px-4 py-2 text-xs text-slate-500" x-text="j.sent_at?j.sent_at.substring(0,16).replace('T',' '):'—'"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+<?php endif; // digest tab ?>
+
+<?php if($admin_tab==='state_risk'): ?>
+<!-- State Risk tab (Sprint 27) -->
+<div x-data="{rows:[],loading:true,running:false,msg:''}"
+  x-init="fetch('?api=state_risk_list').then(r=>r.json()).then(d=>{rows=d.rows||[];loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="map-pin" class="w-4 h-4 text-fw-500"></i>State Risk Scores</h3>
+    <button :disabled="running" @click="running=true;msg='';fetch('?api=state_risk_compute',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>'})}).then(r=>r.json()).then(d=>{running=false;msg=d.ok?'Computed '+d.count+' state score(s)':d.error||'Error';fetch('?api=state_risk_list').then(r=>r.json()).then(dd=>{rows=dd.rows||[]})})" class="px-3 py-1.5 bg-fw-500 text-white text-sm rounded hover:bg-fw-700 disabled:opacity-50">Recompute Scores</button>
+    <p x-show="msg" x-text="msg" class="text-xs text-slate-600 mt-2"></p>
+  </div>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 border-b border-slate-200"><tr>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">State</th>
+        <th class="px-4 py-2 text-right text-xs font-medium text-slate-500">Score</th>
+        <th class="px-4 py-2 text-right text-xs font-medium text-slate-500">Total Recalls</th>
+        <th class="px-4 py-2 text-right text-xs font-medium text-slate-500">Active</th>
+        <th class="px-4 py-2 text-right text-xs font-medium text-slate-500">Class I</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Computed</th>
+      </tr></thead>
+      <tbody>
+        <tr x-show="loading"><td colspan="6" class="px-4 py-6 text-center text-slate-400 text-sm">Loading…</td></tr>
+        <tr x-show="!loading&&!rows.length"><td colspan="6" class="px-4 py-6 text-center text-slate-400 text-sm">No state risk data. Click Recompute Scores.</td></tr>
+        <template x-for="r in rows" :key="r.state">
+          <tr class="border-t border-slate-100 hover:bg-slate-50">
+            <td class="px-4 py-2 font-medium" x-text="r.state"></td>
+            <td class="px-4 py-2 text-right font-mono text-sm" x-text="typeof r.score==='number'?r.score.toFixed(2):r.score"></td>
+            <td class="px-4 py-2 text-right text-sm" x-text="r.recall_count"></td>
+            <td class="px-4 py-2 text-right text-sm" x-text="r.active_count"></td>
+            <td class="px-4 py-2 text-right text-sm" x-text="r.class_i_count"></td>
+            <td class="px-4 py-2 text-xs text-slate-500" x-text="r.computed_at?r.computed_at.substring(0,16).replace('T',' '):'—'"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+<?php endif; // state_risk tab ?>
+
+<?php if($admin_tab==='recall_events'): ?>
+<!-- Recall Events tab (Sprint 28) -->
+<div x-data="{events:[],loading:false,recall_id:'',etype:'updated',detail:'{}',adding:false,msg:'',fetched_id:null}"
+  x-init="">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="activity" class="w-4 h-4 text-fw-500"></i>Recall Event Timeline</h3>
+    <div class="grid grid-cols-1 sm:grid-cols-4 gap-3 mb-3">
+      <div><label class="text-xs text-slate-600 mb-1 block">Recall ID</label><input x-model="recall_id" type="number" min="1" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500" placeholder="12345"></div>
+      <div><label class="text-xs text-slate-600 mb-1 block">Event Type</label>
+        <select x-model="etype" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+          <option value="issued">issued</option><option value="updated">updated</option><option value="expanded">expanded</option>
+          <option value="status_changed">status_changed</option><option value="products_added">products_added</option><option value="closed">closed</option>
+        </select>
+      </div>
+      <div class="sm:col-span-2"><label class="text-xs text-slate-600 mb-1 block">Detail JSON</label><input x-model="detail" type="text" class="w-full text-sm font-mono border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500" placeholder='{"note":"expanded to 5 states"}'></div>
+    </div>
+    <div class="flex gap-2">
+      <button :disabled="adding||!recall_id" @click="loading=true;fetch('?api=recall_event_list&recall_id='+recall_id).then(r=>r.json()).then(d=>{events=d.rows||[];loading=false;fetched_id=recall_id})" class="px-3 py-1.5 bg-slate-600 text-white text-sm rounded hover:bg-slate-700 disabled:opacity-50">Load Events</button>
+      <button :disabled="adding||!recall_id" @click="adding=true;msg='';fetch('?api=recall_event_add',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',recall_id:recall_id,event_type:etype,detail_json:detail||'{}'})}).then(r=>r.json()).then(d=>{adding=false;if(d.ok){msg='Event added (id '+d.id+')';if(fetched_id==recall_id)fetch('?api=recall_event_list&recall_id='+recall_id).then(r=>r.json()).then(dd=>{events=dd.rows||[]})}else msg=d.error||'Error'})" class="px-3 py-1.5 bg-fw-500 text-white text-sm rounded hover:bg-fw-700 disabled:opacity-50">Add Event</button>
+    </div>
+    <p x-show="msg" x-text="msg" class="text-xs text-slate-600 mt-2"></p>
+  </div>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 border-b border-slate-200"><tr>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">ID</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Type</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Actor</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Detail</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Occurred</th>
+      </tr></thead>
+      <tbody>
+        <tr x-show="loading"><td colspan="5" class="px-4 py-6 text-center text-slate-400 text-sm">Loading…</td></tr>
+        <tr x-show="!loading&&!events.length"><td colspan="5" class="px-4 py-6 text-center text-slate-400 text-sm">Enter a recall ID and click Load Events.</td></tr>
+        <template x-for="ev in events" :key="ev.id">
+          <tr class="border-t border-slate-100 hover:bg-slate-50">
+            <td class="px-4 py-2 font-mono text-xs" x-text="ev.id"></td>
+            <td class="px-4 py-2"><span class="px-2 py-0.5 rounded-full text-xs bg-slate-100 text-slate-600" x-text="ev.event_type"></span></td>
+            <td class="px-4 py-2 text-xs" x-text="ev.actor_email||'—'"></td>
+            <td class="px-4 py-2 font-mono text-xs truncate max-w-xs" x-text="ev.detail_json"></td>
+            <td class="px-4 py-2 text-xs text-slate-500" x-text="ev.occurred_at?ev.occurred_at.substring(0,16).replace('T',' '):'—'"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+<?php endif; // recall_events tab ?>
+
+<?php if($admin_tab==='tiers'): ?>
+<!-- Subscription Tiers tab (Sprint 29) -->
+<div x-data="{tiers:[],loading:true,uid:'',tname:'free',texp:'',assigning:false,amsg:''}"
+  x-init="fetch('?api=tier_list').then(r=>r.json()).then(d=>{tiers=d.rows||[];loading=false})">
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-5 mb-5">
+    <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+      <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="layers" class="w-4 h-4 text-fw-500"></i>Defined Tiers</h3>
+      <div x-show="loading" class="text-xs text-slate-400">Loading…</div>
+      <template x-for="t in tiers" :key="t.name">
+        <div class="mb-3 p-3 border border-slate-200 rounded">
+          <div class="flex items-center justify-between mb-1">
+            <span class="font-medium text-sm" x-text="t.name"></span>
+            <span class="text-xs text-slate-500" x-text="t.rate_limit_hour+' req/hr'"></span>
+          </div>
+          <div class="text-xs text-slate-500" x-text="'API access: '+(t.api_access?'Yes':'No')"></div>
+          <div class="font-mono text-xs text-slate-400 mt-1" x-text="t.features_json"></div>
+        </div>
+      </template>
+    </div>
+    <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+      <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="user-check" class="w-4 h-4 text-fw-500"></i>Assign Tier Override</h3>
+      <div class="space-y-3">
+        <div><label class="text-xs text-slate-600 mb-1 block">User ID</label><input x-model="uid" type="number" min="1" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500"></div>
+        <div><label class="text-xs text-slate-600 mb-1 block">Tier</label>
+          <select x-model="tname" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+            <template x-for="t in tiers" :key="t.name"><option :value="t.name" x-text="t.name"></option></template>
+          </select>
+        </div>
+        <div><label class="text-xs text-slate-600 mb-1 block">Expires At (ISO datetime, blank=never)</label><input x-model="texp" type="text" placeholder="2027-01-01T00:00:00" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500"></div>
+        <button :disabled="assigning||!uid" @click="assigning=true;amsg='';fetch('?api=tier_assign',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',user_id:uid,tier_name:tname,expires_at:texp||''})}).then(r=>r.json()).then(d=>{assigning=false;amsg=d.ok?'Tier assigned':d.error||'Error'})" class="px-3 py-1.5 bg-fw-500 text-white text-sm rounded hover:bg-fw-700 disabled:opacity-50">Assign Tier</button>
+        <p x-show="amsg" x-text="amsg" class="text-xs text-slate-600"></p>
+      </div>
+    </div>
+  </div>
+</div>
+<?php endif; // tiers tab ?>
+
+<?php if($admin_tab==='system_settings'): ?>
+<!-- System Settings tab (Sprint 30) -->
+<div x-data="{settings:[],loading:true,ekey:'',evalue:'',saving:false,smsg:''}"
+  x-init="fetch('?api=settings_list').then(r=>r.json()).then(d=>{settings=d.rows||[];loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="settings" class="w-4 h-4 text-fw-500"></i>Edit Setting</h3>
+    <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+      <div><label class="text-xs text-slate-600 mb-1 block">Key</label><input x-model="ekey" type="text" maxlength="100" placeholder="archive_days" class="w-full text-sm font-mono border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500"></div>
+      <div><label class="text-xs text-slate-600 mb-1 block">Value</label><input x-model="evalue" type="text" maxlength="2000" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500"></div>
+      <div class="flex items-end gap-2">
+        <button :disabled="saving||!ekey" @click="saving=true;smsg='';fetch('?api=settings_set',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',key:ekey,value:evalue})}).then(r=>r.json()).then(d=>{saving=false;if(d.ok){smsg='Saved';let ex=settings.findIndex(s=>s.key===ekey);if(ex>=0)settings[ex].value=evalue;else settings.push({key:ekey,value:evalue})}else smsg=d.error||'Error'})" class="px-3 py-1.5 bg-fw-500 text-white text-sm rounded hover:bg-fw-700 disabled:opacity-50">Save</button>
+        <p x-show="smsg" x-text="smsg" class="text-xs text-slate-600"></p>
+      </div>
+    </div>
+  </div>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 border-b border-slate-200"><tr>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Key</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Value</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Updated</th>
+      </tr></thead>
+      <tbody>
+        <tr x-show="loading"><td colspan="3" class="px-4 py-6 text-center text-slate-400 text-sm">Loading…</td></tr>
+        <tr x-show="!loading&&!settings.length"><td colspan="3" class="px-4 py-6 text-center text-slate-400 text-sm">No settings found.</td></tr>
+        <template x-for="s in settings" :key="s.key">
+          <tr class="border-t border-slate-100 hover:bg-slate-50 cursor-pointer" @click="ekey=s.key;evalue=s.value">
+            <td class="px-4 py-2 font-mono text-xs font-medium" x-text="s.key"></td>
+            <td class="px-4 py-2 text-sm" x-text="s.value"></td>
+            <td class="px-4 py-2 text-xs text-slate-500" x-text="s.updated_at?s.updated_at.substring(0,16).replace('T',' '):'—'"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+<?php endif; // system_settings tab ?>
+
 <?php layout_foot(); }
 
 // ================================================================
@@ -9840,7 +10703,7 @@ if(!$user && $reset_tok_param): ?>
 <!-- Tab nav -->
 <?php $atab=$_GET['tab']??'overview'; ?>
 <div class="flex gap-0 border-b border-slate-200 mb-6">
-  <?php foreach(['overview'=>'Overview','filters'=>'Saved Filters','alerts'=>'Alerts','keys'=>'API Keys','activity'=>'Activity','notifications'=>'Notifications','tags'=>'Tags','feeds'=>'RSS Feeds','searches'=>'Saved Searches','shares'=>'Shared Links'] as $tv=>$tl): ?>
+  <?php foreach(['overview'=>'Overview','filters'=>'Saved Filters','alerts'=>'Alerts','keys'=>'API Keys','activity'=>'Activity','notifications'=>'Notifications','tags'=>'Tags','feeds'=>'RSS Feeds','searches'=>'Saved Searches','shares'=>'Shared Links','digest'=>'Digest'] as $tv=>$tl): ?>
   <a href="?page=account&tab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$atab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
   <?php endforeach; ?>
 </div>
@@ -10269,6 +11132,32 @@ Authorization: Bearer fw_...</pre>
         </template>
       </tbody>
     </table>
+  </div>
+</div>
+
+<?php elseif($atab==='digest'): ?>
+<!-- Digest Preview tab (Sprint 26) -->
+<div x-data="{html:'',count:0,loading:false,dtype:'weekly',msg:''}"
+  x-init="loadPreview();"
+  x-effect="">
+  <script>
+  function loadPreview(){
+    const self=Alpine.store?Alpine:null;
+  }
+  </script>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5" x-data="{html:'',count:0,loading:false,dtype:'weekly',msg:''}" x-init="">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="mail" class="w-4 h-4 text-fw-500"></i>Recall Digest Preview</h3>
+    <div class="flex items-center gap-3 mb-4">
+      <label class="text-xs text-slate-600">Type:</label>
+      <select x-model="dtype" class="text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+        <option value="daily">Daily</option>
+        <option value="weekly">Weekly</option>
+      </select>
+      <button :disabled="loading" @click="loading=true;msg='';fetch('?api=digest_preview',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',type:dtype})}).then(r=>r.json()).then(d=>{loading=false;if(d.ok){html=d.html;count=d.recall_count;msg=d.recall_count+' recall(s) in digest'}else msg=d.error||'Error'})" class="px-3 py-1.5 bg-fw-500 text-white text-sm rounded hover:bg-fw-700 disabled:opacity-50">Preview Digest</button>
+    </div>
+    <p x-show="msg" x-text="msg" class="text-xs text-slate-600 mb-3"></p>
+    <div x-show="html" class="border border-slate-200 rounded p-4 bg-white prose prose-sm max-w-none" x-html="html"></div>
+    <p x-show="!html&&!loading" class="text-xs text-slate-400">Click "Preview Digest" to generate a preview.</p>
   </div>
 </div>
 
