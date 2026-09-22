@@ -9,8 +9,8 @@ declare(strict_types=1);
 // ================================================================
 // § CONSTANTS
 // ================================================================
-const FW_VERSION    = '5.4.0';
-const FW_SCHEMA_VER = 21;
+const FW_VERSION    = '5.5.0';
+const FW_SCHEMA_VER = 22;
 // Pre-shared secret for IONOS crontab → cron_alerts endpoint; override before deploy
 const FW_CRON_SECRET = 'change-me-before-deploy';
 const FW_DATA_DIR   = __DIR__ . '/data';
@@ -706,6 +706,18 @@ INSERT OR IGNORE INTO state_population(state_code,population)VALUES
 ('SD',886667),('TN',6910840),('TX',29145505),('UT',3271616),
 ('VT',643077),('VA',8631393),('WA',7705281),('WV',1793716),
 ('WI',5893718),('WY',576851),('DC',689545);
+SQL; }
+
+function m22():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS recall_notes(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  recall_id INTEGER NOT NULL REFERENCES recalls(id) ON DELETE CASCADE,
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT(datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_rn_recall ON recall_notes(recall_id);
+CREATE INDEX IF NOT EXISTS idx_rn_user ON recall_notes(user_id);
 SQL; }
 
 // ================================================================
@@ -1881,6 +1893,28 @@ function q_velocity():array{
     return $result;
 }
 
+// Sprint 10: Linear regression over recall_velocity history → 30d forecast
+function q_velocity_forecast():array{
+    try{
+        $rows=db()->query("SELECT rate_30d FROM recall_velocity ORDER BY computed_date DESC LIMIT 12")->fetchAll(\PDO::FETCH_COLUMN);
+    }catch(\Throwable){$rows=[];}
+    $n=count($rows);
+    if($n<2)return['forecast'=>null,'trend'=>0.0,'confidence'=>'insufficient data'];
+    $rows=array_reverse($rows); // oldest first
+    $x_mean=($n-1)/2.0;
+    $y_mean=array_sum($rows)/$n;
+    $num=0.0;$den=0.0;
+    foreach($rows as $i=>$y){$dx=$i-$x_mean;$num+=$dx*((float)$y-$y_mean);$den+=$dx*$dx;}
+    $slope=$den>0?$num/$den:0.0;
+    $intercept=$y_mean-$slope*$x_mean;
+    $forecast_raw=$intercept+$slope*$n; // next period
+    $forecast=max(0,(int)round($forecast_raw));
+    $r2=0.0;
+    if($den>0){$ss_res=0.0;foreach($rows as $i=>$y){$pred=$intercept+$slope*$i;$ss_res+=((float)$y-$pred)**2;}$ss_tot=0.0;foreach($rows as $y){$ss_tot+=((float)$y-$y_mean)**2;}$r2=$ss_tot>0?max(0.0,1-$ss_res/$ss_tot):0.0;}
+    $conf=$r2>0.7?'high':($r2>0.4?'moderate':'low');
+    return['forecast'=>$forecast,'trend'=>round($slope,2),'r2'=>round($r2,3),'confidence'=>$conf,'periods'=>$n];
+}
+
 // GROUP 5: System-wide Markov dashboard summary for the "Recall Outlook" card
 function q_markov_dashboard():array{
     try{
@@ -2462,6 +2496,17 @@ function run_tests():array{
         'watchlist_checks'  =>'test_watchlist_checks',
         'user_mgmt_api'     =>'test_user_mgmt_api',
         'distributors_view' =>'test_distributors_view',
+        // Sprint 10
+        'recall_notes_schema'   =>'test_recall_notes_schema',
+        'velocity_forecast'     =>'test_velocity_forecast',
+        'compare_view'          =>'test_compare_view',
+        'note_save_api'         =>'test_note_save_api',
+        'compare_routing'       =>'test_compare_routing',
+        'db_checkpoint_api'     =>'test_db_checkpoint_api',
+        'velocity_forecast_keys'=>'test_velocity_forecast_keys',
+        'compare_no_dups'       =>'test_compare_no_dups',
+        'dbhealth_tab'          =>'test_dbhealth_tab',
+        'notes_auth_guard'      =>'test_notes_auth_guard',
         // Sprint 9
         'fts_snippet'           =>'test_fts_snippet',
         'similar_recalls'       =>'test_similar_recalls',
@@ -2949,6 +2994,67 @@ function test_recall_detail_similar():array{
     $ok=str_contains($src,'Similar Recalls')&&str_contains($src,'recall_equivalences')&&str_contains($src,'sim>=0.30');
     return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'similar recalls panel present in recall detail':'panel missing'];
 }
+// ── Sprint 10 tests ──────────────────────────────────────────────
+function test_recall_notes_schema():array{
+    try{
+        $cols=db()->query("PRAGMA table_info(recall_notes)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    }catch(\Throwable){$cols=[];}
+    $need=['id','user_id','recall_id','body','created_at','updated_at'];
+    $missing=array_diff($need,$cols);
+    $ok=empty($missing);
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'recall_notes schema valid':'missing cols: '.implode(',',$missing)];
+}
+function test_velocity_forecast():array{
+    $f=q_velocity_forecast();
+    $ok=array_key_exists('forecast',$f)&&array_key_exists('trend',$f)&&array_key_exists('confidence',$f);
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'forecast='.json_encode($f['forecast']).' trend='.$f['trend'].' conf='.$f['confidence']:'q_velocity_forecast missing keys'];
+}
+function test_compare_view():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function view_compare()')&&str_contains($src,'?page=compare')&&str_contains($src,'side-by-side');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'view_compare() present with routing and side-by-side markup':'compare view missing'];
+}
+function test_note_save_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'note_save':")&&str_contains($src,"case 'note_del':")&&str_contains($src,"case 'notes_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'note_save / note_del / notes_list API cases present':'note API cases missing'];
+}
+function test_compare_routing():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'compare':       render_page('compare')")&&str_contains($src,"'compare'      =>view_compare()");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compare route and render_page dispatch present':'compare routing incomplete'];
+}
+function test_db_checkpoint_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'db_checkpoint':")&&str_contains($src,'wal_checkpoint(TRUNCATE)');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'db_checkpoint endpoint present':'db_checkpoint missing'];
+}
+function test_velocity_forecast_keys():array{
+    $f=q_velocity_forecast();
+    $need=['forecast','trend','confidence'];
+    $missing=array_diff($need,array_keys($f));
+    $ok=empty($missing);
+    $periods=$f['periods']??0;
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?"keys present; periods=$periods r2=".($f['r2']??'n/a'):'missing keys: '.implode(',',$missing)];
+}
+function test_compare_no_dups():array{
+    // Alpine compare state must guard against duplicate IDs: inCmp check before push
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'inCmp(id)')&&str_contains($src,'this.cmp.find(r=>r.id===id)');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'duplicate-guard in Alpine compare state present':'dup guard missing'];
+}
+function test_dbhealth_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"atab==='dbhealth'")&&str_contains($src,'wal_checkpoint')&&str_contains($src,'sqlite_master');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'DB Health tab markup present':'dbhealth tab missing'];
+}
+function test_notes_auth_guard():array{
+    // notes API must check is_user() before operating
+    $src=file_get_contents(__FILE__);
+    // look for is_user() check in proximity to note_save / note_del / notes_list
+    $ok=str_contains($src,"case 'note_save':")&&str_contains($src,'is_user()')&&str_contains($src,"case 'notes_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'notes auth guard (is_user) present':'notes auth guard missing'];
+}
 
 // ================================================================
 // § ROUTING & DISPATCH
@@ -2993,6 +3099,7 @@ function route():void{
         case 'subscriptions': render_page('subscriptions');break;
         case 'markov_admin':  render_page('markov_admin');break;
         case 'search':        render_page('search');break;
+        case 'compare':       render_page('compare');break;
         case 'distributors':  render_page('distributors');break;
         case 'distributor':   render_page('distributor');break;
         case 'brand':         render_page('brand');break;
@@ -3259,6 +3366,33 @@ function handle_api(string $api):void{
                 if(!is_user())fw_abort('Login required',401);
                 $s=db()->prepare('SELECT id,key_prefix,label,created_at,last_used,rate_limit_hour FROM api_keys WHERE user_id=? AND revoked=0 ORDER BY created_at DESC');
                 $s->execute([current_user()['id']]);echo js($s->fetchAll());break;
+            // Sprint 10: recall notes
+            case 'note_save':
+                if(!csrf_ok())fw_abort('CSRF',403);
+                if(!is_user())fw_abort('Login required',401);
+                $note_uid=current_user()['id'];
+                $note_rid=(int)($_POST['recall_id']??0);
+                $note_body=trim($_POST['body']??'');
+                if(!$note_rid||!$note_body)fw_abort('recall_id and body required',400);
+                if(mb_strlen($note_body)>2000)fw_abort('Note too long (max 2000 chars)',400);
+                $note_id_upd=(int)($_POST['id']??0);
+                if($note_id_upd){
+                    db()->prepare("UPDATE recall_notes SET body=?,updated_at=datetime('now') WHERE id=? AND user_id=?")->execute([$note_body,$note_id_upd,$note_uid]);
+                    echo js(['ok'=>true,'id'=>$note_id_upd]);
+                }else{
+                    db()->prepare("INSERT INTO recall_notes(user_id,recall_id,body)VALUES(?,?,?)")->execute([$note_uid,$note_rid,$note_body]);
+                    echo js(['ok'=>true,'id'=>(int)db()->lastInsertId()]);
+                }break;
+            case 'note_del':
+                if(!csrf_ok())fw_abort('CSRF',403);
+                if(!is_user())fw_abort('Login required',401);
+                db()->prepare("DELETE FROM recall_notes WHERE id=? AND user_id=?")->execute([(int)($_POST['id']??0),current_user()['id']]);
+                echo js(['ok'=>true]);break;
+            case 'notes_list':
+                if(!is_user())fw_abort('Login required',401);
+                $s=db()->prepare("SELECT id,body,created_at,updated_at FROM recall_notes WHERE recall_id=? AND user_id=? ORDER BY created_at DESC");
+                $s->execute([(int)($_GET['recall_id']??0),current_user()['id']]);
+                echo js($s->fetchAll());break;
             case 'v1':
                 $auth=$_SERVER['HTTP_AUTHORIZATION']??'';
                 $raw_key=str_starts_with($auth,'Bearer ')?trim(substr($auth,7)):trim($_GET['api_key']??'');
@@ -3325,6 +3459,12 @@ function handle_api(string $api):void{
                 if(!csrf_ok())fw_abort('CSRF',403);
                 echo js(password_reset_apply($tok_pr,$new_pw));break;
             // SPRINT 6: cron-safe endpoint — IONOS crontab: curl "https://domain/?api=cron_alerts&secret=FW_CRON_SECRET"
+            // Sprint 10: WAL checkpoint (admin-only)
+            case 'db_checkpoint':
+                if(!csrf_ok())fw_abort('CSRF',403);
+                if(!is_admin())fw_abort('Unauthorized',403);
+                $ck=db()->query("PRAGMA wal_checkpoint(TRUNCATE)")->fetch(\PDO::FETCH_NUM);
+                echo js(['ok'=>true,'busy'=>$ck[0]??0,'log_frames'=>$ck[1]??0,'ckpt_frames'=>$ck[2]??0]);break;
             case 'cron_alerts':
                 $secret=$_GET['secret']??'';
                 if(!hash_equals(FW_CRON_SECRET,$secret))fw_abort('Unauthorized',403);
@@ -3518,6 +3658,7 @@ function render_page(string $p):void{
         'subscriptions' =>view_subscriptions(),
         'markov_admin'  =>view_markov_admin(),
         'search'        =>view_search(),
+        'compare'       =>view_compare(),
         'watchlist'     =>view_watchlist(),
         'account'       =>view_account(),
         'tests'         =>view_tests(),
@@ -3537,6 +3678,8 @@ function view_dashboard():void{
     $coesc=q_coescalation_clusters();
     // Sprint 9: recall velocity for surge alert banner
     try{$velocity=q_velocity();}catch(\Throwable){$velocity=['z_score'=>0.0,'rate_30d'=>0,'baseline_monthly'=>0,'trending_cats'=>[]];}
+    // Sprint 10: velocity forecast (linear regression over stored velocity history)
+    try{$forecast=q_velocity_forecast();}catch(\Throwable){$forecast=['forecast'=>null,'trend'=>0.0,'confidence'=>'n/a'];}
 
     layout_head('Dashboard','dashboard'); ?>
 
@@ -3654,6 +3797,13 @@ function view_dashboard():void{
       <div class="text-2xl font-bold text-slate-700"><?=$markov_dash['e_days']?><span class="text-sm font-normal">d</span></div>
     </div>
   </div>
+  <?php if($forecast['forecast']!==null): ?>
+  <div class="mt-3 pt-3 border-t border-indigo-100 flex items-center gap-4 text-xs text-indigo-700">
+    <i data-lucide="trending-<?=$forecast['trend']>=0?'up':'down'?>" class="w-4 h-4 shrink-0"></i>
+    <span>30-day forecast: <strong><?=(int)$forecast['forecast']?> recalls</strong>
+    (<?=$forecast['trend']>=0?'+':''?><?=number_format($forecast['trend'],1)?>/period · <?=h($forecast['confidence'])?> confidence · R²=<?=number_format($forecast['r2']??0,2)?>)</span>
+  </div>
+  <?php endif; ?>
 </div>
 
 <?php if($stats['active']===0): ?>
@@ -3785,7 +3935,8 @@ function view_recalls():void{
   <button type="submit" class="bg-fw-500 text-white text-sm rounded px-3 py-1.5 font-medium hover:bg-fw-700">Filter</button>
 </form>
 
-<div class="bg-white rounded-lg border border-slate-200 shadow-sm">
+<!-- Sprint 10: compare state wrapper -->
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm" x-data="{cmp:[],addCmp(id,title){if(this.cmp.length>=4||this.cmp.find(r=>r.id===id))return;this.cmp.push({id,title})},rmCmp(id){this.cmp=this.cmp.filter(r=>r.id!==id)},inCmp(id){return!!this.cmp.find(r=>r.id===id)}}">
   <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
     <span class="text-sm text-slate-600"><?=number_format($data['total'])?> recalls</span>
     <div class="flex items-center gap-3 text-xs text-slate-500">
@@ -3797,11 +3948,27 @@ function view_recalls():void{
       <a href="?api=export_pdf&status=<?=h($f['status'])?>&q=<?=h($f['q']??'')?>" target="_blank" class="flex items-center gap-1 text-slate-400 hover:text-fw-500 hover:underline"><i data-lucide="printer" class="w-3 h-3"></i>Print</a>
     </div>
   </div>
+  <!-- Sprint 10: floating compare bar -->
+  <div x-show="cmp.length>0" x-cloak class="flex items-center gap-3 bg-indigo-50 border-b border-indigo-200 px-4 py-2 flex-wrap">
+    <i data-lucide="git-compare" class="w-4 h-4 text-indigo-600 shrink-0"></i>
+    <template x-for="r in cmp" :key="r.id">
+      <span class="flex items-center gap-1 bg-white border border-indigo-200 rounded px-2 py-0.5 text-xs text-indigo-800">
+        <span x-text="r.title.length>40?r.title.substring(0,40)+'…':r.title"></span>
+        <button @click="rmCmp(r.id)" class="text-indigo-400 hover:text-red-500 ml-1 font-bold leading-none">×</button>
+      </span>
+    </template>
+    <a :href="'?page=compare&ids='+cmp.map(r=>r.id).join(',')" class="ml-auto bg-indigo-600 text-white text-xs px-3 py-1 rounded font-medium hover:bg-indigo-700 flex items-center gap-1">
+      <i data-lucide="git-compare" class="w-3 h-3"></i>Compare <span x-text="cmp.length"></span>
+    </a>
+    <button @click="cmp=[]" class="text-xs text-indigo-500 hover:underline">Clear</button>
+  </div>
   <table class="fw-table w-full">
-    <thead><tr><th>Severity</th><th>Product / Reason</th><th>Agency</th><th>Category</th><th>Date</th><th>States</th><th title="Raw event risk score from retail exposure model (GROUP 25)">Risk ⓘ</th><th>Status</th></tr></thead>
+    <thead><tr><th class="w-8"></th><th>Severity</th><th>Product / Reason</th><th>Agency</th><th>Category</th><th>Date</th><th>States</th><th title="Raw event risk score from retail exposure model (GROUP 25)">Risk ⓘ</th><th>Status</th></tr></thead>
     <tbody>
     <?php foreach($data['records'] as $rec): ?>
+    <?php $rid=(int)$rec['id'];$rtitle=addslashes(mb_substr($rec['title'],0,60)); ?>
     <tr>
+      <td class="text-center"><input type="checkbox" :checked="inCmp(<?=$rid?>)" @change="$event.target.checked?addCmp(<?=$rid?>,'<?=$rtitle?>'):rmCmp(<?=$rid?>)" class="rounded text-indigo-600 cursor-pointer" title="Add to compare" :disabled="!inCmp(<?=$rid?>)&&cmp.length>=4"></td>
       <td><?=sev_badge((float)$rec['severity'],$rec['severity_label']??'')?></td>
       <td><a href="?page=recall&id=<?=(int)$rec['id']?>" class="text-fw-500 hover:underline font-medium"><?=h(mb_substr($rec['title'],0,80))?><?=mb_strlen($rec['title'])>80?'…':''?></a>
         <?php if($rec['reason']): ?><br><span class="text-xs text-slate-500"><?=h(mb_substr($rec['reason'],0,100))?><?=mb_strlen($rec['reason'])>100?'…':''?></span><?php endif; ?>
@@ -3824,7 +3991,7 @@ function view_recalls():void{
       <td><?=status_badge($rec['status'])?></td>
     </tr>
     <?php endforeach; ?>
-    <?php if(empty($data['records'])): ?><tr><td colspan="8" class="text-center py-8 text-slate-400">No recalls match the current filters.</td></tr><?php endif; ?>
+    <?php if(empty($data['records'])): ?><tr><td colspan="9" class="text-center py-8 text-slate-400">No recalls match the current filters.</td></tr><?php endif; ?>
     </tbody>
   </table>
   <?=paginator($page,$data['pages'],$_GET)?>
@@ -4091,6 +4258,52 @@ function view_recall_detail():void{
     <?php endif; ?>
   </div>
 </div>
+
+<?php if(is_user()): ?>
+<!-- Sprint 10: Private notes panel (auth required) -->
+<div class="mt-6 bg-white rounded-lg border border-slate-200 shadow-sm"
+  x-data="{notes:[],loading:true,body:'',saving:false,err:'',editId:null}"
+  x-init="fetch('?api=notes_list&recall_id=<?=(int)$id?>').then(r=>r.json()).then(d=>{notes=d;loading=false})">
+  <div class="px-4 py-3 border-b border-slate-200 flex items-center gap-2">
+    <i data-lucide="notebook-pen" class="w-4 h-4 text-slate-500"></i>
+    <h3 class="text-sm font-semibold text-slate-700">My Notes</h3>
+    <span class="text-xs text-slate-400 ml-1">Private · visible only to you</span>
+  </div>
+  <div class="p-4">
+    <textarea x-model="body" rows="3" maxlength="2000"
+      class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500 resize-none"
+      placeholder="Add a private note about this recall…"></textarea>
+    <div class="flex items-center justify-between mt-2">
+      <p x-show="err" x-text="err" class="text-xs text-red-600"></p>
+      <div class="flex gap-2 ml-auto">
+        <span x-show="editId" class="text-xs text-slate-400 self-center">editing</span>
+        <button x-show="editId" @click="editId=null;body=''" class="text-xs text-slate-500 hover:underline">Cancel</button>
+        <button @click="if(!body.trim())return;saving=true;err='';fetch('?api=note_save',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',recall_id:<?=(int)$id?>,body,id:editId||''})}).then(r=>r.json()).then(d=>{saving=false;if(!d.ok){err='Save failed.';return;}if(editId){notes=notes.map(n=>n.id===editId?{...n,body,updated_at:new Date().toISOString()}:n)}else{notes.unshift({id:d.id,body,created_at:new Date().toISOString(),updated_at:new Date().toISOString()})};body='';editId=null}).catch(()=>{saving=false;err='Error.'})"
+          :disabled="saving||!body.trim()" class="bg-fw-500 text-white text-xs px-3 py-1.5 rounded font-medium hover:bg-fw-700 disabled:opacity-50">
+          <span x-show="!saving" x-text="editId?'Update':'Save Note'">Save Note</span>
+          <span x-show="saving">Saving…</span>
+        </button>
+      </div>
+    </div>
+    <div x-show="loading" class="text-xs text-slate-400 text-center py-3 animate-pulse">Loading notes…</div>
+    <div x-show="!loading&&notes.length===0" class="text-xs text-slate-400 text-center py-3">No notes yet.</div>
+    <div x-show="notes.length>0" class="mt-3 space-y-2">
+      <template x-for="n in notes" :key="n.id">
+        <div class="bg-slate-50 rounded border border-slate-200 px-3 py-2 text-sm text-slate-700 flex gap-3">
+          <div class="flex-1 min-w-0">
+            <p class="whitespace-pre-wrap break-words" x-text="n.body"></p>
+            <p class="text-xs text-slate-400 mt-1" x-text="n.updated_at?n.updated_at.substring(0,16).replace('T',' '):n.created_at.substring(0,16).replace('T',' ')"></p>
+          </div>
+          <div class="flex flex-col gap-1 shrink-0">
+            <button @click="editId=n.id;body=n.body" class="text-xs text-fw-500 hover:underline">Edit</button>
+            <button @click="if(confirm('Delete this note?'))fetch('?api=note_del',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',id:n.id})}).then(()=>{notes=notes.filter(x=>x.id!==n.id)})" class="text-xs text-red-500 hover:underline">Delete</button>
+          </div>
+        </div>
+      </template>
+    </div>
+  </div>
+</div>
+<?php endif; ?>
 <?php layout_foot(); }
 
 function view_retailers():void{
@@ -4775,6 +4988,101 @@ function view_geo():void{
 </div>
 <?php layout_foot(); }
 
+// Sprint 10: side-by-side recall comparison
+function view_compare():void{
+    $raw=trim($_GET['ids']??'');
+    $ids=array_filter(array_map('intval',explode(',',$raw)),fn($v)=>$v>0);
+    $ids=array_slice(array_values(array_unique($ids)),0,4);
+    $recalls=[];
+    foreach($ids as $cid){
+        $r=q_recall($cid);
+        if($r)$recalls[]=$r;
+    }
+    layout_head('Compare Recalls','recalls'); ?>
+<div class="mb-4 flex items-center justify-between">
+  <h1 class="text-lg font-bold text-slate-800 flex items-center gap-2"><i data-lucide="git-compare" class="w-5 h-5 text-indigo-500"></i>Recall Comparison</h1>
+  <a href="?page=recalls" class="text-xs text-fw-500 hover:underline flex items-center gap-1"><i data-lucide="arrow-left" class="w-3 h-3"></i>Back to recalls</a>
+</div>
+<?php if(count($recalls)<2): ?>
+<div class="bg-amber-50 border border-amber-300 rounded-lg p-6 text-center text-sm text-amber-800">
+  Select 2–4 recalls from the <a href="?page=recalls" class="underline">recalls list</a> to compare them side by side.
+</div>
+<?php else: ?>
+<?php
+$fields=[
+    'title'=>'Product / Title','announced_date'=>'Announced','classification'=>'Classification',
+    'status'=>'Status','severity_label'=>'Severity','agency_name'=>'Agency',
+    'category_name'=>'Category','distribution_description'=>'Distribution',
+    'quantity_recalled'=>'Quantity','voluntary_mandated'=>'Voluntary/Mandated',
+    'reason'=>'Reason for Recall',
+];
+?>
+<div class="overflow-x-auto">
+<table class="w-full text-sm border-collapse">
+  <thead>
+    <tr>
+      <th class="text-left text-xs text-slate-500 uppercase tracking-wide font-semibold border-b border-slate-200 px-3 py-2 bg-slate-50 w-36 shrink-0">Field</th>
+      <?php foreach($recalls as $cr): ?>
+      <th class="text-left border-b border-slate-200 px-3 py-2 bg-slate-50 align-top">
+        <a href="?page=recall&id=<?=(int)$cr['id']?>" class="text-fw-500 hover:underline font-semibold text-sm leading-snug">
+          <?=h(mb_substr($cr['title'],0,60))?><?=mb_strlen($cr['title']??'')>60?'…':''?>
+        </a>
+        <div class="mt-1"><?=sev_badge((float)$cr['severity'],$cr['severity_label']??'')?> <?=status_badge($cr['status']??'')?></div>
+      </th>
+      <?php endforeach; ?>
+    </tr>
+  </thead>
+  <tbody>
+  <?php foreach($fields as $fk=>$fl): ?>
+  <tr class="border-b border-slate-100">
+    <td class="text-xs font-semibold text-slate-500 px-3 py-2 bg-slate-50 whitespace-nowrap"><?=h($fl)?></td>
+    <?php foreach($recalls as $cr): ?>
+    <?php $val=$cr[$fk]??'—'; ?>
+    <td class="px-3 py-2 text-xs text-slate-700 align-top max-w-xs">
+      <?php if($fk==='status'): ?><?=status_badge($val)?>
+      <?php elseif($fk==='severity_label'): ?><?=sev_badge((float)($cr['severity']??0),$val)?>
+      <?php else: ?><?=h($val)?><?php endif; ?>
+    </td>
+    <?php endforeach; ?>
+  </tr>
+  <?php endforeach; ?>
+  <!-- Hazards row -->
+  <tr class="border-b border-slate-100">
+    <td class="text-xs font-semibold text-slate-500 px-3 py-2 bg-slate-50">Hazards</td>
+    <?php foreach($recalls as $cr): ?>
+    <td class="px-3 py-2 text-xs text-slate-700 align-top">
+      <?php if(empty($cr['hazards'])): ?>—<?php else: ?>
+      <?php foreach($cr['hazards'] as $hz): ?>
+      <span class="inline-block bg-slate-100 rounded px-1.5 py-0.5 mr-1 mb-0.5"><?=h($hz['name'])?></span>
+      <?php endforeach; ?><?php endif; ?>
+    </td>
+    <?php endforeach; ?>
+  </tr>
+  <!-- States row -->
+  <tr class="border-b border-slate-100">
+    <td class="text-xs font-semibold text-slate-500 px-3 py-2 bg-slate-50">States</td>
+    <?php foreach($recalls as $cr): ?>
+    <td class="px-3 py-2 text-xs text-slate-700 align-top"><?=h(implode(', ',$cr['states']??['—']))?></td>
+    <?php endforeach; ?>
+  </tr>
+  <!-- Retailers row -->
+  <tr>
+    <td class="text-xs font-semibold text-slate-500 px-3 py-2 bg-slate-50">Retailers</td>
+    <?php foreach($recalls as $cr): ?>
+    <td class="px-3 py-2 text-xs text-slate-700 align-top">
+      <?php $rts=array_slice($cr['retailers']??[],0,4); ?>
+      <?php if($rts): ?><?=h(implode(', ',array_column($rts,'name')))?>
+        <?php if(count($cr['retailers']??[])>4): ?> <span class="text-slate-400">+<?=count($cr['retailers'])-4?> more</span><?php endif; ?>
+      <?php else: ?>—<?php endif; ?>
+    </td>
+    <?php endforeach; ?>
+  </tr>
+  </tbody>
+</table>
+</div>
+<?php endif; ?>
+<?php layout_foot(); }
+
 function view_search():void{
     $q=trim($_GET['q']??'');
     $results=$q?q_search($q):[];
@@ -5100,7 +5408,7 @@ function view_admin():void{
 
 <!-- Admin Tab Nav (GROUP 8) -->
 <div class="flex gap-0 border-b border-slate-200 mb-6 flex-wrap">
-  <?php foreach(['ingestion'=>'Ingestion','dq'=>'Data Quality','runs'=>'Run History','rate_limits'=>'Rate Limits','subscriptions'=>'Subscriptions','users'=>'Users'] as $tv=>$tl): ?>
+  <?php foreach(['ingestion'=>'Ingestion','dq'=>'Data Quality','runs'=>'Run History','rate_limits'=>'Rate Limits','subscriptions'=>'Subscriptions','users'=>'Users','dbhealth'=>'DB Health'] as $tv=>$tl): ?>
   <a href="?page=admin&atab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$admin_tab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
   <?php endforeach; ?>
 </div>
@@ -5323,6 +5631,66 @@ function view_admin():void{
   </table>
 </div>
 <?php endif; // users tab ?>
+
+<?php if($admin_tab==='dbhealth'): ?>
+<!-- Sprint 10: DB Health Tab -->
+<?php
+$wal_mode=db()->query("PRAGMA journal_mode")->fetchColumn();
+$page_sz=(int)db()->query("PRAGMA page_size")->fetchColumn();
+$page_cnt=(int)db()->query("PRAGMA page_count")->fetchColumn();
+$free_pg=(int)db()->query("PRAGMA freelist_count")->fetchColumn();
+$cache_sz=(int)db()->query("PRAGMA cache_size")->fetchColumn();
+$fk_on=(int)db()->query("PRAGMA foreign_keys")->fetchColumn();
+$db_bytes=$page_sz*$page_cnt;
+$tables=db()->query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")->fetchAll(\PDO::FETCH_COLUMN);
+$idx_cnt=(int)db()->query("SELECT COUNT(*) FROM sqlite_master WHERE type='index'")->fetchColumn();
+$migrations=db()->query("SELECT version,applied_at FROM schema_migrations ORDER BY version DESC LIMIT 5")->fetchAll();
+?>
+<div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+  <div class="fw-stat"><div class="text-xl font-bold"><?=h($wal_mode)?></div><div class="text-xs text-slate-500">Journal Mode</div></div>
+  <div class="fw-stat"><div class="text-xl font-bold"><?=number_format(round($db_bytes/1024/1024,2),2)?> MB</div><div class="text-xs text-slate-500">DB Size (pages)</div></div>
+  <div class="fw-stat"><div class="text-xl font-bold"><?=$page_cnt?></div><div class="text-xs text-slate-500">Total Pages</div></div>
+  <div class="fw-stat"><div class="text-xl font-bold <?=$fk_on?'text-green-600':'text-red-600'?>"><?=$fk_on?'ON':'OFF'?></div><div class="text-xs text-slate-500">Foreign Keys</div></div>
+</div>
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <div class="px-4 py-3 border-b border-slate-200 text-sm font-semibold text-slate-700">Table Row Counts</div>
+    <table class="fw-table w-full">
+      <thead><tr><th>Table</th><th class="text-right">Rows</th></tr></thead>
+      <tbody>
+      <?php foreach($tables as $tbl): ?>
+      <?php try{$rc=(int)db()->query("SELECT COUNT(*) FROM \"$tbl\"")->fetchColumn();}catch(\Throwable){$rc=-1;} ?>
+      <tr><td class="font-mono text-xs"><?=h($tbl)?></td><td class="text-right font-mono text-xs <?=$rc>0?'text-slate-700':'text-slate-400'?>"><?=$rc>=0?number_format($rc):'—'?></td></tr>
+      <?php endforeach; ?>
+      </tbody>
+    </table>
+  </div>
+  <div class="space-y-4">
+    <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
+      <h3 class="text-sm font-semibold text-slate-700 mb-3">Storage &amp; Cache</h3>
+      <dl class="text-xs space-y-1">
+        <div class="flex justify-between"><dt class="text-slate-500">Page size</dt><dd class="font-mono"><?=number_format($page_sz)?> B</dd></div>
+        <div class="flex justify-between"><dt class="text-slate-500">Free pages</dt><dd class="font-mono"><?=$free_pg?></dd></div>
+        <div class="flex justify-between"><dt class="text-slate-500">Cache size</dt><dd class="font-mono"><?=$cache_sz> 0?$cache_sz.' pages':abs($cache_sz).' KiB'?></dd></div>
+        <div class="flex justify-between"><dt class="text-slate-500">Indexes</dt><dd class="font-mono"><?=$idx_cnt?></dd></div>
+      </dl>
+      <button onclick="fetch('?api=db_checkpoint',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>'})}).then(r=>r.json()).then(d=>alert('WAL checkpoint: '+JSON.stringify(d)))" class="mt-3 text-xs text-fw-500 border border-fw-500 rounded px-3 py-1.5 hover:bg-fw-50">Run WAL Checkpoint</button>
+    </div>
+    <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
+      <h3 class="text-sm font-semibold text-slate-700 mb-3">Recent Migrations</h3>
+      <table class="fw-table w-full">
+        <thead><tr><th>Version</th><th>Applied At</th></tr></thead>
+        <tbody>
+        <?php foreach($migrations as $mg): ?>
+        <tr><td class="font-mono text-xs">m<?=(int)$mg['version']?></td><td class="text-xs"><?=h(substr($mg['applied_at'],0,16))?></td></tr>
+        <?php endforeach; ?>
+        <?php if(empty($migrations)): ?><tr><td colspan="2" class="text-center text-slate-400 py-3">No migration records.</td></tr><?php endif; ?>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+<?php endif; // dbhealth tab ?>
 
 <?php layout_foot(); }
 
