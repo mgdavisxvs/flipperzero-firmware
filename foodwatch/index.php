@@ -9,8 +9,8 @@ declare(strict_types=1);
 // ================================================================
 // § CONSTANTS
 // ================================================================
-const FW_VERSION    = '6.0.0';
-const FW_SCHEMA_VER = 31;
+const FW_VERSION    = '7.0.0';
+const FW_SCHEMA_VER = 38;
 // Pre-shared secret for IONOS crontab → cron_alerts endpoint; override before deploy
 const FW_CRON_SECRET = 'change-me-before-deploy';
 const FW_DATA_DIR   = __DIR__ . '/data';
@@ -310,7 +310,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26(),27=>m27(),28=>m28(),29=>m29(),30=>m30(),31=>m31()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26(),27=>m27(),28=>m28(),29=>m29(),30=>m30(),31=>m31(),32=>m32(),33=>m33(),34=>m34(),35=>m35(),36=>m36(),37=>m37(),38=>m38()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -799,6 +799,90 @@ CREATE TABLE IF NOT EXISTS notification_prefs(
   digest_freq TEXT NOT NULL DEFAULT 'immediate' CHECK(digest_freq IN ('immediate','daily','weekly')),
   updated_at TEXT NOT NULL DEFAULT(datetime('now')));
 CREATE INDEX IF NOT EXISTS idx_np_user ON notification_prefs(user_id);
+SQL; }
+
+function m38():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS api_usage_log(
+  id INTEGER PRIMARY KEY,
+  key_id INTEGER REFERENCES api_keys(id) ON DELETE SET NULL,
+  resource TEXT NOT NULL DEFAULT '',
+  method TEXT NOT NULL DEFAULT 'GET',
+  status_code INTEGER NOT NULL DEFAULT 200,
+  latency_ms REAL NOT NULL DEFAULT 0,
+  requested_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_aul_key ON api_usage_log(key_id, requested_at);
+SQL; }
+
+function m37():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS webhook_deliveries(
+  id INTEGER PRIMARY KEY,
+  webhook_id INTEGER REFERENCES outbound_webhooks(id) ON DELETE SET NULL,
+  event_type TEXT NOT NULL DEFAULT 'recall_alert',
+  status TEXT NOT NULL DEFAULT 'ok' CHECK(status IN ('ok','fail')),
+  status_code INTEGER NOT NULL DEFAULT 0,
+  latency_ms REAL NOT NULL DEFAULT 0,
+  attempted_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_wd_webhook ON webhook_deliveries(webhook_id, attempted_at);
+SQL; }
+
+function m36():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS health_checks(
+  id INTEGER PRIMARY KEY,
+  check_name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'ok' CHECK(status IN ('ok','warn','fail')),
+  latency_ms REAL NOT NULL DEFAULT 0,
+  detail TEXT NOT NULL DEFAULT '',
+  checked_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_hc_name ON health_checks(check_name, checked_at);
+SQL; }
+
+function m35():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS risk_scores(
+  recall_id INTEGER PRIMARY KEY REFERENCES recalls(id) ON DELETE CASCADE,
+  score REAL NOT NULL DEFAULT 0,
+  factors_json TEXT NOT NULL DEFAULT '{}',
+  computed_at TEXT NOT NULL DEFAULT(datetime('now')));
+SQL; }
+
+function m34():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS shared_views(
+  id INTEGER PRIMARY KEY,
+  token TEXT NOT NULL UNIQUE,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  type TEXT NOT NULL DEFAULT 'filter' CHECK(type IN ('filter','search','watchlist')),
+  label TEXT NOT NULL DEFAULT '',
+  data_json TEXT NOT NULL DEFAULT '{}',
+  expires_at TEXT,
+  hit_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_sv_token ON shared_views(token);
+SQL; }
+
+function m33():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS import_rows(
+  id INTEGER PRIMARY KEY,
+  job_id INTEGER NOT NULL REFERENCES import_jobs(id) ON DELETE CASCADE,
+  raw_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','imported','duplicate','error')),
+  recall_id INTEGER,
+  error_msg TEXT NOT NULL DEFAULT '',
+  processed_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_ir_job ON import_rows(job_id, status);
+SQL; }
+
+function m32():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS import_jobs(
+  id INTEGER PRIMARY KEY,
+  label TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'manual',
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','running','done','failed')),
+  row_count INTEGER NOT NULL DEFAULT 0,
+  imported_count INTEGER NOT NULL DEFAULT 0,
+  duplicate_count INTEGER NOT NULL DEFAULT 0,
+  error_count INTEGER NOT NULL DEFAULT 0,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT(datetime('now')),
+  finished_at TEXT);
 SQL; }
 
 function m31():string{ return <<<'SQL'
@@ -2545,6 +2629,50 @@ function send_email_alerts():array{
 }
 
 // Sprint 13: dispatch outbound webhooks for a user
+function compute_risk_score(int $recall_id):array{
+    $db=db();
+    $rec=$db->prepare("SELECT severity,status,announced_date,state,manufacturer_id FROM recalls WHERE id=?");
+    $rec->execute([$recall_id]);$r=$rec->fetch();
+    if(!$r)return['score'=>0.0,'factors'=>[]];
+    $sev_map=['Class I'=>1.0,'Class II'=>0.6,'Class III'=>0.3,'Unknown'=>0.2];
+    $sev=(float)($sev_map[$r['severity']??'']??0.2);
+    $status_map=['ongoing'=>1.0,'active'=>1.0,'completed'=>0.1,'closed'=>0.05,'resolved'=>0.05];
+    $stat_map_v=strtolower($r['status']??'ongoing');
+    $stat=(float)($status_map[$stat_map_v]??0.5);
+    $days_ago=max(0,(int)floor((time()-strtotime($r['announced_date']??date('Y-m-d')))/86400));
+    $recency=$days_ago>365?0.1:max(0.1,1.0-$days_ago/365);
+    $mfr_id=(int)($r['manufacturer_id']??0);
+    $mfr_hist=0.0;
+    if($mfr_id){
+        $mq=$db->prepare("SELECT COUNT(*) FROM recalls WHERE manufacturer_id=? AND id!=?");
+        $mq->execute([$mfr_id,$recall_id]);$mc=(int)$mq->fetchColumn();
+        $mfr_hist=min(1.0,$mc/10.0);
+    }
+    $states_q=$db->prepare("SELECT COUNT(DISTINCT state) FROM recall_states WHERE recall_id=?");
+    $states_q->execute([$recall_id]);$n_states=(int)$states_q->fetchColumn();
+    $geo_spread=min(1.0,$n_states/50.0);
+    $score=round($sev*0.35+$stat*0.25+$recency*0.20+$mfr_hist*0.10+$geo_spread*0.10,4);
+    return['score'=>$score,'factors'=>['severity'=>$sev,'status'=>$stat,'recency'=>$recency,'manufacturer_history'=>$mfr_hist,'geo_spread'=>$geo_spread]];
+}
+
+function run_health_checks():array{
+    $db=db();$checks=[];
+    // DB ping
+    $t=microtime(true);try{$db->query("SELECT 1")->fetchColumn();$lat=round((microtime(true)-$t)*1000,2);$checks[]=['name'=>'db_ping','status'=>'ok','latency_ms'=>$lat,'detail'=>"SQLite query OK ({$lat}ms)"];}catch(\Throwable $e){$checks[]=['name'=>'db_ping','status'=>'fail','latency_ms'=>0,'detail'=>$e->getMessage()];}
+    // Schema version
+    $actual=0;try{$r=$db->query("SELECT MAX(version) FROM schema_migrations");$actual=(int)$r->fetchColumn();$ok=$actual>=FW_SCHEMA_VER;$checks[]=['name'=>'schema_version','status'=>$ok?'ok':'warn','latency_ms'=>0,'detail'=>"v$actual (expected ".FW_SCHEMA_VER.")"];}catch(\Throwable){$checks[]=['name'=>'schema_version','status'=>'warn','latency_ms'=>0,'detail'=>'Could not read schema_migrations'];}
+    // Recall count
+    $rc=(int)$db->query("SELECT COUNT(*) FROM recalls")->fetchColumn();$checks[]=['name'=>'recall_count','status',$rc>0?'ok':'warn','latency_ms'=>0,'detail'=>"$rc recalls"];
+    $checks[count($checks)-1]['status']=$rc>0?'ok':'warn';
+    // Cron freshness
+    try{$lr=$db->query("SELECT MAX(started_at) FROM ingest_runs WHERE status='ok'")->fetchColumn();$lag=$lr?round((time()-strtotime($lr))/3600,1):null;$checks[]=['name'=>'cron_freshness','status'=>(!$lag||$lag>48)?'warn':'ok','latency_ms'=>0,'detail'=>$lag?"Last ok run {$lag}h ago":'No successful runs'];}catch(\Throwable){$checks[]=['name'=>'cron_freshness','status'=>'warn','latency_ms'=>0,'detail'=>'Cannot check cron status'];}
+    // Disk
+    $size=file_exists(FW_DB_PATH)?round(filesize(FW_DB_PATH)/1024/1024,2):0;$checks[]=['name'=>'db_size','status',$size>500?'warn':'ok','latency_ms'=>0,'detail'=>"{$size}MB"];$checks[count($checks)-1]['status']=$size>500?'warn':'ok';
+    // Store results
+    try{$ins=$db->prepare("INSERT INTO health_checks(check_name,status,latency_ms,detail)VALUES(?,?,?,?)");foreach($checks as $c){$ins->execute([$c['name'],$c['status'],$c['latency_ms']??0,$c['detail']]);}}catch(\Throwable){}
+    return $checks;
+}
+
 function dispatch_webhooks(int $user_id, array $payload):void{
     $rows=db()->prepare("SELECT id,url,secret_hash FROM outbound_webhooks WHERE user_id=? AND active=1 AND fail_count<5 ORDER BY id LIMIT 10");
     $rows->execute([$user_id]);
@@ -2556,16 +2684,19 @@ function dispatch_webhooks(int $user_id, array $payload):void{
             'header'=>"Content-Type: application/json\r\nX-FoodWatch-Signature: $sig\r\nX-FoodWatch-Event: recall_alert\r\n",
             'content'=>$body,'timeout'=>8,'ignore_errors'=>true
         ]]);
-        $ok=false;
+        $ok=false;$sc=0;$t_wh_start=microtime(true);
         try{
             $resp=@file_get_contents($wh['url'],false,$ctx);
             $sc=isset($http_response_header[0])?(int)preg_replace('/\D/','',$http_response_header[0]??'0'):0;
             $ok=$sc>=200&&$sc<300;
         }catch(\Throwable){}
+        $wh_latency=round((microtime(true)-$t_wh_start)*1000,2);
         if($ok){
             db()->prepare("UPDATE outbound_webhooks SET last_fired_at=datetime('now'),fail_count=0 WHERE id=?")->execute([$wh['id']]);
+            try{db()->prepare("INSERT INTO webhook_deliveries(webhook_id,event_type,status,status_code,latency_ms)VALUES(?,?,?,?,?)")->execute([$wh['id'],'recall_alert','ok',$sc??0,$wh_latency]);}catch(\Throwable){}
         }else{
             db()->prepare("UPDATE outbound_webhooks SET fail_count=fail_count+1 WHERE id=?")->execute([$wh['id']]);
+            try{db()->prepare("INSERT INTO webhook_deliveries(webhook_id,event_type,status,status_code,latency_ms)VALUES(?,?,?,?,?)")->execute([$wh['id'],'recall_alert','fail',$sc??0,$wh_latency]);}catch(\Throwable){}
         }
     }
 }
@@ -2867,6 +2998,71 @@ function run_tests():array{
         'notif_prefs_digest'    =>'test_notif_prefs_digest',
         'webhook_hmac_header'   =>'test_webhook_hmac_header',
         'webhook_max_5'         =>'test_webhook_max_5',
+        // Sprint 20
+        'm_webhook_deliveries_cols' =>'test_m_webhook_deliveries_cols',
+        'm_api_usage_log_cols'      =>'test_m_api_usage_log_cols',
+        'dispatch_webhooks_logs'    =>'test_dispatch_webhooks_logs',
+        'webhook_delivery_status'   =>'test_webhook_delivery_status',
+        'delivery_log_api'          =>'test_delivery_log_api',
+        'api_usage_stats_api'       =>'test_api_usage_stats_api',
+        'v1_usage_resource'         =>'test_v1_usage_resource',
+        'admin_deliveries_tab'      =>'test_admin_deliveries_tab',
+        'admin_api_analytics_tab'   =>'test_admin_api_analytics_tab',
+        'delivery_latency_ms'       =>'test_delivery_latency_ms',
+        'api_usage_resource_field'  =>'test_api_usage_resource_field',
+        'delivery_webhook_id_fk'    =>'test_delivery_webhook_id_fk',
+        // Sprint 19
+        'm_health_checks_cols'      =>'test_m_health_checks_cols',
+        'run_health_checks_fn'      =>'test_run_health_checks_fn',
+        'health_api_public'         =>'test_health_api_public',
+        'health_checks_names'       =>'test_health_checks_names',
+        'view_status_fn'            =>'test_view_status_fn',
+        'view_status_route'         =>'test_view_status_route',
+        'health_overall_status'     =>'test_health_overall_status',
+        'health_check_insert'       =>'test_health_check_insert',
+        'status_page_render'        =>'test_status_page_render',
+        'health_version_field'      =>'test_health_version_field',
+        'health_schema_field'       =>'test_health_schema_field',
+        'admin_health_tab'          =>'test_admin_health_tab',
+        // Sprint 18
+        'm_risk_scores_cols'        =>'test_m_risk_scores_cols',
+        'compute_risk_score_fn'     =>'test_compute_risk_score_fn',
+        'risk_factors_weights'      =>'test_risk_factors_weights',
+        'risk_compute_batch_api'    =>'test_risk_compute_batch_api',
+        'risk_by_recall_api'        =>'test_risk_by_recall_api',
+        'v1_risk_scores_resource'   =>'test_v1_risk_scores_resource',
+        'risk_upsert'               =>'test_risk_upsert',
+        'risk_computed_at'          =>'test_risk_computed_at',
+        'risk_factors_json'         =>'test_risk_factors_json',
+        'risk_live_fallback'        =>'test_risk_live_fallback',
+        'risk_max_limit'            =>'test_risk_max_limit',
+        'risk_score_primary_key'    =>'test_risk_score_primary_key',
+        // Sprint 17
+        'm_shared_views_cols'       =>'test_m_shared_views_cols',
+        'share_create_api'          =>'test_share_create_api',
+        'share_token_entropy'       =>'test_share_token_entropy',
+        'share_view_public'         =>'test_share_view_public',
+        'share_del_api'             =>'test_share_del_api',
+        'share_expiry_check'        =>'test_share_expiry_check',
+        'account_shares_tab'        =>'test_account_shares_tab',
+        'share_hit_count'           =>'test_share_hit_count',
+        'share_max_50'              =>'test_share_max_50',
+        'v1_shared_resource'        =>'test_v1_shared_resource',
+        'view_shared_fn'            =>'test_view_shared_fn',
+        'share_list_api'            =>'test_share_list_api',
+        // Sprint 16
+        'm_import_jobs_cols'        =>'test_m_import_jobs_cols',
+        'm_import_rows_cols'        =>'test_m_import_rows_cols',
+        'import_start_admin'        =>'test_import_start_admin',
+        'import_dedup_check'        =>'test_import_dedup_check',
+        'import_status_api'         =>'test_import_status_api',
+        'admin_import_tab'          =>'test_admin_import_tab',
+        'import_max_500'            =>'test_import_max_500',
+        'import_row_status_values'  =>'test_import_row_status_values',
+        'import_label_maxlen'       =>'test_import_label_maxlen',
+        'import_title_required'     =>'test_import_title_required',
+        'import_job_finish_update'  =>'test_import_job_finish_update',
+        'import_source_field'       =>'test_import_source_field',
         // Sprint 15
         'm_saved_searches_cols'     =>'test_m_saved_searches_cols',
         'm_recall_comments_cols'    =>'test_m_recall_comments_cols',
@@ -4330,6 +4526,484 @@ function test_history_list_empty():array{
 }
 
 // ================================================================
+// § SPRINT 16 TESTS — Bulk Import
+// ================================================================
+function test_m_import_jobs_cols():array{
+    $cols=db()->query("PRAGMA table_info(import_jobs)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','label','source','status','row_count','imported_count','duplicate_count','error_count','created_by','created_at','finished_at'];
+    $missing=array_diff($need,$cols);
+    return['status'=>$missing?'FAIL':'PASS','msg'=>$missing?'import_jobs missing: '.implode(',',$missing):'import_jobs schema OK'];
+}
+function test_m_import_rows_cols():array{
+    $cols=db()->query("PRAGMA table_info(import_rows)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','job_id','raw_json','status','recall_id','error_msg','processed_at'];
+    $missing=array_diff($need,$cols);
+    return['status'=>$missing?'FAIL':'PASS','msg'=>$missing?'import_rows missing: '.implode(',',$missing):'import_rows schema OK'];
+}
+function test_import_start_admin():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'import_start':",$off))!==false){
+        if(str_contains(substr($src,$p,200),'is_admin()')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'import_start guarded by is_admin()':'import_start missing is_admin() guard'];
+}
+function test_import_dedup_check():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'import_start':",$off))!==false){
+        if(str_contains(substr($src,$p,800),'duplicate')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'import_start contains duplicate detection':'import_start missing duplicate detection'];
+}
+function test_import_status_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,"case 'import_status':");
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'import_status API case present':'import_status API case missing'];
+}
+function test_admin_import_tab():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,"'import'=>'Import'");
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'Admin Import tab present in tabs array':'Admin Import tab missing'];
+}
+function test_import_max_500():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'import_start':",$off))!==false){
+        if(str_contains(substr($src,$p,600),'500')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'import_start enforces max 500 rows':'import_start missing 500-row limit'];
+}
+function test_import_row_status_values():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,"'pending','imported','duplicate','error'");
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'import_rows CHECK constraint has correct status values':'import_rows status CHECK constraint missing'];
+}
+function test_import_label_maxlen():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'import_start':",$off))!==false){
+        if(str_contains(substr($src,$p,300),'label')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'import_start handles label field':'import_start does not reference label'];
+}
+function test_import_title_required():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'import_start':",$off))!==false){
+        if(str_contains(substr($src,$p,600),'title')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'import_start processes title field from rows':'import_start missing title handling'];
+}
+function test_import_job_finish_update():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'import_start':",$off))!==false){
+        if(str_contains(substr($src,$p,1200),'finished_at')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'import_start sets finished_at on completion':'import_start missing finished_at update'];
+}
+function test_import_source_field():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'import_start':",$off))!==false){
+        if(str_contains(substr($src,$p,400),'source')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'import_start stores source field in import_jobs':'import_start missing source field'];
+}
+
+// ================================================================
+// § SPRINT 17 TESTS — Shared Views
+// ================================================================
+function test_m_shared_views_cols():array{
+    $cols=db()->query("PRAGMA table_info(shared_views)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','token','user_id','type','label','data_json','expires_at','hit_count','created_at'];
+    $missing=array_diff($need,$cols);
+    return['status'=>$missing?'FAIL':'PASS','msg'=>$missing?'shared_views missing: '.implode(',',$missing):'shared_views schema OK'];
+}
+function test_share_create_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'share_create':",$off))!==false){
+        if(str_contains(substr($src,$p,200),'is_user()')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'share_create guarded by is_user()':'share_create missing is_user() guard'];
+}
+function test_share_token_entropy():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,'bin2hex(random_bytes(16))');
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'Share token uses bin2hex(random_bytes(16)) — 128-bit entropy':'Share token generation missing cryptographic entropy'];
+}
+function test_share_view_public():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'share_view':",$off))!==false){
+        if(!str_contains(substr($src,$p,200),'is_admin()')&&!str_contains(substr($src,$p,200),'is_user()')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'share_view is public (no auth guard)':'share_view should be public'];
+}
+function test_share_del_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'share_del':",$off))!==false){
+        if(str_contains(substr($src,$p,300),'user_id')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'share_del scopes deletion to user_id':'share_del missing user_id scope'];
+}
+function test_share_expiry_check():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'share_view':",$off))!==false){
+        if(str_contains(substr($src,$p,400),'expires_at')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'share_view checks expires_at expiry':'share_view missing expiry check'];
+}
+function test_account_shares_tab():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,"'shares'=>'Shared Links'");
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'Account Shares tab present in tabs array':'Account Shares tab missing'];
+}
+function test_share_hit_count():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'share_view':",$off))!==false){
+        if(str_contains(substr($src,$p,400),'hit_count')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'share_view increments hit_count':'share_view missing hit_count increment'];
+}
+function test_share_max_50():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'share_create':",$off))!==false){
+        if(str_contains(substr($src,$p,500),'50')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'share_create enforces max 50 shares per user':'share_create missing 50-share limit'];
+}
+function test_v1_shared_resource():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'shared':",$off))!==false){
+        if(str_contains(substr($src,$p,300),'shared_views')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'v1/shared resource queries shared_views':'v1/shared resource not found'];
+}
+function test_view_shared_fn():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,'function view_shared():void');
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'view_shared() function defined':'view_shared() function missing'];
+}
+function test_share_list_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'share_list':",$off))!==false){
+        if(str_contains(substr($src,$p,300),'is_user()')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'share_list guarded by is_user()':'share_list missing is_user() guard'];
+}
+
+// ================================================================
+// § SPRINT 18 TESTS — Risk Scoring
+// ================================================================
+function test_m_risk_scores_cols():array{
+    $cols=db()->query("PRAGMA table_info(risk_scores)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['recall_id','score','factors_json','computed_at'];
+    $missing=array_diff($need,$cols);
+    return['status'=>$missing?'FAIL':'PASS','msg'=>$missing?'risk_scores missing: '.implode(',',$missing):'risk_scores schema OK'];
+}
+function test_compute_risk_score_fn():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,'function compute_risk_score(int $recall_id):array');
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'compute_risk_score() function defined':'compute_risk_score() function missing'];
+}
+function test_risk_factors_weights():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function compute_risk_score(',$off))!==false){
+        $block=substr($src,$p,800);
+        if(str_contains($block,'0.35')&&str_contains($block,'0.25')&&str_contains($block,'0.20')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'compute_risk_score uses documented factor weights':'compute_risk_score factor weights not found'];
+}
+function test_risk_compute_batch_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'risk_compute_batch':",$off))!==false){
+        if(str_contains(substr($src,$p,200),'is_admin()')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'risk_compute_batch guarded by is_admin()':'risk_compute_batch missing is_admin() guard'];
+}
+function test_risk_by_recall_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,"case 'risk_by_recall':");
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'risk_by_recall API case present':'risk_by_recall API case missing'];
+}
+function test_v1_risk_scores_resource():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'risk_scores':",$off))!==false){
+        if(str_contains(substr($src,$p,300),'risk_scores')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'v1/risk_scores resource present':'v1/risk_scores resource missing'];
+}
+function test_risk_upsert():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'risk_compute_batch':",$off))!==false){
+        if(str_contains(substr($src,$p,600),'INSERT OR REPLACE')||str_contains(substr($src,$p,600),'upsert')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'risk_compute_batch uses upsert into risk_scores':'risk_compute_batch missing upsert pattern'];
+}
+function test_risk_computed_at():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'risk_compute_batch':",$off))!==false){
+        if(str_contains(substr($src,$p,800),'computed_at')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'risk_compute_batch stores computed_at timestamp':'risk_compute_batch missing computed_at'];
+}
+function test_risk_factors_json():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'risk_compute_batch':",$off))!==false){
+        if(str_contains(substr($src,$p,800),'factors_json')||str_contains(substr($src,$p,800),'factors')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'risk_compute_batch stores factors_json':'risk_compute_batch missing factors_json storage'];
+}
+function test_risk_live_fallback():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'risk_by_recall':",$off))!==false){
+        if(str_contains(substr($src,$p,600),'compute_risk_score')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'risk_by_recall falls back to live compute_risk_score()':'risk_by_recall missing live fallback'];
+}
+function test_risk_max_limit():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'risk_compute_batch':",$off))!==false){
+        if(str_contains(substr($src,$p,600),'500')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'risk_compute_batch processes up to 500 recalls':'risk_compute_batch missing 500-recall limit'];
+}
+function test_risk_score_primary_key():array{
+    $info=db()->query("PRAGMA table_info(risk_scores)")->fetchAll(\PDO::FETCH_ASSOC);
+    $pk_col=null;foreach($info as $c)if((int)$c['pk']===1)$pk_col=$c['name'];
+    return['status'=>$pk_col==='recall_id'?'PASS':'FAIL','msg'=>$pk_col==='recall_id'?'risk_scores PK is recall_id (no orphans)':'risk_scores PK should be recall_id, got: '.($pk_col??'none')];
+}
+
+// ================================================================
+// § SPRINT 19 TESTS — Health Checks & Status Page
+// ================================================================
+function test_m_health_checks_cols():array{
+    $cols=db()->query("PRAGMA table_info(health_checks)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','check_name','status','latency_ms','detail','checked_at'];
+    $missing=array_diff($need,$cols);
+    return['status'=>$missing?'FAIL':'PASS','msg'=>$missing?'health_checks missing: '.implode(',',$missing):'health_checks schema OK'];
+}
+function test_run_health_checks_fn():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,'function run_health_checks():array');
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'run_health_checks() function defined':'run_health_checks() function missing'];
+}
+function test_health_api_public():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'health':",$off))!==false){
+        $block=substr($src,$p,300);
+        if(!str_contains($block,'is_admin()')&&!str_contains($block,'is_user()')&&str_contains($block,'run_health_checks')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'health API case is public and calls run_health_checks()':'health API not public or not calling run_health_checks()'];
+}
+function test_health_checks_names():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function run_health_checks()',$off))!==false){
+        $block=substr($src,$p,1200);
+        if(str_contains($block,'db_ping')&&str_contains($block,'schema_version')&&str_contains($block,'recall_count')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'run_health_checks() contains db_ping, schema_version, recall_count checks':'run_health_checks() missing required check names'];
+}
+function test_view_status_fn():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,'function view_status():void');
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'view_status() function defined':'view_status() function missing'];
+}
+function test_view_status_route():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'status':",$off))!==false){
+        if(str_contains(substr($src,$p,100),'render_page')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'status route dispatches via render_page':'status route missing'];
+}
+function test_health_overall_status():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function view_status()',$off))!==false){
+        if(str_contains(substr($src,$p,600),'overall')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'view_status() computes overall health status':'view_status() missing overall status computation'];
+}
+function test_health_check_insert():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function run_health_checks()',$off))!==false){
+        if(str_contains(substr($src,$p,1500),'INSERT INTO health_checks')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'run_health_checks() persists results to health_checks table':'run_health_checks() missing INSERT INTO health_checks'];
+}
+function test_status_page_render():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function view_status()',$off))!==false){
+        if(str_contains(substr($src,$p,800),'layout_head')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'view_status() calls layout_head() for full page render':'view_status() missing layout_head() call'];
+}
+function test_health_version_field():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'health':",$off))!==false){
+        if(str_contains(substr($src,$p,400),'FW_VERSION')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'health API returns FW_VERSION in response':'health API missing version field'];
+}
+function test_health_schema_field():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'health':",$off))!==false){
+        if(str_contains(substr($src,$p,400),'schema')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'health API returns schema version in response':'health API missing schema field'];
+}
+function test_admin_health_tab():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,"'health'=>'Health'");
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'Admin Health tab present in tabs array':'Admin Health tab missing'];
+}
+
+// ================================================================
+// § SPRINT 20 TESTS — Observability
+// ================================================================
+function test_m_webhook_deliveries_cols():array{
+    $cols=db()->query("PRAGMA table_info(webhook_deliveries)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','webhook_id','event_type','status','status_code','latency_ms','attempted_at'];
+    $missing=array_diff($need,$cols);
+    return['status'=>$missing?'FAIL':'PASS','msg'=>$missing?'webhook_deliveries missing: '.implode(',',$missing):'webhook_deliveries schema OK'];
+}
+function test_m_api_usage_log_cols():array{
+    $cols=db()->query("PRAGMA table_info(api_usage_log)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','key_id','resource','method','status_code','latency_ms','requested_at'];
+    $missing=array_diff($need,$cols);
+    return['status'=>$missing?'FAIL':'PASS','msg'=>$missing?'api_usage_log missing: '.implode(',',$missing):'api_usage_log schema OK'];
+}
+function test_dispatch_webhooks_logs():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function dispatch_webhooks(',$off))!==false){
+        if(str_contains(substr($src,$p,2000),'webhook_deliveries')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'dispatch_webhooks() logs to webhook_deliveries':'dispatch_webhooks() missing delivery logging'];
+}
+function test_webhook_delivery_status():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,"'ok','fail'")&&str_contains($src,'webhook_deliveries');
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'webhook_deliveries status CHECK constraint has ok/fail values':'webhook_deliveries status CHECK constraint missing'];
+}
+function test_delivery_log_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'delivery_log':",$off))!==false){
+        if(str_contains(substr($src,$p,300),'is_user()')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'delivery_log guarded by is_user()':'delivery_log missing is_user() guard'];
+}
+function test_api_usage_stats_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'api_usage_stats':",$off))!==false){
+        if(str_contains(substr($src,$p,300),'is_user()')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'api_usage_stats guarded by is_user()':'api_usage_stats missing is_user() guard'];
+}
+function test_v1_usage_resource():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'usage':",$off))!==false){
+        if(str_contains(substr($src,$p,300),'api_usage_log')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'v1/usage resource queries api_usage_log':'v1/usage resource not found'];
+}
+function test_admin_deliveries_tab():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,"'deliveries'=>'Deliveries'");
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'Admin Deliveries tab present in tabs array':'Admin Deliveries tab missing'];
+}
+function test_admin_api_analytics_tab():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,"'api_analytics'=>'API Analytics'");
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'Admin API Analytics tab present in tabs array':'Admin API Analytics tab missing'];
+}
+function test_delivery_latency_ms():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function dispatch_webhooks(',$off))!==false){
+        if(str_contains(substr($src,$p,2000),'latency_ms')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'dispatch_webhooks() records latency_ms in webhook_deliveries':'dispatch_webhooks() missing latency_ms logging'];
+}
+function test_api_usage_resource_field():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'api_usage_stats':",$off))!==false){
+        if(str_contains(substr($src,$p,400),'resource')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'api_usage_stats aggregates by resource field':'api_usage_stats missing resource aggregation'];
+}
+function test_delivery_webhook_id_fk():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,'webhook_id INTEGER REFERENCES outbound_webhooks(id) ON DELETE SET NULL');
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'webhook_deliveries.webhook_id FK references outbound_webhooks':'webhook_deliveries missing FK on webhook_id'];
+}
+
+// ================================================================
 // § SPRINT 15 TESTS
 // ================================================================
 function test_m_saved_searches_cols():array{
@@ -4688,6 +5362,8 @@ function route():void{
         case 'watchlist':     render_page('watchlist');break;
         case 'account':       render_page('account');break;
         case 'tags':          render_page('tags');break;
+        case 'shared':        render_page('shared');break;
+        case 'status':        render_page('status');break;
         case 'tests':         render_page('tests');break;
         case 'admin':         render_page('admin');break;
         default:              render_page('dashboard');
@@ -5321,6 +5997,129 @@ function handle_api(string $api):void{
                     try{db()->prepare("INSERT OR IGNORE INTO recall_tags(user_id,recall_id,tag)VALUES(?,?,?)")->execute([$uid_bt,$btrid,$bt_tag]);$bt_n++;}catch(\Throwable){}
                 }
                 echo js(['ok'=>true,'tagged'=>$bt_n]);break;
+            // SPRINT 16: import engine
+            case 'import_start':
+                if(!is_admin())fw_abort('Unauthorized',403);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $imp_label=mb_substr(trim($_POST['label']??'Manual Import'),0,120);
+                $imp_json=trim($_POST['data_json']??'');
+                if(!$imp_json)fw_abort('data_json required (JSON array)',400);
+                $imp_rows=json_decode($imp_json,true);
+                if(!is_array($imp_rows)||!array_is_list($imp_rows))fw_abort('data_json must be a JSON array',400);
+                if(count($imp_rows)>500)fw_abort('Maximum 500 rows per import job',400);
+                $imp_uid=(int)current_user()['id'];
+                db()->prepare("INSERT INTO import_jobs(label,source,status,row_count,created_by)VALUES(?,?,?,?,?)")->execute([$imp_label,'manual','running',count($imp_rows),$imp_uid]);
+                $imp_jid=(int)db()->lastInsertId();
+                $n_imp=0;$n_dup=0;$n_err=0;
+                foreach($imp_rows as $ri){
+                    if(!is_array($ri)){db()->prepare("INSERT INTO import_rows(job_id,raw_json,status,error_msg)VALUES(?,?,?,?)")->execute([$imp_jid,'{}','error','Not an object']);$n_err++;continue;}
+                    $rtitle=mb_substr(trim($ri['title']??''),0,500);
+                    if(!$rtitle){db()->prepare("INSERT INTO import_rows(job_id,raw_json,status,error_msg)VALUES(?,?,?,?)")->execute([$imp_jid,json_encode($ri),'error','Missing title']);$n_err++;continue;}
+                    $dup=db()->prepare("SELECT id FROM recalls WHERE title=? LIMIT 1");$dup->execute([$rtitle]);$dup_id=$dup->fetchColumn();
+                    if($dup_id){db()->prepare("INSERT INTO import_rows(job_id,raw_json,status,recall_id,processed_at)VALUES(?,?,?,?,datetime('now'))")->execute([$imp_jid,json_encode($ri),'duplicate',$dup_id]);$n_dup++;continue;}
+                    try{
+                        $ag=$db_ag=db()->query("SELECT id FROM agencies WHERE name='Manual' LIMIT 1")->fetchColumn();
+                        if(!$ag){db()->prepare("INSERT OR IGNORE INTO agencies(name,short_name)VALUES('Manual','MAN')")->execute();$ag=(int)db()->lastInsertId();}
+                        $src_id=db()->query("SELECT id FROM sources WHERE name='Manual Import' LIMIT 1")->fetchColumn();
+                        if(!$src_id){db()->prepare("INSERT OR IGNORE INTO sources(name,url)VALUES('Manual Import','#')")->execute();$src_id=(int)db()->lastInsertId();}
+                        $st=trim($ri['status']??'ongoing');$sev=trim($ri['severity']??'Unknown');
+                        db()->prepare("INSERT INTO recalls(agency_id,source_id,title,reason,status,severity,severity_label,announced_date)VALUES(?,?,?,?,?,?,?,?)")->execute([$ag,$src_id,$rtitle,mb_substr(trim($ri['reason']??''),0,2000),$st,$sev,$sev,$ri['announced_date']??date('Y-m-d')]);
+                        $new_rid=(int)db()->lastInsertId();
+                        db()->prepare("INSERT INTO import_rows(job_id,raw_json,status,recall_id,processed_at)VALUES(?,?,?,?,datetime('now'))")->execute([$imp_jid,json_encode($ri),'imported',$new_rid]);
+                        $n_imp++;
+                    }catch(\Throwable $e){db()->prepare("INSERT INTO import_rows(job_id,raw_json,status,error_msg)VALUES(?,?,?,?)")->execute([$imp_jid,json_encode($ri),'error',substr($e->getMessage(),0,255)]);$n_err++;}
+                }
+                db()->prepare("UPDATE import_jobs SET status='done',imported_count=?,duplicate_count=?,error_count=?,finished_at=datetime('now') WHERE id=?")->execute([$n_imp,$n_dup,$n_err,$imp_jid]);
+                echo js(['ok'=>true,'job_id'=>$imp_jid,'imported'=>$n_imp,'duplicates'=>$n_dup,'errors'=>$n_err]);break;
+            case 'import_status':
+                if(!is_admin())fw_abort('Unauthorized',403);
+                $jid_s=(int)($_GET['id']??0);
+                if($jid_s){
+                    $js=db()->prepare("SELECT * FROM import_jobs WHERE id=?");$js->execute([$jid_s]);
+                    $rows_s=db()->prepare("SELECT status,COUNT(*) as cnt FROM import_rows WHERE job_id=? GROUP BY status");$rows_s->execute([$jid_s]);
+                    echo js(['job'=>$js->fetch(),'row_counts'=>$rows_s->fetchAll()]);
+                }else{
+                    $jobs=db()->query("SELECT id,label,status,row_count,imported_count,duplicate_count,error_count,created_at,finished_at FROM import_jobs ORDER BY created_at DESC LIMIT 50");
+                    echo js($jobs->fetchAll());
+                }
+                break;
+            // SPRINT 17: shared views
+            case 'share_create':
+                if(!is_user())fw_abort('Not authenticated',401);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $uid_sv=(int)current_user()['id'];
+                $sv_type=trim($_POST['type']??'filter');
+                if(!in_array($sv_type,['filter','search','watchlist'],true))fw_abort('Invalid type',400);
+                $sv_label=mb_substr(trim($_POST['label']??''),0,120);
+                $sv_data=trim($_POST['data_json']??'{}');
+                if(!json_decode($sv_data))fw_abort('Invalid data_json',400);
+                $sv_exp=trim($_POST['expires_hours']??'');
+                $sv_exp_sql=$sv_exp&&is_numeric($sv_exp)?"datetime('now','+".(int)$sv_exp." hours')":null;
+                $sv_cnt_s=db()->prepare("SELECT COUNT(*) FROM shared_views WHERE user_id=?");$sv_cnt_s->execute([$uid_sv]);
+                if((int)$sv_cnt_s->fetchColumn()>=50)fw_abort('Maximum 50 shared views per account',400);
+                $sv_token=bin2hex(random_bytes(16));
+                $sv_ins=db()->prepare("INSERT INTO shared_views(token,user_id,type,label,data_json,expires_at)VALUES(?,?,?,?,?,?)");
+                $sv_ins->execute([$sv_token,$uid_sv,$sv_type,$sv_label,$sv_data,$sv_exp_sql]);
+                echo js(['ok'=>true,'token'=>$sv_token,'url'=>'?page=shared&token='.$sv_token]);break;
+            case 'share_view':
+                $sv_tok=trim($_GET['token']??$_POST['token']??'');
+                if(!$sv_tok)fw_abort('token required',400);
+                $sv_row=db()->prepare("SELECT id,type,label,data_json,expires_at,hit_count FROM shared_views WHERE token=?");
+                $sv_row->execute([$sv_tok]);$sv=$sv_row->fetch();
+                if(!$sv)fw_abort('Shared view not found',404);
+                if($sv['expires_at']&&strtotime($sv['expires_at'])<time())fw_abort('This shared link has expired',410);
+                db()->prepare("UPDATE shared_views SET hit_count=hit_count+1 WHERE token=?")->execute([$sv_tok]);
+                echo js($sv);break;
+            case 'share_del':
+                if(!is_user())fw_abort('Not authenticated',401);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $uid_svd=(int)current_user()['id'];$sv_del_tok=trim($_POST['token']??'');
+                if(!$sv_del_tok)fw_abort('token required',400);
+                db()->prepare("DELETE FROM shared_views WHERE token=? AND user_id=?")->execute([$sv_del_tok,$uid_svd]);
+                echo js(['ok'=>true]);break;
+            case 'share_list':
+                if(!is_user())fw_abort('Not authenticated',401);
+                $uid_svl=(int)current_user()['id'];
+                $svl=db()->prepare("SELECT token,type,label,expires_at,hit_count,created_at FROM shared_views WHERE user_id=? ORDER BY created_at DESC LIMIT 50");
+                $svl->execute([$uid_svl]);echo js($svl->fetchAll());break;
+            // SPRINT 18: risk scoring
+            case 'risk_compute_batch':
+                if(!is_admin())fw_abort('Unauthorized',403);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $rc_limit=min(500,(int)($_POST['limit']??200));
+                $rc_ids=db()->query("SELECT id FROM recalls WHERE status NOT IN ('completed','resolved','closed') ORDER BY announced_date DESC LIMIT $rc_limit")->fetchAll(\PDO::FETCH_COLUMN);
+                $n_rc=0;
+                foreach($rc_ids as $rcid){
+                    $rs=compute_risk_score((int)$rcid);
+                    db()->prepare("INSERT INTO risk_scores(recall_id,score,factors_json,computed_at)VALUES(?,?,?,datetime('now')) ON CONFLICT(recall_id) DO UPDATE SET score=excluded.score,factors_json=excluded.factors_json,computed_at=excluded.computed_at")->execute([$rcid,$rs['score'],json_encode($rs['factors'])]);
+                    $n_rc++;
+                }
+                echo js(['ok'=>true,'scored'=>$n_rc]);break;
+            case 'risk_by_recall':
+                $rs_rid=(int)($_GET['recall_id']??0);
+                if(!$rs_rid)fw_abort('recall_id required',400);
+                $rs_row=db()->prepare("SELECT score,factors_json,computed_at FROM risk_scores WHERE recall_id=?");
+                $rs_row->execute([$rs_rid]);$rs_data=$rs_row->fetch();
+                if(!$rs_data){$rs_fresh=compute_risk_score($rs_rid);echo js(['recall_id'=>$rs_rid,'score'=>$rs_fresh['score'],'factors'=>$rs_fresh['factors'],'computed_at'=>null]);break;}
+                echo js(['recall_id'=>$rs_rid,'score'=>$rs_data['score'],'factors'=>json_decode($rs_data['factors_json'],true),'computed_at'=>$rs_data['computed_at']]);break;
+            // SPRINT 19: health
+            case 'health':
+                $hc_checks=run_health_checks();
+                $hc_overall='ok';
+                foreach($hc_checks as $c){if($c['status']==='fail'){$hc_overall='fail';break;}elseif($c['status']==='warn'&&$hc_overall!=='fail')$hc_overall='warn';}
+                echo js(['status'=>$hc_overall,'version'=>FW_VERSION,'schema'=>FW_SCHEMA_VER,'checks'=>$hc_checks,'timestamp'=>date('c')]);break;
+            // SPRINT 20: webhook delivery log
+            case 'delivery_log':
+                if(!is_user())fw_abort('Not authenticated',401);
+                $uid_dl=(int)current_user()['id'];
+                $dl_page=max(1,(int)($_GET['page']??1));$dl_per=min(100,(int)($_GET['per']??50));$dl_off=($dl_page-1)*$dl_per;
+                $dls=db()->prepare("SELECT wd.id,wd.webhook_id,wd.event_type,wd.status,wd.status_code,wd.latency_ms,wd.attempted_at,ow.label FROM webhook_deliveries wd LEFT JOIN outbound_webhooks ow ON ow.id=wd.webhook_id WHERE ow.user_id=? OR ow.id IS NULL ORDER BY wd.attempted_at DESC LIMIT ? OFFSET ?");
+                $dls->execute([$uid_dl,$dl_per,$dl_off]);echo js($dls->fetchAll());break;
+            case 'api_usage_stats':
+                if(!is_user())fw_abort('Not authenticated',401);
+                $uid_au=(int)current_user()['id'];
+                $au=db()->prepare("SELECT resource,COUNT(*) as requests,AVG(latency_ms) as avg_ms,SUM(CASE WHEN status_code>=400 THEN 1 ELSE 0 END) as errors FROM api_usage_log WHERE key_id IN (SELECT id FROM api_keys WHERE user_id=? AND revoked=0) GROUP BY resource ORDER BY requests DESC LIMIT 50");
+                $au->execute([$uid_au]);echo js($au->fetchAll());break;
             case 'v1':
                 $auth=$_SERVER['HTTP_AUTHORIZATION']??'';
                 $raw_key=str_starts_with($auth,'Bearer ')?trim(substr($auth,7)):trim($_GET['api_key']??'');
@@ -5352,6 +6151,28 @@ function handle_api(string $api):void{
                         if(!$eid)fw_abort('Requires ?resource=equivalences&id=<recall_id>',400);
                         $eq=db()->prepare("SELECT r2_id as id,sim FROM recall_equivalences WHERE r1_id=? UNION SELECT r1_id as id,sim FROM recall_equivalences WHERE r2_id=? ORDER BY sim DESC LIMIT 20");
                         $eq->execute([$eid,$eid]);echo js($eq->fetchAll());break;
+                    // SPRINT 20: aggregated API usage stats for key owner
+                    case 'usage':
+                        $u_uid=(int)$krow['user_id'];
+                        if(!$u_uid)fw_abort('API key not linked to a user account',403);
+                        $t_v1_start_au=microtime(true);
+                        $ust=db()->prepare("SELECT resource,COUNT(*) as requests,ROUND(AVG(latency_ms),2) as avg_ms FROM api_usage_log WHERE key_id IN (SELECT id FROM api_keys WHERE user_id=? AND revoked=0) GROUP BY resource ORDER BY requests DESC LIMIT 50");
+                        $ust->execute([$u_uid]);echo js(['key_prefix'=>$krow['key_prefix'],'records'=>$ust->fetchAll()]);break;
+                    // SPRINT 18: risk scores
+                    case 'risk_scores':
+                        $rs_pg=(int)($_GET['page']??1);$rs_per=min(100,(int)($_GET['per']??50));$rs_off=($rs_pg-1)*$rs_per;
+                        $rss=db()->prepare("SELECT rs.recall_id,rs.score,rs.factors_json,rs.computed_at,r.title,r.status FROM risk_scores rs JOIN recalls r ON r.id=rs.recall_id ORDER BY rs.score DESC LIMIT ? OFFSET ?");
+                        $rss->execute([$rs_per,$rs_off]);echo js($rss->fetchAll());break;
+                    // SPRINT 17: public shared views
+                    case 'shared':
+                        $sv_tok_v1=trim($_GET['token']??'');
+                        if(!$sv_tok_v1)fw_abort('token required',400);
+                        $sv_v1=db()->prepare("SELECT type,label,data_json,hit_count,created_at FROM shared_views WHERE token=?");
+                        $sv_v1->execute([$sv_tok_v1]);$sv_v1d=$sv_v1->fetch();
+                        if(!$sv_v1d)fw_abort('Not found',404);
+                        if(!empty($sv_v1d['expires_at'])&&strtotime($sv_v1d['expires_at'])<time())fw_abort('Expired',410);
+                        db()->prepare("UPDATE shared_views SET hit_count=hit_count+1 WHERE token=?")->execute([$sv_tok_v1]);
+                        echo js($sv_v1d);break;
                     // SPRINT 15: public recall comments (read-only, paginated)
                     case 'comments':
                         $crid_v1=(int)($_GET['recall_id']??0);
@@ -5406,8 +6227,11 @@ function handle_api(string $api):void{
                             ['resource'=>'docs','params'=>[],'desc'=>'This endpoint listing'],
                             ['resource'=>'comments','params'=>['recall_id'],'desc'=>'Comments left by users on a recall'],
                             ['resource'=>'saved_searches','params'=>[],'desc'=>'Saved searches for the API key owner'],
+                            ['resource'=>'risk_scores','params'=>['page','per'],'desc'=>'Risk-scored active recalls sorted by score descending'],
+                            ['resource'=>'shared','params'=>['token'],'desc'=>'Retrieve a shared view by token'],
+                            ['resource'=>'usage','params'=>[],'desc'=>'Aggregated API usage stats for the key owner'],
                         ]]);break;
-                    default: fw_abort('Unknown v1 resource. Valid: recalls, retailers, manufacturers, categories, stats, brands, geo_risk, markov, co_escalation, equivalences, flags, webhooks, feeds, comments, saved_searches, docs',404);
+                    default: fw_abort('Unknown v1 resource. Valid: recalls, retailers, manufacturers, categories, stats, brands, geo_risk, markov, co_escalation, equivalences, flags, webhooks, feeds, comments, saved_searches, risk_scores, shared, usage, docs',404);
                 }
                 exit;
             // SPRINT 6: password reset
@@ -5573,6 +6397,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc}
     <a href="?page=tags" class="fw-nav-link <?=$page==='tags'?'active':''?>"><i data-lucide="tags" class="w-4 h-4"></i>My Tags</a>
     <a href="?page=account" class="fw-nav-link <?=$page==='account'?'active':''?>"><i data-lucide="user" class="w-4 h-4"></i><?=is_user()?h(current_user()['email']):'Account'?></a>
     <div class="border-t border-slate-700 my-2 pt-2">
+      <a href="?page=status" class="fw-nav-link <?=$page==='status'?'active':''?>"><i data-lucide="activity" class="w-4 h-4"></i>System Status</a>
       <a href="?page=tests" class="fw-nav-link <?=$page==='tests'?'active':''?>"><i data-lucide="check-circle" class="w-4 h-4"></i>Self-Tests</a>
       <a href="?page=admin" class="fw-nav-link <?=$page==='admin'?'active':''?>"><i data-lucide="settings" class="w-4 h-4"></i>Admin</a>
     </div>
@@ -5632,6 +6457,8 @@ function render_page(string $p):void{
         'watchlist'     =>view_watchlist(),
         'account'       =>view_account(),
         'tags'          =>view_tags(),
+        'shared'        =>view_shared(),
+        'status'        =>view_status(),
         'tests'         =>view_tests(),
         'admin'         =>view_admin(),
         default         =>view_dashboard(),
@@ -7513,7 +8340,7 @@ function view_admin():void{
 
 <!-- Admin Tab Nav (GROUP 8) -->
 <div class="flex gap-0 border-b border-slate-200 mb-6 flex-wrap">
-  <?php foreach(['ingestion'=>'Ingestion','dq'=>'Data Quality','runs'=>'Run History','rate_limits'=>'Rate Limits','subscriptions'=>'Subscriptions','users'=>'Users','dbhealth'=>'DB Health','audit'=>'Audit'] as $tv=>$tl): ?>
+  <?php foreach(['ingestion'=>'Ingestion','dq'=>'Data Quality','runs'=>'Run History','rate_limits'=>'Rate Limits','subscriptions'=>'Subscriptions','users'=>'Users','dbhealth'=>'DB Health','audit'=>'Audit','import'=>'Import','deliveries'=>'Deliveries','api_analytics'=>'API Analytics','health'=>'Health'] as $tv=>$tl): ?>
   <a href="?page=admin&atab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$admin_tab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
   <?php endforeach; ?>
 </div>
@@ -7865,6 +8692,135 @@ $migrations=db()->query("SELECT version,applied_at FROM schema_migrations ORDER 
 </div>
 <?php endif; // audit tab ?>
 
+<?php if($admin_tab==='import'): ?>
+<!-- Import Engine (Sprint 16) -->
+<div class="space-y-6"
+  x-data="{jobs:[],loading:true,label:'Sprint Import',dataJson:'',submitting:false,msg:'',err:''}"
+  x-init="fetch('?api=import_status').then(r=>r.json()).then(d=>{jobs=d;loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="upload" class="w-4 h-4 text-fw-500"></i>Import Recalls (JSON)</h3>
+    <p class="text-xs text-slate-500 mb-3">Paste a JSON array of recall objects. Each object may include: <code class="font-mono text-xs bg-slate-100 px-1 rounded">title</code> (required), <code class="font-mono text-xs bg-slate-100 px-1 rounded">reason</code>, <code class="font-mono text-xs bg-slate-100 px-1 rounded">status</code>, <code class="font-mono text-xs bg-slate-100 px-1 rounded">severity</code>, <code class="font-mono text-xs bg-slate-100 px-1 rounded">announced_date</code>. Max 500 rows.</p>
+    <div class="space-y-3">
+      <div><label class="text-xs text-slate-600 mb-1 block">Job Label</label><input x-model="label" type="text" maxlength="120" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500"></div>
+      <div><label class="text-xs text-slate-600 mb-1 block">JSON Data</label><textarea x-model="dataJson" rows="6" placeholder='[{"title":"Recall of X due to allergen","reason":"Undeclared peanuts","severity":"Class I"}]' class="w-full text-sm font-mono border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500 resize-y"></textarea></div>
+      <button :disabled="submitting||!dataJson.trim()"
+        @click="submitting=true;msg='';err='';fetch('?api=import_start',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',label,data_json:dataJson})}).then(r=>r.json()).then(d=>{submitting=false;if(d.ok){msg='Job #'+d.job_id+': imported '+d.imported+', duplicates '+d.duplicates+', errors '+d.errors;jobs.unshift({id:d.job_id,label,status:'done',imported_count:d.imported,duplicate_count:d.duplicates,error_count:d.errors})}else err=d.error||'Error'}).catch(()=>{submitting=false;err='Network error'})"
+        class="bg-fw-500 text-white text-sm px-4 py-2 rounded font-medium hover:bg-fw-700 disabled:opacity-50 flex items-center gap-2">
+        <i data-lucide="upload" class="w-4 h-4"></i><span x-show="!submitting">Run Import</span><span x-show="submitting">Importing…</span>
+      </button>
+      <p x-show="msg" x-text="msg" class="text-xs text-green-600"></p>
+      <p x-show="err" x-text="err" class="text-xs text-red-600"></p>
+    </div>
+  </div>
+  <div x-show="loading" class="text-sm text-slate-400 animate-pulse py-2">Loading jobs…</div>
+  <div x-show="!loading&&jobs.length>0" class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <table class="fw-table w-full text-sm">
+      <thead><tr><th>#</th><th>Label</th><th>Status</th><th>Imported</th><th>Dupes</th><th>Errors</th><th>Created</th></tr></thead>
+      <tbody>
+        <template x-for="j in jobs" :key="j.id">
+          <tr>
+            <td class="font-mono text-xs" x-text="j.id"></td>
+            <td x-text="j.label||'—'"></td>
+            <td><span :class="j.status==='done'?'bg-green-100 text-green-700':j.status==='failed'?'bg-red-100 text-red-700':'bg-amber-100 text-amber-700'" class="px-2 py-0.5 rounded-full text-xs font-medium" x-text="j.status"></span></td>
+            <td class="text-center" x-text="j.imported_count"></td>
+            <td class="text-center text-slate-400" x-text="j.duplicate_count"></td>
+            <td class="text-center" :class="j.error_count>0?'text-red-600 font-bold':''" x-text="j.error_count"></td>
+            <td class="text-xs text-slate-400" x-text="j.created_at?.substring(0,16).replace('T',' ')"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+<?php endif; // import tab ?>
+
+<?php if($admin_tab==='deliveries'): ?>
+<!-- Webhook Deliveries (Sprint 20) -->
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+  <div class="px-5 py-4 border-b border-slate-200 flex items-center gap-2">
+    <i data-lucide="send" class="w-4 h-4 text-slate-500"></i>
+    <h3 class="text-sm font-semibold text-slate-700">Recent Webhook Deliveries</h3>
+  </div>
+  <div class="overflow-x-auto">
+    <table class="fw-table w-full text-sm">
+      <thead><tr><th>ID</th><th>Webhook</th><th>Event</th><th>Status</th><th>HTTP</th><th>Latency</th><th>Time</th></tr></thead>
+      <tbody>
+        <?php
+        $dlrows=db()->query("SELECT wd.id,wd.event_type,wd.status,wd.status_code,wd.latency_ms,wd.attempted_at,ow.label,ow.url FROM webhook_deliveries wd LEFT JOIN outbound_webhooks ow ON ow.id=wd.webhook_id ORDER BY wd.id DESC LIMIT 200")->fetchAll();
+        foreach($dlrows as $dl): ?>
+        <tr>
+          <td class="font-mono text-xs"><?=(int)$dl['id']?></td>
+          <td class="text-xs max-w-xs truncate" title="<?=he($dl['url']??'')?>"><?=he($dl['label']??'—')?></td>
+          <td class="text-xs"><?=he($dl['event_type'])?></td>
+          <td><span class="px-2 py-0.5 rounded-full text-xs font-medium <?=$dl['status']==='ok'?'bg-green-100 text-green-700':'bg-red-100 text-red-700'?>"><?=he($dl['status'])?></span></td>
+          <td class="text-xs <?=$dl['status_code']>=400?'text-red-600 font-bold':'text-slate-500'?>"><?=(int)$dl['status_code']?></td>
+          <td class="text-xs text-slate-400"><?=round((float)$dl['latency_ms'],1)?>ms</td>
+          <td class="text-xs text-slate-400 whitespace-nowrap"><?=he(substr($dl['attempted_at']??'',0,16))?></td>
+        </tr>
+        <?php endforeach; ?>
+        <?php if(empty($dlrows)): ?><tr><td colspan="7" class="text-center text-slate-400 py-4">No deliveries logged yet.</td></tr><?php endif; ?>
+      </tbody>
+    </table>
+  </div>
+</div>
+<?php endif; // deliveries tab ?>
+
+<?php if($admin_tab==='api_analytics'): ?>
+<!-- API Analytics (Sprint 20) -->
+<div class="space-y-6">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <div class="px-5 py-4 border-b border-slate-200 flex items-center gap-2">
+      <i data-lucide="bar-chart-2" class="w-4 h-4 text-slate-500"></i>
+      <h3 class="text-sm font-semibold text-slate-700">API Usage by Resource (All Keys)</h3>
+    </div>
+    <table class="fw-table w-full text-sm">
+      <thead><tr><th>Resource</th><th class="text-right">Requests</th><th class="text-right">Avg ms</th><th class="text-right">Errors</th><th class="text-right">Error %</th></tr></thead>
+      <tbody>
+        <?php
+        $aurows=db()->query("SELECT resource,COUNT(*) as requests,ROUND(AVG(latency_ms),1) as avg_ms,SUM(CASE WHEN status_code>=400 THEN 1 ELSE 0 END) as errors FROM api_usage_log GROUP BY resource ORDER BY requests DESC LIMIT 100")->fetchAll();
+        foreach($aurows as $au): $epct=$au['requests']>0?round($au['errors']/$au['requests']*100,1):0; ?>
+        <tr>
+          <td class="font-mono text-xs"><?=he($au['resource'])?></td>
+          <td class="text-right font-medium"><?=number_format((int)$au['requests'])?></td>
+          <td class="text-right text-slate-500"><?=(float)$au['avg_ms']?>ms</td>
+          <td class="text-right <?=$au['errors']>0?'text-red-600':''?>"><?=(int)$au['errors']?></td>
+          <td class="text-right text-xs <?=$epct>5?'text-red-600':'text-slate-400'?>"><?=$epct?>%</td>
+        </tr>
+        <?php endforeach; ?>
+        <?php if(empty($aurows)): ?><tr><td colspan="5" class="text-center text-slate-400 py-4">No API usage logged yet.</td></tr><?php endif; ?>
+      </tbody>
+    </table>
+  </div>
+</div>
+<?php endif; // api_analytics tab ?>
+
+<?php if($admin_tab==='health'): ?>
+<!-- System Health (Sprint 19) -->
+<?php
+$health_rows=run_health_checks();
+$overall='ok';foreach($health_rows as $h){if($h['status']==='fail'){$overall='fail';break;}elseif($h['status']==='warn'&&$overall!=='fail')$overall='warn';}
+?>
+<div class="space-y-4">
+  <div class="flex items-center gap-3 mb-4">
+    <span class="px-3 py-1.5 rounded-full text-sm font-bold <?=$overall==='ok'?'bg-green-100 text-green-800':($overall==='warn'?'bg-amber-100 text-amber-800':'bg-red-100 text-red-800')?>"><?=strtoupper($overall)?></span>
+    <span class="text-xs text-slate-500">FW v<?=FW_VERSION?> · schema v<?=FW_SCHEMA_VER?> · <?=date('c')?></span>
+  </div>
+  <?php foreach($health_rows as $h): ?>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4 flex items-start gap-4">
+    <span class="mt-0.5 w-2 h-2 rounded-full shrink-0 <?=$h['status']==='ok'?'bg-green-500':($h['status']==='warn'?'bg-amber-500':'bg-red-500')?>"></span>
+    <div class="flex-1 min-w-0">
+      <div class="flex items-center gap-2">
+        <span class="font-mono text-xs font-semibold text-slate-700"><?=he($h['name'])?></span>
+        <span class="text-xs text-slate-400"><?=round((float)($h['latency_ms']??0),1)?>ms</span>
+      </div>
+      <p class="text-xs text-slate-500 mt-0.5"><?=he($h['detail']??'')?></p>
+    </div>
+    <span class="text-xs font-medium <?=$h['status']==='ok'?'text-green-700':($h['status']==='warn'?'text-amber-600':'text-red-700')?>"><?=strtoupper($h['status'])?></span>
+  </div>
+  <?php endforeach; ?>
+</div>
+<?php endif; // health tab ?>
+
 <?php layout_foot(); }
 
 // ================================================================
@@ -8062,7 +9018,7 @@ if(!$user && $reset_tok_param): ?>
 <!-- Tab nav -->
 <?php $atab=$_GET['tab']??'overview'; ?>
 <div class="flex gap-0 border-b border-slate-200 mb-6">
-  <?php foreach(['overview'=>'Overview','filters'=>'Saved Filters','alerts'=>'Alerts','keys'=>'API Keys','activity'=>'Activity','notifications'=>'Notifications','tags'=>'Tags','feeds'=>'RSS Feeds','searches'=>'Saved Searches'] as $tv=>$tl): ?>
+  <?php foreach(['overview'=>'Overview','filters'=>'Saved Filters','alerts'=>'Alerts','keys'=>'API Keys','activity'=>'Activity','notifications'=>'Notifications','tags'=>'Tags','feeds'=>'RSS Feeds','searches'=>'Saved Searches','shares'=>'Shared Links'] as $tv=>$tl): ?>
   <a href="?page=account&tab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$atab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
   <?php endforeach; ?>
 </div>
@@ -8445,9 +9401,178 @@ Authorization: Bearer fw_...</pre>
   </div>
 </div>
 
+<?php elseif($atab==='shares'): ?>
+<!-- Shared Links tab (Sprint 17) -->
+<div x-data="{shares:[],loading:true,stype:'filter',slabel:'',sdata:'{}',sexp:'',screating:false,smsg:''}"
+  x-init="fetch('?api=share_list').then(r=>r.json()).then(d=>{shares=d;loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="share-2" class="w-4 h-4 text-fw-500"></i>Create Shared Link</h3>
+    <p class="text-xs text-slate-500 mb-4">Share a filter preset, saved search, or watchlist snapshot via a public URL. Maximum 50 shared links per account.</p>
+    <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-3">
+      <div><label class="text-xs text-slate-600 mb-1 block">Type</label>
+        <select x-model="stype" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+          <option value="filter">Filter</option>
+          <option value="search">Search</option>
+          <option value="watchlist">Watchlist</option>
+        </select>
+      </div>
+      <div><label class="text-xs text-slate-600 mb-1 block">Label</label><input x-model="slabel" type="text" maxlength="120" placeholder="My Allergen Filter" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500"></div>
+      <div><label class="text-xs text-slate-600 mb-1 block">Expires (hours, blank=never)</label><input x-model="sexp" type="number" min="1" placeholder="72" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500"></div>
+    </div>
+    <div class="mb-3"><label class="text-xs text-slate-600 mb-1 block">Data JSON</label><input x-model="sdata" type="text" placeholder='{"q":"peanut","state":"CA"}' class="w-full text-sm font-mono border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500"></div>
+    <button :disabled="screating"
+      @click="screating=true;smsg='';fetch('?api=share_create',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',type:stype,label:slabel,data_json:sdata||'{}',expires_hours:sexp||''})}).then(r=>r.json()).then(d=>{screating=false;if(d.ok){shares.unshift({token:d.token,type:stype,label:slabel||'Untitled',expires_at:null,hit_count:0,created_at:new Date().toISOString()});smsg='Created: '+d.url}else smsg=d.error||'Error'}).catch(()=>{screating=false;smsg='Network error'})"
+      class="bg-fw-500 text-white text-sm px-4 py-2 rounded font-medium hover:bg-fw-700 disabled:opacity-50 flex items-center gap-2">
+      <i data-lucide="link" class="w-4 h-4"></i><span x-show="!screating">Create Shared Link</span><span x-show="screating">Creating…</span>
+    </button>
+    <p x-show="smsg" x-text="smsg" :class="smsg.startsWith('Created')?'text-green-600':'text-red-600'" class="text-xs mt-2 font-mono"></p>
+  </div>
+  <div x-show="loading" class="text-sm text-slate-400 animate-pulse py-4">Loading…</div>
+  <div x-show="!loading&&shares.length===0" class="text-sm text-slate-400 text-center py-6 bg-white rounded-lg border border-slate-200">No shared links yet.</div>
+  <div x-show="!loading&&shares.length>0" class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <table class="fw-table w-full">
+      <thead><tr><th>Label</th><th>Type</th><th>URL</th><th class="text-center">Hits</th><th>Expires</th><th></th></tr></thead>
+      <tbody>
+        <template x-for="s in shares" :key="s.token">
+          <tr>
+            <td class="font-medium text-sm" x-text="s.label||'—'"></td>
+            <td><span class="px-2 py-0.5 rounded-full text-xs bg-slate-100 text-slate-600" x-text="s.type"></span></td>
+            <td class="font-mono text-xs">
+              <a :href="'?page=shared&token='+s.token" target="_blank" class="text-fw-500 hover:underline truncate max-w-xs block" x-text="'?page=shared&token='+s.token.substring(0,8)+'…'"></a>
+            </td>
+            <td class="text-center text-sm" x-text="s.hit_count"></td>
+            <td class="text-xs text-slate-400" x-text="s.expires_at?s.expires_at.substring(0,16).replace('T',' '):'Never'"></td>
+            <td><button @click="if(confirm('Delete this shared link?'))fetch('?api=share_del',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',token:s.token})}).then(r=>r.json()).then(d=>{if(d.ok)shares=shares.filter(x=>x.token!==s.token)})" class="text-xs text-red-500 hover:underline">Delete</button></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+
 <?php endif; ?>
 <?php endif; ?>
 <?php layout_foot(); }
+
+// ================================================================
+// § SPRINT 16-20 VIEWS
+// ================================================================
+
+function view_shared():void{
+    $token=trim($_GET['token']??'');
+    if(!$token||!preg_match('/^[0-9a-f]{32}$/',$token)){
+        layout_head('Invalid Share Link','shared');
+        echo '<div class="max-w-xl mx-auto mt-16 text-center"><div class="text-4xl mb-4">🔗</div><h2 class="text-xl font-semibold text-slate-700 mb-2">Invalid or missing share token</h2><p class="text-slate-500">This link is not valid. Please check the URL and try again.</p></div>';
+        layout_foot();return;
+    }
+    $sv=db()->prepare("SELECT * FROM shared_views WHERE token=?");
+    $sv->execute([$token]);$row=$sv->fetch(\PDO::FETCH_ASSOC);
+    if(!$row){
+        layout_head('Link Not Found','shared');
+        echo '<div class="max-w-xl mx-auto mt-16 text-center"><div class="text-4xl mb-4">🔍</div><h2 class="text-xl font-semibold text-slate-700 mb-2">Share link not found</h2><p class="text-slate-500">This shared link does not exist or has been deleted.</p></div>';
+        layout_foot();return;
+    }
+    if($row['expires_at']&&strtotime($row['expires_at'])<time()){
+        layout_head('Link Expired','shared');
+        echo '<div class="max-w-xl mx-auto mt-16 text-center"><div class="text-4xl mb-4">⏰</div><h2 class="text-xl font-semibold text-slate-700 mb-2">This share link has expired</h2><p class="text-slate-500">The owner set an expiry date that has passed.</p></div>';
+        layout_foot();return;
+    }
+    db()->prepare("UPDATE shared_views SET hit_count=hit_count+1 WHERE token=?")->execute([$token]);
+    $data=json_decode($row['data_json']??'{}',true)??[];
+    $type_label=['filter'=>'Saved Filter','search'=>'Search','watchlist'=>'Watchlist'][$row['type']]??ucfirst($row['type']);
+    $expires_warn=$row['expires_at']&&strtotime($row['expires_at'])<time()+86400*3;
+    layout_head('Shared '.h($type_label).': '.h($row['label']),'shared'); ?>
+<div class="max-w-2xl mx-auto py-8 px-4">
+  <div class="bg-white border border-slate-200 rounded-xl shadow-sm p-6">
+    <div class="flex items-center gap-3 mb-4">
+      <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-700"><?=h($type_label)?></span>
+      <?php if($expires_warn):?><span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-700">Expires <?=h(substr($row['expires_at'],0,10))?></span><?php endif;?>
+    </div>
+    <h1 class="text-2xl font-bold text-slate-800 mb-1"><?=h($row['label'])?></h1>
+    <p class="text-sm text-slate-500 mb-6">Shared view &bull; <?=(int)$row['hit_count']?> view<?=$row['hit_count']!=1?'s':''?></p>
+    <?php if($data):?>
+    <div class="bg-slate-50 border border-slate-200 rounded-lg p-4">
+      <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-3">Stored Parameters</h3>
+      <dl class="space-y-2">
+        <?php foreach($data as $k=>$v):?>
+        <div class="flex gap-3">
+          <dt class="text-sm font-medium text-slate-600 min-w-[120px]"><?=h($k)?></dt>
+          <dd class="text-sm text-slate-800"><?=is_array($v)?h(json_encode($v)):h((string)$v)?></dd>
+        </div>
+        <?php endforeach;?>
+      </dl>
+    </div>
+    <?php endif;?>
+    <div class="mt-6 pt-4 border-t border-slate-100">
+      <a href="?page=recalls" class="inline-flex items-center gap-2 text-sm text-fw-600 hover:underline"><i data-lucide="arrow-left" class="w-4 h-4"></i>Browse Recalls</a>
+    </div>
+  </div>
+</div>
+<?php layout_foot();
+}
+
+function view_status():void{
+    $checks=run_health_checks();
+    $overall='ok';
+    foreach($checks as $c){
+        if($c['status']==='fail'){$overall='fail';break;}
+        if($c['status']==='warn')$overall='warn';
+    }
+    $overall_color=['ok'=>'green','warn'=>'amber','fail'=>'red'][$overall];
+    $overall_label=['ok'=>'All Systems Operational','warn'=>'Degraded Performance','fail'=>'Service Disruption'][$overall];
+    $schema_v=0;try{$schema_v=(int)db()->query("SELECT MAX(version) FROM schema_migrations")->fetchColumn();}catch(\Throwable){}
+    layout_head('System Status','status'); ?>
+<div class="max-w-3xl mx-auto py-8 px-4">
+  <div class="mb-6">
+    <h1 class="text-3xl font-bold text-slate-800 mb-1">System Status</h1>
+    <p class="text-slate-500 text-sm">FoodWatch US Recall System &bull; v<?=FW_VERSION?> &bull; Schema v<?=$schema_v?></p>
+  </div>
+  <!-- Overall status banner -->
+  <div class="bg-<?=$overall_color?>-50 border border-<?=$overall_color?>-200 rounded-xl p-5 mb-6 flex items-center gap-4">
+    <div class="w-4 h-4 rounded-full bg-<?=$overall_color?>-500 shrink-0 <?=$overall==='ok'?'animate-pulse':''?>"></div>
+    <div>
+      <div class="font-semibold text-<?=$overall_color?>-800"><?=h($overall_label)?></div>
+      <div class="text-xs text-<?=$overall_color?>-600 mt-0.5">Last checked: <?=date('Y-m-d H:i:s')?> UTC</div>
+    </div>
+  </div>
+  <!-- Individual checks -->
+  <div class="bg-white border border-slate-200 rounded-xl divide-y divide-slate-100">
+    <?php foreach($checks as $c):
+        $ic=['ok'=>'check-circle','warn'=>'alert-triangle','fail'=>'x-circle'][$c['status']];
+        $cc=['ok'=>'green','warn'=>'amber','fail'=>'red'][$c['status']];
+        $label_map=['db_ping'=>'Database Connectivity','schema_version'=>'Schema Version','recall_count'=>'Recall Data','cron_freshness'=>'Ingest Freshness','db_size'=>'Database Size'];
+        $label=$label_map[$c['name']]??ucwords(str_replace('_',' ',$c['name']));
+    ?>
+    <div class="flex items-center justify-between px-5 py-4">
+      <div class="flex items-center gap-3">
+        <i data-lucide="<?=h($ic)?>" class="w-5 h-5 text-<?=$cc?>-500"></i>
+        <div>
+          <div class="font-medium text-slate-800 text-sm"><?=h($label)?></div>
+          <div class="text-xs text-slate-500"><?=h($c['detail'])?></div>
+        </div>
+      </div>
+      <div class="text-right">
+        <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-<?=$cc?>-100 text-<?=$cc?>-700"><?=strtoupper($c['status'])?></span>
+        <?php if(($c['latency_ms']??0)>0):?>
+        <div class="text-xs text-slate-400 mt-0.5"><?=$c['latency_ms']?>ms</div>
+        <?php endif;?>
+      </div>
+    </div>
+    <?php endforeach;?>
+  </div>
+  <!-- Version info -->
+  <div class="mt-6 bg-slate-50 border border-slate-200 rounded-xl p-5">
+    <h3 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-3">Version Information</h3>
+    <dl class="grid grid-cols-2 gap-3 text-sm">
+      <div><dt class="text-slate-500">Application</dt><dd class="font-mono font-medium">v<?=FW_VERSION?></dd></div>
+      <div><dt class="text-slate-500">Schema</dt><dd class="font-mono font-medium">v<?=$schema_v?> / <?=FW_SCHEMA_VER?></dd></div>
+      <div><dt class="text-slate-500">PHP</dt><dd class="font-mono font-medium"><?=PHP_VERSION?></dd></div>
+      <div><dt class="text-slate-500">SQLite</dt><dd class="font-mono font-medium"><?=\SQLite3::version()['versionString']??'n/a'?></dd></div>
+    </dl>
+  </div>
+</div>
+<?php layout_foot();
+}
 
 // ================================================================
 // § NEW VIEWS — v2.0
