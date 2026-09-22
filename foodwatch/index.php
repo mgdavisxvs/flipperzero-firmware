@@ -9,7 +9,7 @@ declare(strict_types=1);
 // ================================================================
 // § CONSTANTS
 // ================================================================
-const FW_VERSION    = '4.1.0';
+const FW_VERSION    = '5.0.0';
 const FW_SCHEMA_VER = 19;
 const FW_DATA_DIR   = __DIR__ . '/data';
 const FW_DB_PATH    = __DIR__ . '/data/foodwatch.db';
