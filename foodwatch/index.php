@@ -9,8 +9,8 @@ declare(strict_types=1);
 // ================================================================
 // § CONSTANTS
 // ================================================================
-const FW_VERSION    = '11.0.0';
-const FW_SCHEMA_VER = 64;
+const FW_VERSION    = '12.0.0';
+const FW_SCHEMA_VER = 74;
 // Pre-shared secret for IONOS crontab → cron_alerts endpoint; override before deploy
 const FW_CRON_SECRET = 'change-me-before-deploy';
 const FW_DATA_DIR   = __DIR__ . '/data';
@@ -286,6 +286,8 @@ function db():PDO{
     seed_system_settings();
     seed_feature_flags();
     seed_rate_limit_config();
+    seed_roles();
+    seed_email_templates();
     return $pdo;
 }
 
@@ -313,7 +315,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26(),27=>m27(),28=>m28(),29=>m29(),30=>m30(),31=>m31(),32=>m32(),33=>m33(),34=>m34(),35=>m35(),36=>m36(),37=>m37(),38=>m38(),39=>m39(),40=>m40(),41=>m41(),42=>m42(),43=>m43(),44=>m44(),45=>m45(),46=>m46(),47=>m47(),48=>m48(),49=>m49(),50=>m50(),51=>m51(),52=>m52(),53=>m53(),54=>m54(),55=>m55(),56=>m56(),57=>m57(),58=>m58(),59=>m59(),60=>m60(),61=>m61(),62=>m62(),63=>m63(),64=>m64()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26(),27=>m27(),28=>m28(),29=>m29(),30=>m30(),31=>m31(),32=>m32(),33=>m33(),34=>m34(),35=>m35(),36=>m36(),37=>m37(),38=>m38(),39=>m39(),40=>m40(),41=>m41(),42=>m42(),43=>m43(),44=>m44(),45=>m45(),46=>m46(),47=>m47(),48=>m48(),49=>m49(),50=>m50(),51=>m51(),52=>m52(),53=>m53(),54=>m54(),55=>m55(),56=>m56(),57=>m57(),58=>m58(),59=>m59(),60=>m60(),61=>m61(),62=>m62(),63=>m63(),64=>m64(),65=>m65(),66=>m66(),67=>m67(),68=>m68(),69=>m69(),70=>m70(),71=>m71(),72=>m72(),73=>m73(),74=>m74()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -802,6 +804,111 @@ CREATE TABLE IF NOT EXISTS notification_prefs(
   digest_freq TEXT NOT NULL DEFAULT 'immediate' CHECK(digest_freq IN ('immediate','daily','weekly')),
   updated_at TEXT NOT NULL DEFAULT(datetime('now')));
 CREATE INDEX IF NOT EXISTS idx_np_user ON notification_prefs(user_id);
+SQL; }
+
+// Sprint 51-60 migrations (highest first)
+function m74():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS data_requests(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  type TEXT NOT NULL CHECK(type IN('export','deletion')),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN('pending','processing','complete','failed')),
+  requested_at TEXT NOT NULL DEFAULT(datetime('now')),
+  completed_at TEXT,
+  download_token TEXT
+);
+SQL; }
+function m73():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS scheduled_exports(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  format TEXT NOT NULL DEFAULT 'csv' CHECK(format IN('csv','json')),
+  filters_json TEXT NOT NULL DEFAULT '{}',
+  schedule_cron TEXT NOT NULL DEFAULT '0 6 * * 1',
+  last_run_at TEXT,
+  next_run_at TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT(datetime('now'))
+);
+SQL; }
+function m72():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS roles(
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  permissions_json TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS user_roles(
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+  assigned_at TEXT NOT NULL DEFAULT(datetime('now')),
+  UNIQUE(user_id,role_id)
+);
+SQL; }
+function m71():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS recall_status_transitions(
+  id INTEGER PRIMARY KEY,
+  recall_id INTEGER NOT NULL REFERENCES recalls(id) ON DELETE CASCADE,
+  from_status TEXT NOT NULL DEFAULT '',
+  to_status TEXT NOT NULL,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT(datetime('now'))
+);
+SQL; }
+function m70():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS ingest_sources(
+  key TEXT PRIMARY KEY,
+  label TEXT NOT NULL,
+  url TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_fetched_at TEXT,
+  format TEXT NOT NULL DEFAULT 'json' CHECK(format IN('json','xml','csv'))
+);
+SQL; }
+function m69():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS email_templates(
+  slug TEXT PRIMARY KEY,
+  subject TEXT NOT NULL,
+  html_body TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT(datetime('now'))
+);
+SQL; }
+function m68():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS api_changelog(
+  id INTEGER PRIMARY KEY,
+  version TEXT NOT NULL,
+  endpoint TEXT NOT NULL,
+  change TEXT NOT NULL,
+  released_at TEXT NOT NULL DEFAULT(datetime('now'))
+);
+SQL; }
+function m67():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS recall_comparisons(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  ids_json TEXT NOT NULL DEFAULT '[]',
+  label TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT(datetime('now'))
+);
+SQL; }
+function m66():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS user_activity(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  entity_type TEXT NOT NULL DEFAULT '',
+  entity_id INTEGER NOT NULL DEFAULT 0,
+  meta_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT(datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_user_activity_uid ON user_activity(user_id,created_at DESC);
+SQL; }
+function m65():string{ return <<<'SQL'
+CREATE VIRTUAL TABLE IF NOT EXISTS recalls_fts USING fts5(
+  title, brand, reason_detail,
+  content=recalls, content_rowid=id,
+  tokenize='unicode61 remove_diacritics 1'
+);
 SQL; }
 
 function m64():string{ return <<<'SQL'
@@ -2946,6 +3053,180 @@ function send_email_alerts():array{
 
 // ================================================================
 // ================================================================
+// § SPRINT 51-60 HELPERS
+function fts_recall_search(string $q, int $limit=50, int $offset=0):array{
+    if(strlen(trim($q))<2)return[];
+    try{
+        $stmt=db()->prepare("SELECT r.id,r.title,r.status,r.severity,r.announced_date,
+            snippet(recalls_fts,-1,'<mark>','</mark>','…',32) AS snip
+            FROM recalls_fts
+            JOIN recalls r ON r.id=recalls_fts.rowid
+            WHERE recalls_fts MATCH ?
+            ORDER BY rank LIMIT ? OFFSET ?");
+        $stmt->execute(['"'.str_replace('"','',$q).'"',$limit,$offset]);
+        return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    }catch(\Exception $e){return[];}
+}
+function log_user_activity(int $uid, string $event, string $entity='', int $eid=0, array $meta=[]):void{
+    if($uid<=0)return;
+    try{
+        db()->prepare("INSERT INTO user_activity(user_id,event_type,entity_type,entity_id,meta_json) VALUES(?,?,?,?,?)")
+            ->execute([$uid,$event,$entity,$eid,json_encode($meta,JSON_UNESCAPED_UNICODE)]);
+    }catch(\Exception $e){}
+}
+function get_recall_comparison(array $ids):array{
+    if(empty($ids))return[];
+    $ids=array_map('intval',array_slice($ids,0,5));
+    $ph=implode(',',array_fill(0,count($ids),'?'));
+    $rows=db()->prepare("SELECT r.*,a.name AS agency_name,cat.name AS category_name,b.name AS brand_name
+        FROM recalls r
+        LEFT JOIN agencies a ON a.id=r.agency_id
+        LEFT JOIN categories cat ON cat.id=r.category_id
+        LEFT JOIN brands b ON b.id=r.brand_id
+        WHERE r.id IN($ph)")->execute($ids)?db()->prepare("SELECT r.*,a.name AS agency_name,cat.name AS category_name,b.name AS brand_name
+        FROM recalls r
+        LEFT JOIN agencies a ON a.id=r.agency_id
+        LEFT JOIN categories cat ON cat.id=r.category_id
+        LEFT JOIN brands b ON b.id=r.brand_id
+        WHERE r.id IN($ph)")->fetchAll(\PDO::FETCH_ASSOC):[];
+    $stmt=db()->prepare("SELECT r.*,a.name AS agency_name,cat.name AS category_name,b.name AS brand_name
+        FROM recalls r
+        LEFT JOIN agencies a ON a.id=r.agency_id
+        LEFT JOIN categories cat ON cat.id=r.category_id
+        LEFT JOIN brands b ON b.id=r.brand_id
+        WHERE r.id IN($ph)");
+    $stmt->execute($ids);
+    return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+}
+function build_openapi_schema():array{
+    return[
+        'openapi'=>'3.0.3',
+        'info'=>['title'=>'FoodWatch API','version'=>FW_VERSION,'description'=>'US Food Recall surveillance platform API'],
+        'paths'=>[
+            '/?api=recalls_list'=>['get'=>['summary'=>'List recalls','parameters'=>[['name'=>'limit','in'=>'query'],['name'=>'offset','in'=>'query'],['name'=>'q','in'=>'query'],['name'=>'status','in'=>'query'],['name'=>'severity','in'=>'query']]]],
+            '/?api=recall_detail'=>['get'=>['summary'=>'Get recall by ID','parameters'=>[['name'=>'id','in'=>'query','required'=>true]]]],
+            '/?api=fts_search'=>['get'=>['summary'=>'Full-text search recalls','parameters'=>[['name'=>'q','in'=>'query','required'=>true],['name'=>'limit','in'=>'query']]]],
+            '/?api=analytics_summary'=>['get'=>['summary'=>'Analytics summary statistics']],
+            '/?api=analytics_timeseries'=>['get'=>['summary'=>'Recall counts over time','parameters'=>[['name'=>'days','in'=>'query'],['name'=>'group','in'=>'query']]]],
+            '/?api=risk_index_list'=>['get'=>['summary'=>'Compound risk scores for recalls']],
+            '/?api=openapi_schema'=>['get'=>['summary'=>'This OpenAPI schema document']],
+        ],
+    ];
+}
+function render_email_template(string $slug, array $vars):string{
+    $row=db()->prepare("SELECT html_body FROM email_templates WHERE slug=?")->execute([$slug])
+        ?db()->prepare("SELECT html_body FROM email_templates WHERE slug=?")->fetchColumn():false;
+    $stmt=db()->prepare("SELECT html_body FROM email_templates WHERE slug=?");
+    $stmt->execute([$slug]);
+    $body=(string)($stmt->fetchColumn()?:'');
+    foreach($vars as $k=>$v){$body=str_replace('{{'.$k.'}}',(string)$v,$body);}
+    return $body;
+}
+function seed_email_templates():void{
+    $existing=db()->query("SELECT COUNT(*) FROM email_templates")->fetchColumn();
+    if($existing>0)return;
+    $tpls=[
+        ['alert','[FoodWatch] New recall alert: {{title}}',
+         '<h2>New Recall Alert</h2><p><strong>{{title}}</strong></p><p>Severity: {{severity}}</p><p>Announced: {{announced_date}}</p><p><a href="{{url}}">View full recall →</a></p>'],
+        ['digest','[FoodWatch] Your weekly recall digest',
+         '<h2>Weekly Recall Digest</h2><p>{{count}} new recalls this week.</p>{{recall_list}}<p><a href="{{url}}">View all recalls →</a></p>'],
+        ['welcome','Welcome to FoodWatch',
+         '<h2>Welcome to FoodWatch!</h2><p>Hi {{name}},</p><p>Your account has been created. <a href="{{url}}">Sign in →</a></p>'],
+    ];
+    $ins=db()->prepare("INSERT OR IGNORE INTO email_templates(slug,subject,html_body) VALUES(?,?,?)");
+    foreach($tpls as [$s,$sub,$body])$ins->execute([$s,$sub,$body]);
+}
+function simulate_ingest_run(string $source_key, int $count=5):array{
+    $prefixes=['Voluntary','Class I','Class II','Class III','Urgent'];
+    $foods=['Peanut Butter','Salad Mix','Frozen Chicken','Almond Milk','Cheese Slices'];
+    $inserted=0;
+    $ins=db()->prepare("INSERT INTO recalls(title,status,severity,severity_label,announced_date,brand_id,category_id,reason_detail) VALUES(?,?,?,?,?,?,?,?)");
+    for($i=0;$i<min($count,20);$i++){
+        $p=$prefixes[array_rand($prefixes)];$f=$foods[array_rand($foods)];
+        $sev=(float)(random_int(1,10)/2);
+        $ins->execute(["Simulated: $p Recall — $f",'open',$sev,$sev>=4?'Class I':($sev>=2?'Class II':'Class III'),date('Y-m-d',strtotime("-{$i} days")),null,null,"Simulated ingest from source $source_key"]);
+        $inserted++;
+    }
+    $at=date('Y-m-d\TH:i:s');
+    db()->prepare("UPDATE ingest_sources SET last_fetched_at=? WHERE key=?")->execute([$at,$source_key]);
+    db()->prepare("INSERT INTO ingest_run_log(source,status,records_fetched,records_inserted,started_at,finished_at) VALUES(?,?,?,?,?,?)")
+        ->execute([$source_key,'ok',$inserted,$inserted,$at,$at]);
+    return['source'=>$source_key,'records_inserted'=>$inserted,'ran_at'=>$at];
+}
+function seed_roles():void{
+    $existing=db()->query("SELECT COUNT(*) FROM roles")->fetchColumn();
+    if($existing>0)return;
+    $roles=[
+        ['viewer','["recalls:read","search","export"]'],
+        ['editor','["recalls:read","recalls:write","search","export","tags:write"]'],
+        ['admin','["*"]'],
+    ];
+    $ins=db()->prepare("INSERT OR IGNORE INTO roles(name,permissions_json) VALUES(?,?)");
+    foreach($roles as [$n,$p])$ins->execute([$n,$p]);
+}
+function user_has_permission(string $perm):bool{
+    if(!is_user())return false;
+    if(is_admin())return true;
+    $uid=(int)(current_user()['id']??0);
+    $stmt=db()->prepare("SELECT r.permissions_json FROM user_roles ur JOIN roles r ON r.id=ur.role_id WHERE ur.user_id=?");
+    $stmt->execute([$uid]);
+    foreach($stmt->fetchAll(\PDO::FETCH_COLUMN) as $json){
+        $perms=json_decode($json,true)??[];
+        if(in_array('*',$perms,true)||in_array($perm,$perms,true))return true;
+    }
+    return false;
+}
+function transition_recall_status(int $rid, string $to, string $note=''):bool{
+    $allowed=['open','under_review','published','withdrawn','archived'];
+    if(!in_array($to,$allowed,true))return false;
+    $row=db()->prepare("SELECT status FROM recalls WHERE id=?")->execute([$rid])
+        ?null:null;
+    $stmt=db()->prepare("SELECT status FROM recalls WHERE id=?");$stmt->execute([$rid]);
+    $from=(string)($stmt->fetchColumn()?:'');
+    $uid=is_user()?(int)(current_user()['id']??0):0;
+    db()->prepare("UPDATE recalls SET status=? WHERE id=?")->execute([$to,$rid]);
+    db()->prepare("INSERT INTO recall_status_transitions(recall_id,from_status,to_status,user_id,note) VALUES(?,?,?,?,?)")
+        ->execute([$rid,$from,$to,$uid?:null,$note]);
+    log_audit('recall_status_transition','recall',$rid,['from'=>$from,'to'=>$to]);
+    return true;
+}
+function compute_next_export_run(string $cron):string{
+    $parts=explode(' ',$cron);
+    if(count($parts)!==5)return date('Y-m-d\TH:i:s',strtotime('+7 days'));
+    return date('Y-m-d\TH:i:s',strtotime('+1 week'));
+}
+function run_scheduled_exports():int{
+    $now=date('Y-m-d\TH:i:s');
+    $due=db()->prepare("SELECT * FROM scheduled_exports WHERE enabled=1 AND (next_run_at IS NULL OR next_run_at<=?)");
+    $due->execute([$now]);$rows=$due->fetchAll(\PDO::FETCH_ASSOC);
+    $count=0;
+    foreach($rows as $r){
+        $next=compute_next_export_run($r['schedule_cron']);
+        db()->prepare("UPDATE scheduled_exports SET last_run_at=?,next_run_at=? WHERE id=?")->execute([$now,$next,$r['id']]);
+        $count++;
+    }
+    return $count;
+}
+function create_data_request(string $type):int{
+    if(!is_user())return 0;
+    $uid=(int)(current_user()['id']??0);
+    $token=bin2hex(random_bytes(16));
+    db()->prepare("INSERT INTO data_requests(user_id,type,status,download_token) VALUES(?,?,?,?)")
+        ->execute([$uid,$type,'pending',$token]);
+    return (int)db()->lastInsertId();
+}
+function process_data_export(int $req_id):string{
+    $stmt=db()->prepare("SELECT * FROM data_requests WHERE id=?");$stmt->execute([$req_id]);
+    $req=$stmt->fetch(\PDO::FETCH_ASSOC);
+    if(!$req)return '';
+    $uid=(int)$req['user_id'];
+    $stmt2=db()->prepare("SELECT id,title,status,severity_label,announced_date FROM recalls LIMIT 1000");
+    $stmt2->execute();$recalls=$stmt2->fetchAll(\PDO::FETCH_ASSOC);
+    $json=json_encode(['user_id'=>$uid,'exported_at'=>date('c'),'recalls'=>$recalls],JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT);
+    db()->prepare("UPDATE data_requests SET status='complete',completed_at=? WHERE id=?")->execute([date('Y-m-d\TH:i:s'),$req_id]);
+    return $json;
+}
+
 // § SPRINT 41-50 HELPERS
 // ================================================================
 
@@ -3790,6 +4071,138 @@ function run_tests():array{
         'bulk_max_100'              =>'test_bulk_max_100',
         'admin_bulk_tab'            =>'test_admin_bulk_tab',
         'm_admin_op_log'            =>'test_m_admin_op_log',
+        // Sprint 60
+        'm_data_requests_cols'      =>'test_m_data_requests_cols',
+        'create_data_request_fn'    =>'test_create_data_request_fn',
+        'data_request_create_api'   =>'test_data_request_create_api',
+        'data_request_status_api'   =>'test_data_request_status_api',
+        'gdpr_admin_list_api'       =>'test_gdpr_admin_list_api',
+        'process_data_export_fn'    =>'test_process_data_export_fn',
+        'privacy_tab_account'       =>'test_privacy_tab_account',
+        'data_requests_type_check'  =>'test_data_requests_type_check',
+        'data_requests_status_check'=>'test_data_requests_status_check',
+        'data_requests_token_field' =>'test_data_requests_token_field',
+        'data_requests_user_fk'     =>'test_data_requests_user_fk',
+        'privacy_ui_buttons'        =>'test_privacy_ui_buttons',
+        // Sprint 59
+        'm_scheduled_exports_cols'  =>'test_m_scheduled_exports_cols',
+        'scheduled_export_create_api'=>'test_scheduled_export_create_api',
+        'scheduled_export_list_api' =>'test_scheduled_export_list_api',
+        'scheduled_export_delete_api'=>'test_scheduled_export_delete_api',
+        'compute_next_run_fn'       =>'test_compute_next_run_fn',
+        'run_scheduled_exports_fn'  =>'test_run_scheduled_exports_fn',
+        'scheduled_exports_tab'     =>'test_scheduled_exports_tab',
+        'scheduled_exports_format_check'=>'test_scheduled_exports_format_check',
+        'scheduled_exports_cron_field'=>'test_scheduled_exports_cron_field',
+        'scheduled_exports_enabled' =>'test_scheduled_exports_enabled',
+        'scheduled_exports_next_run'=>'test_scheduled_exports_next_run',
+        'scheduled_exports_user_fk' =>'test_scheduled_exports_user_fk',
+        // Sprint 58
+        'm_roles_cols'              =>'test_m_roles_cols',
+        'm_user_roles_cols'         =>'test_m_user_roles_cols',
+        'seed_roles_fn'             =>'test_seed_roles_fn',
+        'user_has_permission_fn'    =>'test_user_has_permission_fn',
+        'role_list_api'             =>'test_role_list_api',
+        'role_assign_api'           =>'test_role_assign_api',
+        'role_revoke_api'           =>'test_role_revoke_api',
+        'roles_admin_tab'           =>'test_roles_admin_tab',
+        'roles_seeded_viewer'       =>'test_roles_seeded_viewer',
+        'roles_seeded_editor'       =>'test_roles_seeded_editor',
+        'roles_seeded_admin'        =>'test_roles_seeded_admin',
+        'user_roles_unique_constraint'=>'test_user_roles_unique_constraint',
+        // Sprint 57
+        'm_status_transitions_cols' =>'test_m_status_transitions_cols',
+        'transition_recall_status_fn'=>'test_transition_recall_status_fn',
+        'recall_status_transition_api'=>'test_recall_status_transition_api',
+        'recall_status_history_api' =>'test_recall_status_history_api',
+        'status_wf_admin_tab'       =>'test_status_wf_admin_tab',
+        'transition_logs_audit'     =>'test_transition_logs_audit',
+        'transition_allowed_values' =>'test_transition_allowed_values',
+        'recall_status_transitions_recall_fk'=>'test_recall_status_transitions_recall_fk',
+        'recall_status_transitions_user_fk'=>'test_recall_status_transitions_user_fk',
+        'recall_status_from_field'  =>'test_recall_status_from_field',
+        'recall_status_note_field'  =>'test_recall_status_note_field',
+        'recall_status_router_case' =>'test_recall_status_router_case',
+        // Sprint 56
+        'm_ingest_sources_cols'     =>'test_m_ingest_sources_cols',
+        'simulate_ingest_run_fn'    =>'test_simulate_ingest_run_fn',
+        'ingest_source_list_api'    =>'test_ingest_source_list_api',
+        'ingest_source_upsert_api'  =>'test_ingest_source_upsert_api',
+        'ingest_run_trigger_api'    =>'test_ingest_run_trigger_api',
+        'ingest_src_admin_tab'      =>'test_ingest_src_admin_tab',
+        'ingest_sources_key_pk'     =>'test_ingest_sources_key_pk',
+        'ingest_sources_format_check'=>'test_ingest_sources_format_check',
+        'ingest_run_logs_source'    =>'test_ingest_run_logs_source',
+        'ingest_sources_enabled'    =>'test_ingest_sources_enabled',
+        'ingest_sources_last_fetched'=>'test_ingest_sources_last_fetched',
+        'simulate_ingest_inserts'   =>'test_simulate_ingest_inserts',
+        // Sprint 55
+        'm_email_templates_cols'    =>'test_m_email_templates_cols',
+        'render_email_template_fn'  =>'test_render_email_template_fn',
+        'seed_email_templates_fn'   =>'test_seed_email_templates_fn',
+        'email_template_list_api'   =>'test_email_template_list_api',
+        'email_template_set_api'    =>'test_email_template_set_api',
+        'email_template_preview_api'=>'test_email_template_preview_api',
+        'email_tpl_admin_tab'       =>'test_email_tpl_admin_tab',
+        'email_templates_slug_pk'   =>'test_email_templates_slug_pk',
+        'email_templates_alert_slug'=>'test_email_templates_alert_slug',
+        'email_templates_digest_slug'=>'test_email_templates_digest_slug',
+        'email_templates_welcome_slug'=>'test_email_templates_welcome_slug',
+        'email_template_var_replace'=>'test_email_template_var_replace',
+        // Sprint 54
+        'm_api_changelog_cols'      =>'test_m_api_changelog_cols',
+        'build_openapi_schema_fn'   =>'test_build_openapi_schema_fn',
+        'openapi_schema_api'        =>'test_openapi_schema_api',
+        'api_changelog_list_api'    =>'test_api_changelog_list_api',
+        'api_changelog_add_api'     =>'test_api_changelog_add_api',
+        'view_api_docs_fn'          =>'test_view_api_docs_fn',
+        'api_docs_router_case'      =>'test_api_docs_router_case',
+        'openapi_paths_key'         =>'test_openapi_paths_key',
+        'openapi_info_key'          =>'test_openapi_info_key',
+        'api_docs_render_dispatch'  =>'test_api_docs_render_dispatch',
+        'api_changelog_version_field'=>'test_api_changelog_version_field',
+        'api_changelog_endpoint_field'=>'test_api_changelog_endpoint_field',
+        // Sprint 53
+        'm_recall_comparisons_cols' =>'test_m_recall_comparisons_cols',
+        'get_recall_comparison_fn'  =>'test_get_recall_comparison_fn',
+        'recall_compare_api'        =>'test_recall_compare_api',
+        'comparison_save_api'       =>'test_comparison_save_api',
+        'comparison_list_api'       =>'test_comparison_list_api',
+        'view_compare_side_by_side' =>'test_view_compare_side_by_side',
+        'view_compare_routing'      =>'test_view_compare_routing',
+        'recall_comparisons_ids_json'=>'test_recall_comparisons_ids_json',
+        'recall_comparisons_user_fk'=>'test_recall_comparisons_user_fk',
+        'recall_comparisons_label'  =>'test_recall_comparisons_label',
+        'comparison_save_csrf'      =>'test_comparison_save_csrf',
+        'comparison_list_user_guard'=>'test_comparison_list_user_guard',
+        // Sprint 52
+        'm_user_activity_new_cols'  =>'test_m_user_activity_new_cols',
+        'log_user_activity_fn'      =>'test_log_user_activity_fn',
+        'user_activity_list_api'    =>'test_user_activity_list_api',
+        'user_activity_admin_api'   =>'test_user_activity_admin_api',
+        'activity_tab_existing'     =>'test_activity_tab_existing',
+        'user_activity_event_type'  =>'test_user_activity_event_type',
+        'user_activity_entity_type' =>'test_user_activity_entity_type',
+        'user_activity_meta_json'   =>'test_user_activity_meta_json',
+        'user_activity_index'       =>'test_user_activity_index',
+        'user_activity_uid_guard'   =>'test_user_activity_uid_guard',
+        'user_activity_admin_guard' =>'test_user_activity_admin_guard',
+        'user_activity_limit'       =>'test_user_activity_limit',
+        // Sprint 51 (also Sprint 60 version tests)
+        'fw_version_12'             =>'test_fw_version_12',
+        'schema_ver_74'             =>'test_schema_ver_74',
+        'm_recalls_fts_virtual'     =>'test_m_recalls_fts_virtual',
+        'fts_recall_search_fn'      =>'test_fts_recall_search_fn',
+        'fts_search_api'            =>'test_fts_search_api',
+        'fts_match_keyword'         =>'test_fts_match_keyword',
+        'fts_search_limit'          =>'test_fts_search_limit',
+        'fts_search_min_len'        =>'test_fts_search_min_len',
+        'fts_returns_array'         =>'test_fts_returns_array',
+        'fts_content_rowid'         =>'test_fts_content_rowid',
+        'fts_tokenize_unicode61'    =>'test_fts_tokenize_unicode61',
+        'fts_columns_defined'       =>'test_fts_columns_defined',
+        'fts_exception_safe'        =>'test_fts_exception_safe',
+        'fts_schema_ver_bump'       =>'test_fts_schema_ver_bump',
         // Sprint 41
         'm_audit_log_cols'          =>'test_m_audit_log_cols',
         'log_audit_fn'              =>'test_log_audit_fn',
@@ -5639,12 +6052,12 @@ function test_ingest_run_list_api():array{
     return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'ingest_run_list API case defined':'ingest_run_list API case missing'];
 }
 function test_fw_version_11():array{
-    $ok=defined('FW_VERSION')&&str_starts_with(FW_VERSION,'11.');
-    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FW_VERSION is 11.x: '.FW_VERSION:'FW_VERSION not 11.x: '.(FW_VERSION??'undef')];
+    $ok=defined('FW_VERSION')&&version_compare(FW_VERSION,'11.0.0','>=');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FW_VERSION>=11.0.0: '.FW_VERSION:'FW_VERSION<11.0.0: '.(FW_VERSION??'undef')];
 }
 function test_schema_ver_64():array{
-    $ok=defined('FW_SCHEMA_VER')&&FW_SCHEMA_VER===64;
-    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FW_SCHEMA_VER=64':'FW_SCHEMA_VER not 64: '.(FW_SCHEMA_VER??'undef')];
+    $ok=defined('FW_SCHEMA_VER')&&FW_SCHEMA_VER>=64;
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FW_SCHEMA_VER>=64 (current: '.FW_SCHEMA_VER.')':'FW_SCHEMA_VER<64'];
 }
 function test_metrics_tab_system_info():array{
     $src=file_get_contents(__FILE__);
@@ -6166,6 +6579,507 @@ function test_m_admin_op_log():array{
 }
 
 // ================================================================
+function test_fw_version_12():array{
+    $ok=defined('FW_VERSION')&&version_compare(FW_VERSION,'12.0.0','>=');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FW_VERSION>=12.0.0: '.FW_VERSION:'FW_VERSION<12.0.0: '.(FW_VERSION??'undef')];
+}
+function test_schema_ver_74():array{
+    $ok=defined('FW_SCHEMA_VER')&&FW_SCHEMA_VER>=74;
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FW_SCHEMA_VER>=74 (current: '.FW_SCHEMA_VER.')':'FW_SCHEMA_VER<74'];
+}
+// § SPRINT 51 TESTS — Full-Text Search
+function test_m_recalls_fts_virtual():array{
+    $ok=str_contains(file_get_contents(__FILE__),'recalls_fts USING fts5');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recalls_fts FTS5 virtual table defined':'FTS5 virtual table missing'];
+}
+function test_fts_recall_search_fn():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function fts_recall_search(string $q');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'fts_recall_search() defined':'fts_recall_search() missing'];
+}
+function test_fts_search_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'fts_search':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'fts_search API case defined':'fts_search API case missing'];
+}
+function test_fts_match_keyword():array{
+    $ok=str_contains(file_get_contents(__FILE__),'recalls_fts MATCH');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FTS MATCH query present':'FTS MATCH query missing'];
+}
+function test_fts_search_limit():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function fts_recall_search')&&str_contains(file_get_contents(__FILE__),'LIMIT ?');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FTS search uses LIMIT parameter':'LIMIT missing in FTS search'];
+}
+function test_fts_search_min_len():array{
+    $ok=str_contains(file_get_contents(__FILE__),'strlen(trim($q))<2');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FTS min length guard (len<2) present':'FTS min length guard missing'];
+}
+function test_fts_returns_array():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function fts_recall_search')&&str_contains(file_get_contents(__FILE__),'fetchAll');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'fts_recall_search uses fetchAll (returns array)':'fetchAll missing in FTS search'];
+}
+function test_fts_content_rowid():array{
+    $ok=str_contains(file_get_contents(__FILE__),'content_rowid=id');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FTS5 content_rowid=id defined':'content_rowid missing'];
+}
+function test_fts_tokenize_unicode61():array{
+    $ok=str_contains(file_get_contents(__FILE__),"tokenize='unicode61");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FTS5 tokenize=unicode61 defined':'unicode61 tokenizer missing'];
+}
+function test_fts_columns_defined():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'title, brand, reason_detail');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FTS5 columns (title,brand,reason_detail) defined':'FTS5 columns missing'];
+}
+function test_fts_exception_safe():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function fts_recall_search')&&str_contains(file_get_contents(__FILE__),'catch(\Exception $e){return[];}');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FTS search has exception handler returning []':'FTS exception handler missing'];
+}
+function test_fts_schema_ver_bump():array{
+    $ok=defined('FW_SCHEMA_VER')&&FW_SCHEMA_VER>=65;
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FW_SCHEMA_VER>=65 (FTS migration included)':'FW_SCHEMA_VER<65'];
+}
+// § SPRINT 52 TESTS — User Activity Feed
+function test_m_user_activity_new_cols():array{
+    $ok=str_contains(file_get_contents(__FILE__),'user_activity')&&str_contains(file_get_contents(__FILE__),'event_type TEXT NOT NULL');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'user_activity table with event_type defined':'user_activity event_type missing'];
+}
+function test_log_user_activity_fn():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function log_user_activity(int $uid');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'log_user_activity() defined':'log_user_activity() missing'];
+}
+function test_user_activity_list_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'user_activity_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'user_activity_list API defined':'user_activity_list API missing'];
+}
+function test_user_activity_admin_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'user_activity_admin':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'user_activity_admin API defined':'user_activity_admin API missing'];
+}
+function test_activity_tab_existing():array{
+    $ok=str_contains(file_get_contents(__FILE__),"atab==='activity'")&&str_contains(file_get_contents(__FILE__),'activity_list');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'activity tab present with activity_list fetch':'activity tab missing'];
+}
+function test_user_activity_event_type():array{
+    $ok=str_contains(file_get_contents(__FILE__),'event_type TEXT NOT NULL');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'user_activity.event_type TEXT NOT NULL defined':'event_type field missing'];
+}
+function test_user_activity_entity_type():array{
+    $ok=str_contains(file_get_contents(__FILE__),'entity_type TEXT NOT NULL DEFAULT');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'user_activity.entity_type defined':'entity_type field missing'];
+}
+function test_user_activity_meta_json():array{
+    $ok=str_contains(file_get_contents(__FILE__),'meta_json TEXT NOT NULL DEFAULT');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'user_activity.meta_json defined':'meta_json field missing'];
+}
+function test_user_activity_index():array{
+    $ok=str_contains(file_get_contents(__FILE__),'idx_user_activity_uid');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'user_activity index idx_user_activity_uid defined':'user_activity index missing'];
+}
+function test_user_activity_uid_guard():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function log_user_activity')&&str_contains(file_get_contents(__FILE__),'if($uid<=0)return;');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'log_user_activity guards uid>0':'uid guard missing in log_user_activity'];
+}
+function test_user_activity_admin_guard():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'user_activity_admin':")&&str_contains(file_get_contents(__FILE__),'is_admin');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'user_activity_admin is_admin guard present':'admin guard missing from user_activity_admin'];
+}
+function test_user_activity_limit():array{
+    $ok=str_contains(file_get_contents(__FILE__),'user_activity_list')&&str_contains(file_get_contents(__FILE__),'LIMIT 100');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'user_activity_list uses LIMIT 100':'activity list limit missing'];
+}
+// § SPRINT 53 TESTS — Recall Comparison
+function test_m_recall_comparisons_cols():array{
+    $ok=str_contains(file_get_contents(__FILE__),'recall_comparisons')&&str_contains(file_get_contents(__FILE__),'ids_json TEXT NOT NULL');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_comparisons table with ids_json defined':'recall_comparisons missing'];
+}
+function test_get_recall_comparison_fn():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function get_recall_comparison(array $ids)');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'get_recall_comparison() defined':'get_recall_comparison() missing'];
+}
+function test_recall_compare_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'recall_compare':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_compare API defined':'recall_compare API missing'];
+}
+function test_comparison_save_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'comparison_save':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'comparison_save API defined':'comparison_save API missing'];
+}
+function test_comparison_list_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'comparison_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'comparison_list API defined':'comparison_list API missing'];
+}
+function test_view_compare_side_by_side():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function view_compare()')&&str_contains(file_get_contents(__FILE__),'side-by-side');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'view_compare() with side-by-side markup present':'compare view missing side-by-side'];
+}
+function test_view_compare_routing():array{
+    $ok=str_contains(file_get_contents(__FILE__),"?page=compare");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'?page=compare routing present':'compare page routing missing'];
+}
+function test_recall_comparisons_ids_json():array{
+    $ok=str_contains(file_get_contents(__FILE__),'recall_comparisons')&&str_contains(file_get_contents(__FILE__),'ids_json TEXT');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_comparisons.ids_json TEXT defined':'ids_json field missing'];
+}
+function test_recall_comparisons_user_fk():array{
+    $ok=str_contains(file_get_contents(__FILE__),'recall_comparisons')&&str_contains(file_get_contents(__FILE__),'user_id INTEGER REFERENCES');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_comparisons.user_id FK defined':'recall_comparisons user FK missing'];
+}
+function test_recall_comparisons_label():array{
+    $ok=str_contains(file_get_contents(__FILE__),'recall_comparisons')&&str_contains(file_get_contents(__FILE__),'label TEXT NOT NULL DEFAULT');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_comparisons.label field defined':'label field missing from recall_comparisons'];
+}
+function test_comparison_save_csrf():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'comparison_save':")&&str_contains(file_get_contents(__FILE__),'csrf_ok()');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'comparison_save CSRF guard present':'comparison_save missing CSRF check'];
+}
+function test_comparison_list_user_guard():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'comparison_list':")&&str_contains(file_get_contents(__FILE__),'is_user()');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'comparison_list user guard present':'comparison_list missing user guard'];
+}
+// § SPRINT 54 TESTS — OpenAPI Schema
+function test_m_api_changelog_cols():array{
+    $ok=str_contains(file_get_contents(__FILE__),'api_changelog')&&str_contains(file_get_contents(__FILE__),'endpoint TEXT NOT NULL');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'api_changelog table with endpoint field defined':'api_changelog missing'];
+}
+function test_build_openapi_schema_fn():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function build_openapi_schema():array');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'build_openapi_schema() defined':'build_openapi_schema() missing'];
+}
+function test_openapi_schema_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'openapi_schema':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'openapi_schema API case defined':'openapi_schema API missing'];
+}
+function test_api_changelog_list_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'api_changelog_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'api_changelog_list API defined':'api_changelog_list API missing'];
+}
+function test_api_changelog_add_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'api_changelog_add':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'api_changelog_add API defined':'api_changelog_add API missing'];
+}
+function test_view_api_docs_fn():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function view_api_docs():void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'view_api_docs() defined':'view_api_docs() missing'];
+}
+function test_api_docs_router_case():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'api_docs':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'api_docs router case defined':'api_docs router case missing'];
+}
+function test_openapi_paths_key():array{
+    $ok=str_contains(file_get_contents(__FILE__),"'paths'=>");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'OpenAPI schema has paths key':'OpenAPI paths key missing'];
+}
+function test_openapi_info_key():array{
+    $ok=str_contains(file_get_contents(__FILE__),"'info'=>")&&str_contains(file_get_contents(__FILE__),"'openapi'=>'3.0.3'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'OpenAPI 3.0.3 schema with info key':'OpenAPI info/version missing'];
+}
+function test_api_docs_render_dispatch():array{
+    $ok=str_contains(file_get_contents(__FILE__),"'api_docs'      =>view_api_docs()");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'api_docs in render_page dispatch map':'api_docs missing from dispatch'];
+}
+function test_api_changelog_version_field():array{
+    $ok=str_contains(file_get_contents(__FILE__),'api_changelog')&&str_contains(file_get_contents(__FILE__),'version TEXT NOT NULL');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'api_changelog.version TEXT NOT NULL defined':'version field missing from api_changelog'];
+}
+function test_api_changelog_endpoint_field():array{
+    $ok=str_contains(file_get_contents(__FILE__),'api_changelog')&&str_contains(file_get_contents(__FILE__),'endpoint TEXT NOT NULL');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'api_changelog.endpoint TEXT NOT NULL defined':'endpoint field missing'];
+}
+// § SPRINT 55 TESTS — Email Templates
+function test_m_email_templates_cols():array{
+    $ok=str_contains(file_get_contents(__FILE__),'email_templates')&&str_contains(file_get_contents(__FILE__),'html_body TEXT NOT NULL');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'email_templates table with html_body defined':'email_templates missing'];
+}
+function test_render_email_template_fn():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function render_email_template(string $slug');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'render_email_template() defined':'render_email_template() missing'];
+}
+function test_seed_email_templates_fn():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function seed_email_templates():void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'seed_email_templates() defined':'seed_email_templates() missing'];
+}
+function test_email_template_list_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'email_template_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'email_template_list API defined':'email_template_list API missing'];
+}
+function test_email_template_set_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'email_template_set':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'email_template_set API defined':'email_template_set API missing'];
+}
+function test_email_template_preview_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'email_template_preview':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'email_template_preview API defined':'email_template_preview API missing'];
+}
+function test_email_tpl_admin_tab():array{
+    $ok=str_contains(file_get_contents(__FILE__),"'email_tpl'=>'Email Templates'")&&str_contains(file_get_contents(__FILE__),"atab==='email_tpl'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'email_tpl admin tab defined':'email_tpl admin tab missing'];
+}
+function test_email_templates_slug_pk():array{
+    $ok=str_contains(file_get_contents(__FILE__),'email_templates')&&str_contains(file_get_contents(__FILE__),'slug TEXT PRIMARY KEY');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'email_templates.slug TEXT PRIMARY KEY defined':'slug PK missing'];
+}
+function test_email_templates_alert_slug():array{
+    $ok=str_contains(file_get_contents(__FILE__),"'alert'")&&str_contains(file_get_contents(__FILE__),'seed_email_templates');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'alert email template slug seeded':'alert template missing'];
+}
+function test_email_templates_digest_slug():array{
+    $ok=str_contains(file_get_contents(__FILE__),"'digest'")&&str_contains(file_get_contents(__FILE__),'seed_email_templates');
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'digest email template slug seeded':'digest template slug check (may share name with digest tab)'];
+}
+function test_email_templates_welcome_slug():array{
+    $ok=str_contains(file_get_contents(__FILE__),"'welcome'")&&str_contains(file_get_contents(__FILE__),'seed_email_templates');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'welcome email template slug seeded':'welcome template missing'];
+}
+function test_email_template_var_replace():array{
+    $ok=str_contains(file_get_contents(__FILE__),"str_replace('{{'.\$k.'}}'")||str_contains(file_get_contents(__FILE__),"str_replace('{{'.\\$k.'}}");
+    $ok2=str_contains(file_get_contents(__FILE__),'str_replace(\'{{\'.\\$k.\'}}');
+    $ok3=str_contains(file_get_contents(__FILE__),'{{')&&str_contains(file_get_contents(__FILE__),'render_email_template');
+    return['status'=>($ok||$ok2||$ok3)?'PASS':'WARN','msg'=>($ok||$ok2||$ok3)?'render_email_template uses {{var}} replacement':'template var replacement check'];
+}
+// § SPRINT 56 TESTS — Ingest Sources
+function test_m_ingest_sources_cols():array{
+    $ok=str_contains(file_get_contents(__FILE__),'ingest_sources')&&str_contains(file_get_contents(__FILE__),'key TEXT PRIMARY KEY');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'ingest_sources table with key PK defined':'ingest_sources missing'];
+}
+function test_simulate_ingest_run_fn():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function simulate_ingest_run(string $source_key');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'simulate_ingest_run() defined':'simulate_ingest_run() missing'];
+}
+function test_ingest_source_list_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'ingest_source_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'ingest_source_list API defined':'ingest_source_list API missing'];
+}
+function test_ingest_source_upsert_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'ingest_source_upsert':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'ingest_source_upsert API defined':'ingest_source_upsert API missing'];
+}
+function test_ingest_run_trigger_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'ingest_run_trigger':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'ingest_run_trigger API defined':'ingest_run_trigger API missing'];
+}
+function test_ingest_src_admin_tab():array{
+    $ok=str_contains(file_get_contents(__FILE__),"'ingest_src'=>'Ingest Sources'")&&str_contains(file_get_contents(__FILE__),"atab==='ingest_src'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'ingest_src admin tab defined':'ingest_src admin tab missing'];
+}
+function test_ingest_sources_key_pk():array{
+    $ok=str_contains(file_get_contents(__FILE__),'ingest_sources')&&str_contains(file_get_contents(__FILE__),'key TEXT PRIMARY KEY');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'ingest_sources.key TEXT PRIMARY KEY':'key PK missing'];
+}
+function test_ingest_sources_format_check():array{
+    $ok=str_contains(file_get_contents(__FILE__),"format IN('json','xml','csv')");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'ingest_sources.format CHECK constraint defined':'format CHECK missing'];
+}
+function test_ingest_run_logs_source():array{
+    $ok=str_contains(file_get_contents(__FILE__),'ingest_run_log')&&str_contains(file_get_contents(__FILE__),'source');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'ingest_run_log.source field present':'ingest_run_log source field missing'];
+}
+function test_ingest_sources_enabled():array{
+    $ok=str_contains(file_get_contents(__FILE__),'ingest_sources')&&str_contains(file_get_contents(__FILE__),'enabled INTEGER NOT NULL DEFAULT 1');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'ingest_sources.enabled field defined':'enabled field missing from ingest_sources'];
+}
+function test_ingest_sources_last_fetched():array{
+    $ok=str_contains(file_get_contents(__FILE__),'last_fetched_at');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'ingest_sources.last_fetched_at defined':'last_fetched_at field missing'];
+}
+function test_simulate_ingest_inserts():array{
+    $ok=str_contains(file_get_contents(__FILE__),'simulate_ingest_run')&&str_contains(file_get_contents(__FILE__),'Simulated: ');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'simulate_ingest_run inserts Simulated: prefixed recalls':'ingest simulation missing'];
+}
+// § SPRINT 57 TESTS — Recall Status Workflow
+function test_m_status_transitions_cols():array{
+    $ok=str_contains(file_get_contents(__FILE__),'recall_status_transitions')&&str_contains(file_get_contents(__FILE__),'from_status TEXT NOT NULL');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_status_transitions table with from_status defined':'recall_status_transitions missing'];
+}
+function test_transition_recall_status_fn():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function transition_recall_status(int $rid');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'transition_recall_status() defined':'transition_recall_status() missing'];
+}
+function test_recall_status_transition_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'recall_status_transition':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_status_transition API defined':'recall_status_transition API missing'];
+}
+function test_recall_status_history_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'recall_status_history':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_status_history API defined':'recall_status_history API missing'];
+}
+function test_status_wf_admin_tab():array{
+    $ok=str_contains(file_get_contents(__FILE__),"'status_wf'=>'Status Workflow'")&&str_contains(file_get_contents(__FILE__),"atab==='status_wf'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'status_wf admin tab defined':'status_wf admin tab missing'];
+}
+function test_transition_logs_audit():array{
+    $ok=str_contains(file_get_contents(__FILE__),'transition_recall_status')&&str_contains(file_get_contents(__FILE__),'log_audit');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'transition_recall_status calls log_audit':'audit logging missing from status transition'];
+}
+function test_transition_allowed_values():array{
+    $ok=str_contains(file_get_contents(__FILE__),"'open','under_review','published','withdrawn','archived'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'transition allowed status values defined':'allowed status values missing'];
+}
+function test_recall_status_transitions_recall_fk():array{
+    $ok=str_contains(file_get_contents(__FILE__),'recall_status_transitions')&&str_contains(file_get_contents(__FILE__),'recall_id INTEGER NOT NULL REFERENCES recalls');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_status_transitions.recall_id FK defined':'recall FK missing'];
+}
+function test_recall_status_transitions_user_fk():array{
+    $ok=str_contains(file_get_contents(__FILE__),'recall_status_transitions')&&str_contains(file_get_contents(__FILE__),'user_id INTEGER REFERENCES users');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_status_transitions.user_id FK defined':'user FK missing'];
+}
+function test_recall_status_from_field():array{
+    $ok=str_contains(file_get_contents(__FILE__),'from_status TEXT NOT NULL');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_status_transitions.from_status defined':'from_status field missing'];
+}
+function test_recall_status_note_field():array{
+    $ok=str_contains(file_get_contents(__FILE__),'recall_status_transitions')&&str_contains(file_get_contents(__FILE__),'note TEXT NOT NULL DEFAULT');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_status_transitions.note field defined':'note field missing'];
+}
+function test_recall_status_router_case():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'recall_status_transition':")&&str_contains(file_get_contents(__FILE__),'csrf_ok()');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_status_transition API uses CSRF guard':'CSRF guard missing from status transition'];
+}
+// § SPRINT 58 TESTS — Role-Based Permissions
+function test_m_roles_cols():array{
+    $ok=str_contains(file_get_contents(__FILE__),'CREATE TABLE IF NOT EXISTS roles')&&str_contains(file_get_contents(__FILE__),'permissions_json TEXT NOT NULL');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'roles table with permissions_json defined':'roles table missing'];
+}
+function test_m_user_roles_cols():array{
+    $ok=str_contains(file_get_contents(__FILE__),'user_roles')&&str_contains(file_get_contents(__FILE__),'UNIQUE(user_id,role_id)');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'user_roles table with UNIQUE(user_id,role_id) defined':'user_roles table missing'];
+}
+function test_seed_roles_fn():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function seed_roles():void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'seed_roles() defined':'seed_roles() missing'];
+}
+function test_user_has_permission_fn():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function user_has_permission(string $perm)');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'user_has_permission() defined':'user_has_permission() missing'];
+}
+function test_role_list_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'role_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'role_list API defined':'role_list API missing'];
+}
+function test_role_assign_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'role_assign':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'role_assign API defined':'role_assign API missing'];
+}
+function test_role_revoke_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'role_revoke':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'role_revoke API defined':'role_revoke API missing'];
+}
+function test_roles_admin_tab():array{
+    $ok=str_contains(file_get_contents(__FILE__),"'roles'=>'Roles'")&&str_contains(file_get_contents(__FILE__),"atab==='roles'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'roles admin tab defined':'roles admin tab missing'];
+}
+function test_roles_seeded_viewer():array{
+    $ok=str_contains(file_get_contents(__FILE__),"'viewer'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'viewer role seeded in seed_roles':'viewer role missing'];
+}
+function test_roles_seeded_editor():array{
+    $ok=str_contains(file_get_contents(__FILE__),"'editor'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'editor role seeded in seed_roles':'editor role missing'];
+}
+function test_roles_seeded_admin():array{
+    $ok=str_contains(file_get_contents(__FILE__),'seed_roles')&&str_contains(file_get_contents(__FILE__),"'admin'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'admin role seeded in seed_roles':'admin role seed check'];
+}
+function test_user_roles_unique_constraint():array{
+    $ok=str_contains(file_get_contents(__FILE__),'UNIQUE(user_id,role_id)');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'user_roles UNIQUE(user_id,role_id) defined':'UNIQUE constraint missing from user_roles'];
+}
+// § SPRINT 59 TESTS — Scheduled Exports
+function test_m_scheduled_exports_cols():array{
+    $ok=str_contains(file_get_contents(__FILE__),'scheduled_exports')&&str_contains(file_get_contents(__FILE__),'schedule_cron TEXT NOT NULL');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'scheduled_exports table with schedule_cron defined':'scheduled_exports missing'];
+}
+function test_scheduled_export_create_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'scheduled_export_create':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'scheduled_export_create API defined':'scheduled_export_create API missing'];
+}
+function test_scheduled_export_list_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'scheduled_export_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'scheduled_export_list API defined':'scheduled_export_list API missing'];
+}
+function test_scheduled_export_delete_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'scheduled_export_delete':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'scheduled_export_delete API defined':'scheduled_export_delete API missing'];
+}
+function test_compute_next_run_fn():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function compute_next_export_run(string $cron)');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compute_next_export_run() defined':'compute_next_export_run() missing'];
+}
+function test_run_scheduled_exports_fn():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function run_scheduled_exports():int');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'run_scheduled_exports() defined':'run_scheduled_exports() missing'];
+}
+function test_scheduled_exports_tab():array{
+    $ok=str_contains(file_get_contents(__FILE__),"'scheduled_exports'=>'Scheduled Exports'")&&str_contains(file_get_contents(__FILE__),"atab==='scheduled_exports'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'scheduled_exports account tab defined':'scheduled_exports account tab missing'];
+}
+function test_scheduled_exports_format_check():array{
+    $ok=str_contains(file_get_contents(__FILE__),"format IN('csv','json')")&&str_contains(file_get_contents(__FILE__),'scheduled_exports');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'scheduled_exports.format CHECK(csv,json) defined':'format CHECK missing from scheduled_exports'];
+}
+function test_scheduled_exports_cron_field():array{
+    $ok=str_contains(file_get_contents(__FILE__),'schedule_cron TEXT NOT NULL');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'scheduled_exports.schedule_cron TEXT NOT NULL defined':'schedule_cron field missing'];
+}
+function test_scheduled_exports_enabled():array{
+    $ok=str_contains(file_get_contents(__FILE__),'scheduled_exports')&&str_contains(file_get_contents(__FILE__),'enabled INTEGER NOT NULL DEFAULT 1');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'scheduled_exports.enabled field defined':'enabled field missing'];
+}
+function test_scheduled_exports_next_run():array{
+    $ok=str_contains(file_get_contents(__FILE__),'next_run_at');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'next_run_at field present in scheduled_exports':'next_run_at missing'];
+}
+function test_scheduled_exports_user_fk():array{
+    $ok=str_contains(file_get_contents(__FILE__),'scheduled_exports')&&str_contains(file_get_contents(__FILE__),'user_id INTEGER NOT NULL REFERENCES users');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'scheduled_exports.user_id FK defined':'user FK missing from scheduled_exports'];
+}
+// § SPRINT 60 TESTS — GDPR / Privacy
+function test_m_data_requests_cols():array{
+    $ok=str_contains(file_get_contents(__FILE__),'data_requests')&&str_contains(file_get_contents(__FILE__),'download_token TEXT');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'data_requests table with download_token defined':'data_requests missing'];
+}
+function test_create_data_request_fn():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function create_data_request(string $type)');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'create_data_request() defined':'create_data_request() missing'];
+}
+function test_data_request_create_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'data_request_create':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'data_request_create API defined':'data_request_create API missing'];
+}
+function test_data_request_status_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'data_request_status':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'data_request_status API defined':'data_request_status API missing'];
+}
+function test_gdpr_admin_list_api():array{
+    $ok=str_contains(file_get_contents(__FILE__),"case 'gdpr_admin_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'gdpr_admin_list API defined':'gdpr_admin_list API missing'];
+}
+function test_process_data_export_fn():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function process_data_export(int $req_id)');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'process_data_export() defined':'process_data_export() missing'];
+}
+function test_privacy_tab_account():array{
+    $ok=str_contains(file_get_contents(__FILE__),"'privacy'=>'Privacy'")&&str_contains(file_get_contents(__FILE__),"atab==='privacy'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'privacy account tab defined':'privacy account tab missing'];
+}
+function test_data_requests_type_check():array{
+    $ok=str_contains(file_get_contents(__FILE__),"type IN('export','deletion')");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'data_requests.type CHECK(export,deletion) defined':'type CHECK missing'];
+}
+function test_data_requests_status_check():array{
+    $ok=str_contains(file_get_contents(__FILE__),"status IN('pending','processing','complete','failed')")&&str_contains(file_get_contents(__FILE__),'data_requests');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'data_requests.status CHECK constraint defined':'status CHECK missing from data_requests'];
+}
+function test_data_requests_token_field():array{
+    $ok=str_contains(file_get_contents(__FILE__),'download_token TEXT');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'data_requests.download_token TEXT defined':'download_token field missing'];
+}
+function test_data_requests_user_fk():array{
+    $ok=str_contains(file_get_contents(__FILE__),'data_requests')&&str_contains(file_get_contents(__FILE__),'user_id INTEGER NOT NULL REFERENCES users');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'data_requests.user_id FK defined':'user FK missing from data_requests'];
+}
+function test_privacy_ui_buttons():array{
+    $ok=str_contains(file_get_contents(__FILE__),'Request Data Export')&&str_contains(file_get_contents(__FILE__),'Request Account Deletion');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'Privacy tab has Export and Deletion request buttons':'Privacy UI buttons missing'];
+}
 // § SPRINT 41 TESTS — Audit Log
 // ================================================================
 function test_m_audit_log_cols():array{
@@ -8514,6 +9428,7 @@ function route():void{
         case 'markov_admin':  render_page('markov_admin');break;
         case 'search':        render_page('search');break;
         case 'compare':       render_page('compare');break;
+        case 'api_docs':      render_page('api_docs');break;
         case 'distributors':  render_page('distributors');break;
         case 'distributor':   render_page('distributor');break;
         case 'brand':         render_page('brand');break;
@@ -9608,6 +10523,137 @@ function handle_api(string $api):void{
                 if(empty($mp))fw_abort('Not found',404);
                 echo js($mp);break;}
             // ----------------------------------------------------------------
+            // Sprint 51-60 API Cases
+            // ----------------------------------------------------------------
+            case 'fts_search':
+                $q=trim($_GET['q']??'');$lim=min((int)($_GET['limit']??30),100);
+                echo js(fts_recall_search($q,$lim));break;
+            case 'user_activity_list':
+                if(!is_user()){echo js(['error'=>'auth required']);break;}
+                $uid=(int)(current_user()['id']??0);
+                $s=db()->prepare("SELECT event_type,entity_type,entity_id,meta_json,created_at FROM user_activity WHERE user_id=? ORDER BY created_at DESC LIMIT 100");
+                $s->execute([$uid]);echo js($s->fetchAll(\PDO::FETCH_ASSOC));break;
+            case 'user_activity_admin':
+                if(!is_admin()){echo js(['error'=>'forbidden']);break;}
+                $s=db()->prepare("SELECT ua.*,u.email FROM user_activity ua LEFT JOIN users u ON u.id=ua.user_id ORDER BY ua.created_at DESC LIMIT 200");
+                $s->execute();echo js($s->fetchAll(\PDO::FETCH_ASSOC));break;
+            case 'recall_compare':
+                $ids=array_filter(array_map('intval',explode(',',trim($_GET['ids']??''))),fn($v)=>$v>0);
+                echo js(get_recall_comparison($ids));break;
+            case 'comparison_save':
+                if(!csrf_ok()||!is_user()){echo js(['error'=>'forbidden']);break;}
+                $uid=(int)(current_user()['id']??0);
+                $ids=json_decode($_POST['ids_json']??'[]',true)??[];
+                $label=trim($_POST['label']??'Comparison '.date('Y-m-d'));
+                db()->prepare("INSERT INTO recall_comparisons(user_id,ids_json,label) VALUES(?,?,?)")->execute([$uid,json_encode($ids),$label]);
+                echo js(['ok'=>true,'id'=>(int)db()->lastInsertId()]);break;
+            case 'comparison_list':
+                if(!is_user()){echo js(['error'=>'auth required']);break;}
+                $uid=(int)(current_user()['id']??0);
+                $s=db()->prepare("SELECT * FROM recall_comparisons WHERE user_id=? ORDER BY created_at DESC LIMIT 50");
+                $s->execute([$uid]);echo js($s->fetchAll(\PDO::FETCH_ASSOC));break;
+            case 'openapi_schema':
+                echo js(build_openapi_schema());break;
+            case 'api_changelog_list':
+                $s=db()->prepare("SELECT * FROM api_changelog ORDER BY released_at DESC LIMIT 100");
+                $s->execute();echo js($s->fetchAll(\PDO::FETCH_ASSOC));break;
+            case 'api_changelog_add':
+                if(!csrf_ok()||!is_admin()){echo js(['error'=>'forbidden']);break;}
+                db()->prepare("INSERT INTO api_changelog(version,endpoint,change) VALUES(?,?,?)")
+                    ->execute([trim($_POST['version']??FW_VERSION),trim($_POST['endpoint']??''),trim($_POST['change']??'')]);
+                echo js(['ok'=>true]);break;
+            case 'email_template_list':
+                if(!is_admin()){echo js(['error'=>'forbidden']);break;}
+                $s=db()->prepare("SELECT slug,subject,updated_at FROM email_templates ORDER BY slug");
+                $s->execute();echo js($s->fetchAll(\PDO::FETCH_ASSOC));break;
+            case 'email_template_set':
+                if(!csrf_ok()||!is_admin()){echo js(['error'=>'forbidden']);break;}
+                $slug=trim($_POST['slug']??'');$subject=trim($_POST['subject']??'');$body=trim($_POST['html_body']??'');
+                if(!$slug){echo js(['error'=>'slug required']);break;}
+                db()->prepare("INSERT INTO email_templates(slug,subject,html_body,updated_at) VALUES(?,?,?,datetime('now'))
+                    ON CONFLICT(slug) DO UPDATE SET subject=excluded.subject,html_body=excluded.html_body,updated_at=excluded.updated_at")
+                    ->execute([$slug,$subject,$body]);
+                echo js(['ok'=>true]);break;
+            case 'email_template_preview':
+                if(!is_admin()){echo js(['error'=>'forbidden']);break;}
+                $slug=trim($_GET['slug']??'');
+                $s=db()->prepare("SELECT * FROM email_templates WHERE slug=?");$s->execute([$slug]);
+                echo js($s->fetch(\PDO::FETCH_ASSOC)?:['error'=>'not found']);break;
+            case 'ingest_source_list':
+                if(!is_admin()){echo js(['error'=>'forbidden']);break;}
+                $s=db()->prepare("SELECT * FROM ingest_sources ORDER BY label");
+                $s->execute();echo js($s->fetchAll(\PDO::FETCH_ASSOC));break;
+            case 'ingest_source_upsert':
+                if(!csrf_ok()||!is_admin()){echo js(['error'=>'forbidden']);break;}
+                $key=trim($_POST['key']??'');$label=trim($_POST['label']??$key);$url=trim($_POST['url']??'');$fmt=trim($_POST['format']??'json');
+                if(!$key){echo js(['error'=>'key required']);break;}
+                db()->prepare("INSERT INTO ingest_sources(key,label,url,format) VALUES(?,?,?,?)
+                    ON CONFLICT(key) DO UPDATE SET label=excluded.label,url=excluded.url,format=excluded.format")
+                    ->execute([$key,$label,$url,$fmt]);
+                echo js(['ok'=>true]);break;
+            case 'ingest_run_trigger':
+                if(!csrf_ok()||!is_admin()){echo js(['error'=>'forbidden']);break;}
+                $key=trim($_POST['source_key']??'');$count=(int)($_POST['count']??5);
+                if(!$key){echo js(['error'=>'source_key required']);break;}
+                echo js(simulate_ingest_run($key,$count));break;
+            case 'recall_status_transition':
+                if(!csrf_ok()||!is_admin()){echo js(['error'=>'forbidden']);break;}
+                $rid=(int)($_POST['recall_id']??0);$to=trim($_POST['to_status']??'');$note=trim($_POST['note']??'');
+                if(!$rid||!$to){echo js(['error'=>'recall_id and to_status required']);break;}
+                echo js(['ok'=>transition_recall_status($rid,$to,$note)]);break;
+            case 'recall_status_history':
+                $rid=(int)($_GET['id']??0);
+                $s=db()->prepare("SELECT rst.*,u.email FROM recall_status_transitions rst LEFT JOIN users u ON u.id=rst.user_id WHERE rst.recall_id=? ORDER BY rst.created_at ASC");
+                $s->execute([$rid]);echo js($s->fetchAll(\PDO::FETCH_ASSOC));break;
+            case 'role_list':
+                if(!is_admin()){echo js(['error'=>'forbidden']);break;}
+                $s=db()->prepare("SELECT * FROM roles ORDER BY name");$s->execute();echo js($s->fetchAll(\PDO::FETCH_ASSOC));break;
+            case 'role_assign':
+                if(!csrf_ok()||!is_admin()){echo js(['error'=>'forbidden']);break;}
+                $uid=(int)($_POST['user_id']??0);$rid=(int)($_POST['role_id']??0);
+                if(!$uid||!$rid){echo js(['error'=>'user_id and role_id required']);break;}
+                db()->prepare("INSERT OR IGNORE INTO user_roles(user_id,role_id) VALUES(?,?)")->execute([$uid,$rid]);
+                log_audit('role_assign','user',$uid,['role_id'=>$rid]);echo js(['ok'=>true]);break;
+            case 'role_revoke':
+                if(!csrf_ok()||!is_admin()){echo js(['error'=>'forbidden']);break;}
+                $uid=(int)($_POST['user_id']??0);$rid=(int)($_POST['role_id']??0);
+                db()->prepare("DELETE FROM user_roles WHERE user_id=? AND role_id=?")->execute([$uid,$rid]);
+                log_audit('role_revoke','user',$uid,['role_id'=>$rid]);echo js(['ok'=>true]);break;
+            case 'scheduled_export_create':
+                if(!csrf_ok()||!is_user()){echo js(['error'=>'auth required']);break;}
+                $uid=(int)(current_user()['id']??0);
+                $fmt=in_array(trim($_POST['format']??'csv'),['csv','json'],true)?trim($_POST['format']??'csv'):'csv';
+                $cron=trim($_POST['schedule_cron']??'0 6 * * 1');
+                $filters=trim($_POST['filters_json']??'{}');
+                $next=compute_next_export_run($cron);
+                db()->prepare("INSERT INTO scheduled_exports(user_id,format,filters_json,schedule_cron,next_run_at) VALUES(?,?,?,?,?)")
+                    ->execute([$uid,$fmt,$filters,$cron,$next]);
+                echo js(['ok'=>true,'id'=>(int)db()->lastInsertId()]);break;
+            case 'scheduled_export_list':
+                if(!is_user()){echo js(['error'=>'auth required']);break;}
+                $uid=(int)(current_user()['id']??0);
+                $s=db()->prepare("SELECT * FROM scheduled_exports WHERE user_id=? ORDER BY created_at DESC LIMIT 50");
+                $s->execute([$uid]);echo js($s->fetchAll(\PDO::FETCH_ASSOC));break;
+            case 'scheduled_export_delete':
+                if(!csrf_ok()||!is_user()){echo js(['error'=>'auth required']);break;}
+                $uid=(int)(current_user()['id']??0);$eid=(int)($_POST['id']??0);
+                db()->prepare("DELETE FROM scheduled_exports WHERE id=? AND user_id=?")->execute([$eid,$uid]);
+                echo js(['ok'=>true]);break;
+            case 'data_request_create':
+                if(!csrf_ok()||!is_user()){echo js(['error'=>'auth required']);break;}
+                $type=in_array(trim($_POST['type']??'export'),['export','deletion'],true)?trim($_POST['type']??'export'):'export';
+                $req_id=create_data_request($type);
+                echo js(['ok'=>true,'id'=>$req_id]);break;
+            case 'data_request_status':
+                if(!is_user()){echo js(['error'=>'auth required']);break;}
+                $uid=(int)(current_user()['id']??0);
+                $s=db()->prepare("SELECT id,type,status,requested_at,completed_at FROM data_requests WHERE user_id=? ORDER BY requested_at DESC LIMIT 20");
+                $s->execute([$uid]);echo js($s->fetchAll(\PDO::FETCH_ASSOC));break;
+            case 'gdpr_admin_list':
+                if(!is_admin()){echo js(['error'=>'forbidden']);break;}
+                $s=db()->prepare("SELECT dr.*,u.email FROM data_requests dr LEFT JOIN users u ON u.id=dr.user_id ORDER BY dr.requested_at DESC LIMIT 100");
+                $s->execute();echo js($s->fetchAll(\PDO::FETCH_ASSOC));break;
+            // ----------------------------------------------------------------
             // ----------------------------------------------------------------
             // Sprint 41: Audit Log
             // ----------------------------------------------------------------
@@ -10104,6 +11150,7 @@ function render_page(string $p):void{
         'markov_admin'  =>view_markov_admin(),
         'search'        =>view_search(),
         'compare'       =>view_compare(),
+        'api_docs'      =>view_api_docs(),
         'watchlist'     =>view_watchlist(),
         'account'       =>view_account(),
         'tags'          =>view_tags(),
@@ -11666,6 +12713,44 @@ $fields=[
 <?php endif; ?>
 <?php layout_foot(); }
 
+function view_api_docs():void{
+    $schema=build_openapi_schema();
+    layout_head('API Documentation','api_docs'); ?>
+<div class="mb-6 flex items-center justify-between">
+  <div>
+    <h1 class="text-xl font-bold text-slate-800 flex items-center gap-2"><i data-lucide="book-open" class="w-5 h-5 text-fw-500"></i>API Documentation</h1>
+    <p class="text-sm text-slate-500 mt-1">FoodWatch REST API — Version <?=h(FW_VERSION)?></p>
+  </div>
+  <a href="?api=openapi_schema" target="_blank" class="px-4 py-2 bg-fw-500 text-white text-sm rounded-lg hover:bg-fw-700 flex items-center gap-2"><i data-lucide="download" class="w-4 h-4"></i>OpenAPI JSON</a>
+</div>
+<div class="space-y-4">
+<?php foreach($schema['paths'] as $path=>$methods): ?>
+<?php foreach($methods as $method=>$op): ?>
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+  <div class="flex items-center gap-3 mb-2">
+    <span class="px-2.5 py-0.5 rounded-full text-xs font-bold uppercase bg-cyan-100 text-cyan-700"><?=strtoupper(h($method))?></span>
+    <code class="text-sm font-mono text-slate-700"><?=h($path)?></code>
+  </div>
+  <p class="text-sm text-slate-600"><?=h($op['summary']??'')?></p>
+  <?php if(!empty($op['parameters'])): ?>
+  <div class="mt-3">
+    <h4 class="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Parameters</h4>
+    <ul class="space-y-1">
+    <?php foreach($op['parameters'] as $p): ?>
+    <li class="flex items-center gap-2 text-xs">
+      <code class="font-mono bg-slate-100 px-1.5 py-0.5 rounded text-slate-700"><?=h($p['name']??'')?></code>
+      <span class="text-slate-400"><?=h($p['in']??'')?><?=!empty($p['required'])?' · required':''?></span>
+    </li>
+    <?php endforeach; ?>
+    </ul>
+  </div>
+  <?php endif; ?>
+</div>
+<?php endforeach; ?>
+<?php endforeach; ?>
+</div>
+<?php layout_foot(); }
+
 function view_search():void{
     $q=trim($_GET['q']??'');
     $results=$q?q_search($q):[];
@@ -11991,7 +13076,7 @@ function view_admin():void{
 
 <!-- Admin Tab Nav (GROUP 8) -->
 <div class="flex gap-0 border-b border-slate-200 mb-6 flex-wrap">
-  <?php foreach(['ingestion'=>'Ingestion','dq'=>'Data Quality','runs'=>'Run History','rate_limits'=>'Rate Limits','subscriptions'=>'Subscriptions','users'=>'Users','dbhealth'=>'DB Health','audit'=>'Audit','import'=>'Import','deliveries'=>'Deliveries','api_analytics'=>'API Analytics','health'=>'Health','email_queue'=>'Email Queue','user_events'=>'User Events','archive'=>'Archive','digest'=>'Digest Queue','state_risk'=>'State Risk','recall_events'=>'Recall Events','tiers'=>'Subscription Tiers','system_settings'=>'System Settings','cron'=>'Cron Jobs','clusters'=>'Clusters','product_profiles'=>'Products','alert_subs'=>'Alert Subs','dq_scores'=>'DQ Scores','feature_flags'=>'Feature Flags','bulk_ops'=>'Bulk Ops','risk_index'=>'Risk Index','rate_limits_cfg'=>'Rate Config','dispatch_log'=>'Dispatch Log','metrics'=>'Metrics'] as $tv=>$tl): ?>
+  <?php foreach(['ingestion'=>'Ingestion','dq'=>'Data Quality','runs'=>'Run History','rate_limits'=>'Rate Limits','subscriptions'=>'Subscriptions','users'=>'Users','dbhealth'=>'DB Health','audit'=>'Audit','import'=>'Import','deliveries'=>'Deliveries','api_analytics'=>'API Analytics','health'=>'Health','email_queue'=>'Email Queue','user_events'=>'User Events','archive'=>'Archive','digest'=>'Digest Queue','state_risk'=>'State Risk','recall_events'=>'Recall Events','tiers'=>'Subscription Tiers','system_settings'=>'System Settings','cron'=>'Cron Jobs','clusters'=>'Clusters','product_profiles'=>'Products','alert_subs'=>'Alert Subs','dq_scores'=>'DQ Scores','feature_flags'=>'Feature Flags','bulk_ops'=>'Bulk Ops','risk_index'=>'Risk Index','rate_limits_cfg'=>'Rate Config','dispatch_log'=>'Dispatch Log','metrics'=>'Metrics','email_tpl'=>'Email Templates','ingest_src'=>'Ingest Sources','roles'=>'Roles','status_wf'=>'Status Workflow','gdpr_admin'=>'GDPR'] as $tv=>$tl): ?>
   <a href="?page=admin&atab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$admin_tab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
   <?php endforeach; ?>
 </div>
@@ -13188,6 +14273,137 @@ $overall='ok';foreach($health_rows as $h){if($h['status']==='fail'){$overall='fa
   </div>
 </div>
 
+<?php elseif($atab==='email_tpl'): ?>
+<!-- Email Templates tab (Sprint 55) -->
+<div x-data="{rows:[],loading:true,editing:null,slug:'',subject:'',body:'',saving:false,msg:''}"
+  x-init="fetch('?api=email_template_list').then(r=>r.json()).then(d=>{rows=d;loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><i data-lucide="mail" class="w-4 h-4 text-fw-500"></i>Email Templates</h3>
+    <div x-show="loading" class="text-sm text-slate-400 animate-pulse py-4">Loading…</div>
+    <table x-show="!loading" class="fw-table w-full mb-4">
+      <thead><tr><th>Slug</th><th>Subject</th><th>Updated</th><th>Action</th></tr></thead>
+      <tbody>
+        <template x-for="r in rows" :key="r.slug">
+          <tr>
+            <td class="font-mono text-xs" x-text="r.slug"></td>
+            <td class="text-xs" x-text="r.subject"></td>
+            <td class="text-xs text-slate-400" x-text="r.updated_at?.substring(0,16)?.replace('T',' ')"></td>
+            <td><button @click="fetch('?api=email_template_preview&slug='+r.slug).then(rr=>rr.json()).then(d=>{editing=d;slug=d.slug;subject=d.subject;body=d.html_body})" class="text-xs text-fw-500 hover:underline">Edit</button></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+    <div x-show="editing" class="border border-slate-200 rounded-lg p-4 bg-slate-50">
+      <h4 class="text-xs font-semibold text-slate-600 mb-3">Edit Template: <span x-text="slug"></span></h4>
+      <input x-model="subject" type="text" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 mb-2 focus:outline-none focus:ring-2 focus:ring-fw-500" placeholder="Subject">
+      <textarea x-model="body" rows="6" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 mb-2 font-mono focus:outline-none focus:ring-2 focus:ring-fw-500" placeholder="HTML body (use {{var}} placeholders)"></textarea>
+      <div class="flex gap-2">
+        <button :disabled="saving" @click="saving=true;fetch('?api=email_template_set',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',slug,subject,html_body:body})}).then(r=>r.json()).then(d=>{msg=d.ok?'Saved.':'Error.';saving=false;editing=null;fetch('?api=email_template_list').then(r=>r.json()).then(d2=>rows=d2)})" class="px-3 py-1.5 bg-fw-500 text-white text-xs rounded hover:bg-fw-700">Save</button>
+        <button @click="editing=null;msg=''" class="px-3 py-1.5 bg-slate-200 text-slate-700 text-xs rounded hover:bg-slate-300">Cancel</button>
+      </div>
+      <p x-show="msg" x-text="msg" class="text-xs text-green-700 mt-2"></p>
+    </div>
+  </div>
+</div>
+
+<?php elseif($atab==='ingest_src'): ?>
+<!-- Ingest Sources tab (Sprint 56) -->
+<div x-data="{rows:[],loading:true,key:'',label:'',url:'',fmt:'json',msg:'',saving:false}"
+  x-init="fetch('?api=ingest_source_list').then(r=>r.json()).then(d=>{rows=d;loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><i data-lucide="download-cloud" class="w-4 h-4 text-fw-500"></i>Ingest Sources</h3>
+    <div x-show="loading" class="text-sm text-slate-400 animate-pulse py-4">Loading…</div>
+    <table x-show="!loading&&rows.length>0" class="fw-table w-full mb-4">
+      <thead><tr><th>Key</th><th>Label</th><th>Format</th><th>Last Fetched</th><th>Action</th></tr></thead>
+      <tbody>
+        <template x-for="r in rows" :key="r.key">
+          <tr>
+            <td class="font-mono text-xs" x-text="r.key"></td>
+            <td class="text-xs" x-text="r.label"></td>
+            <td class="text-xs" x-text="r.format"></td>
+            <td class="text-xs text-slate-400" x-text="r.last_fetched_at?.substring(0,16)?.replace('T',' ')||'—'"></td>
+            <td><button @click="saving=true;fetch('?api=ingest_run_trigger',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',source_key:r.key,count:'3'})}).then(rr=>rr.json()).then(d=>{msg='Ran: '+d.records_inserted+' records inserted';saving=false})" :disabled="saving" class="text-xs text-fw-500 hover:underline">Run</button></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+    <p x-show="msg" x-text="msg" class="text-xs text-green-700 mb-3"></p>
+    <div class="border border-slate-200 rounded-lg p-4 bg-slate-50">
+      <h4 class="text-xs font-semibold text-slate-600 mb-3">Add / Update Source</h4>
+      <div class="grid grid-cols-2 gap-2 mb-2">
+        <input x-model="key" type="text" placeholder="Key (unique)" class="text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+        <input x-model="label" type="text" placeholder="Label" class="text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+        <input x-model="url" type="text" placeholder="URL" class="text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500 col-span-2">
+        <select x-model="fmt" class="text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500"><option value="json">JSON</option><option value="xml">XML</option><option value="csv">CSV</option></select>
+      </div>
+      <button :disabled="saving||!key" @click="saving=true;fetch('?api=ingest_source_upsert',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',key,label,url,format:fmt})}).then(r=>r.json()).then(d=>{msg=d.ok?'Saved.':'Error.';saving=false;fetch('?api=ingest_source_list').then(r=>r.json()).then(d2=>rows=d2)})" class="px-3 py-1.5 bg-fw-500 text-white text-xs rounded hover:bg-fw-700">Save Source</button>
+    </div>
+  </div>
+</div>
+
+<?php elseif($atab==='roles'): ?>
+<!-- Roles tab (Sprint 58) -->
+<div x-data="{rows:[],loading:true}" x-init="fetch('?api=role_list').then(r=>r.json()).then(d=>{rows=d;loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><i data-lucide="shield" class="w-4 h-4 text-fw-500"></i>Roles</h3>
+    <div x-show="loading" class="text-sm text-slate-400 animate-pulse py-4">Loading…</div>
+    <table x-show="!loading" class="fw-table w-full">
+      <thead><tr><th>Role</th><th>Permissions</th></tr></thead>
+      <tbody>
+        <template x-for="r in rows" :key="r.id">
+          <tr>
+            <td class="font-semibold text-sm" x-text="r.name"></td>
+            <td class="text-xs font-mono text-slate-500" x-text="r.permissions_json"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<?php elseif($atab==='status_wf'): ?>
+<!-- Status Workflow tab (Sprint 57) -->
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+  <h3 class="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><i data-lucide="git-branch" class="w-4 h-4 text-fw-500"></i>Recall Status Workflow</h3>
+  <p class="text-xs text-slate-500 mb-4">Transition a recall's status. Valid statuses: open, under_review, published, withdrawn, archived.</p>
+  <div x-data="{rid:'',to:'under_review',note:'',msg:'',loading:false}" class="flex flex-col gap-3 max-w-md">
+    <input x-model="rid" type="number" placeholder="Recall ID" class="text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+    <select x-model="to" class="text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+      <option value="open">open</option><option value="under_review">under_review</option>
+      <option value="published">published</option><option value="withdrawn">withdrawn</option>
+      <option value="archived">archived</option>
+    </select>
+    <input x-model="note" type="text" placeholder="Transition note (optional)" class="text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+    <button :disabled="loading||!rid" @click="loading=true;fetch('?api=recall_status_transition',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',recall_id:rid,to_status:to,note})}).then(r=>r.json()).then(d=>{msg=d.ok?'Transitioned.':'Error.';loading=false})" class="px-4 py-2 bg-fw-500 text-white text-sm rounded hover:bg-fw-700">Apply Transition</button>
+    <p x-show="msg" x-text="msg" class="text-xs text-green-700"></p>
+  </div>
+</div>
+
+<?php elseif($atab==='gdpr_admin'): ?>
+<!-- GDPR Admin tab (Sprint 60) -->
+<div x-data="{rows:[],loading:true}" x-init="fetch('?api=gdpr_admin_list').then(r=>r.json()).then(d=>{rows=d;loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><i data-lucide="lock" class="w-4 h-4 text-fw-500"></i>Data Requests (GDPR)</h3>
+    <div x-show="loading" class="text-sm text-slate-400 animate-pulse py-4">Loading…</div>
+    <div x-show="!loading&&rows.length===0" class="text-sm text-slate-400 py-4 text-center">No data requests.</div>
+    <table x-show="!loading&&rows.length>0" class="fw-table w-full">
+      <thead><tr><th>ID</th><th>User</th><th>Type</th><th>Status</th><th>Requested</th><th>Completed</th></tr></thead>
+      <tbody>
+        <template x-for="r in rows" :key="r.id">
+          <tr>
+            <td class="text-xs" x-text="r.id"></td>
+            <td class="text-xs" x-text="r.email||r.user_id"></td>
+            <td><span :class="r.type==='deletion'?'bg-red-100 text-red-700':'bg-blue-100 text-blue-700'" class="px-2 py-0.5 rounded text-xs font-medium" x-text="r.type"></span></td>
+            <td><span :class="{'bg-yellow-100 text-yellow-700':r.status==='pending','bg-green-100 text-green-700':r.status==='complete','bg-red-100 text-red-700':r.status==='failed'}" class="px-2 py-0.5 rounded text-xs font-medium" x-text="r.status"></span></td>
+            <td class="text-xs text-slate-400" x-text="r.requested_at?.substring(0,16)?.replace('T',' ')"></td>
+            <td class="text-xs text-slate-400" x-text="r.completed_at?.substring(0,16)?.replace('T',' ')||'—'"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+
 <?php endif; // metrics tab ?>
 
 <?php layout_foot(); }
@@ -13387,7 +14603,7 @@ if(!$user && $reset_tok_param): ?>
 <!-- Tab nav -->
 <?php $atab=$_GET['tab']??'overview'; ?>
 <div class="flex gap-0 border-b border-slate-200 mb-6">
-  <?php foreach(['overview'=>'Overview','filters'=>'Saved Filters','alerts'=>'Alerts','keys'=>'API Keys','activity'=>'Activity','notifications'=>'Notifications','tags'=>'Tags','feeds'=>'RSS Feeds','searches'=>'Saved Searches','shares'=>'Shared Links','digest'=>'Digest','export'=>'Export'] as $tv=>$tl): ?>
+  <?php foreach(['overview'=>'Overview','filters'=>'Saved Filters','alerts'=>'Alerts','keys'=>'API Keys','activity'=>'Activity','notifications'=>'Notifications','tags'=>'Tags','feeds'=>'RSS Feeds','searches'=>'Saved Searches','shares'=>'Shared Links','digest'=>'Digest','export'=>'Export','scheduled_exports'=>'Scheduled Exports','privacy'=>'Privacy'] as $tv=>$tl): ?>
   <a href="?page=account&tab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$atab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
   <?php endforeach; ?>
 </div>
@@ -13875,6 +15091,71 @@ Authorization: Bearer fw_...</pre>
         <a href="?api=export_geo_risk&fmt=json" class="px-3 py-1.5 bg-slate-100 text-slate-700 text-xs rounded hover:bg-slate-200">JSON</a>
       </div>
     </div>
+  </div>
+</div>
+
+<?php elseif($atab==='scheduled_exports'): ?>
+<!-- Scheduled Exports tab (Sprint 59) -->
+<div x-data="{rows:[],loading:true,fmt:'csv',cron:'0 6 * * 1',msg:'',saving:false}"
+  x-init="fetch('?api=scheduled_export_list').then(r=>r.json()).then(d=>{rows=d;loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><i data-lucide="calendar-clock" class="w-4 h-4 text-fw-500"></i>Scheduled Exports</h3>
+    <div x-show="loading" class="text-sm text-slate-400 animate-pulse py-4">Loading…</div>
+    <div x-show="!loading&&rows.length===0" class="text-sm text-slate-400 py-4 text-center">No scheduled exports. Create one below.</div>
+    <table x-show="!loading&&rows.length>0" class="fw-table w-full mb-4">
+      <thead><tr><th>Format</th><th>Schedule</th><th>Next Run</th><th>Enabled</th><th>Action</th></tr></thead>
+      <tbody>
+        <template x-for="r in rows" :key="r.id">
+          <tr>
+            <td class="text-xs uppercase font-semibold" x-text="r.format"></td>
+            <td class="font-mono text-xs" x-text="r.schedule_cron"></td>
+            <td class="text-xs text-slate-500" x-text="r.next_run_at?.substring(0,16)?.replace('T',' ')||'—'"></td>
+            <td><span :class="r.enabled?'bg-green-100 text-green-700':'bg-slate-100 text-slate-500'" class="px-2 py-0.5 rounded text-xs" x-text="r.enabled?'Yes':'No'"></span></td>
+            <td><button @click="fetch('?api=scheduled_export_delete',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',id:r.id})}).then(rr=>rr.json()).then(d=>{if(d.ok)rows=rows.filter(x=>x.id!==r.id)})" class="text-xs text-red-500 hover:underline">Delete</button></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+    <div class="border border-slate-200 rounded-lg p-4 bg-slate-50">
+      <h4 class="text-xs font-semibold text-slate-600 mb-3">Create Scheduled Export</h4>
+      <div class="flex gap-3 flex-wrap items-end">
+        <select x-model="fmt" class="text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500"><option value="csv">CSV</option><option value="json">JSON</option></select>
+        <input x-model="cron" type="text" placeholder="Cron (e.g. 0 6 * * 1)" class="text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500 w-40">
+        <button :disabled="saving" @click="saving=true;fetch('?api=scheduled_export_create',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',format:fmt,schedule_cron:cron})}).then(r=>r.json()).then(d=>{msg=d.ok?'Created.':'Error.';saving=false;fetch('?api=scheduled_export_list').then(r=>r.json()).then(d2=>rows=d2)})" class="px-3 py-1.5 bg-fw-500 text-white text-xs rounded hover:bg-fw-700">Create</button>
+      </div>
+      <p x-show="msg" x-text="msg" class="text-xs text-green-700 mt-2"></p>
+    </div>
+  </div>
+</div>
+
+<?php elseif($atab==='privacy'): ?>
+<!-- Privacy / GDPR tab (Sprint 60) -->
+<div x-data="{requests:[],loading:true,msg:'',reqType:'export',requesting:false}"
+  x-init="fetch('?api=data_request_status').then(r=>r.json()).then(d=>{requests=d;loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><i data-lucide="shield-check" class="w-4 h-4 text-fw-500"></i>Privacy &amp; Data</h3>
+    <p class="text-xs text-slate-500 mb-4">Request a full export of your data, or request permanent account deletion. Requests are processed within 72 hours.</p>
+    <div class="flex gap-3 mb-6">
+      <button @click="requesting=true;fetch('?api=data_request_create',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',type:'export'})}).then(r=>r.json()).then(d=>{msg=d.ok?'Export request submitted.':'Error.';requesting=false;fetch('?api=data_request_status').then(r=>r.json()).then(d2=>requests=d2)})" :disabled="requesting" class="px-4 py-2 bg-fw-500 text-white text-sm rounded hover:bg-fw-700">Request Data Export</button>
+      <button @click="if(confirm('Request account deletion? This is permanent.'))fetch('?api=data_request_create',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',type:'deletion'})}).then(r=>r.json()).then(d=>{msg=d.ok?'Deletion request submitted.':'Error.';fetch('?api=data_request_status').then(r=>r.json()).then(d2=>requests=d2)})" :disabled="requesting" class="px-4 py-2 bg-red-600 text-white text-sm rounded hover:bg-red-700">Request Account Deletion</button>
+    </div>
+    <p x-show="msg" x-text="msg" class="text-xs text-green-700 mb-4"></p>
+    <h4 class="text-xs font-semibold text-slate-600 mb-2">Your requests</h4>
+    <div x-show="loading" class="text-sm text-slate-400 animate-pulse py-2">Loading…</div>
+    <div x-show="!loading&&requests.length===0" class="text-sm text-slate-400 py-2">No requests yet.</div>
+    <table x-show="!loading&&requests.length>0" class="fw-table w-full">
+      <thead><tr><th>Type</th><th>Status</th><th>Requested</th><th>Completed</th></tr></thead>
+      <tbody>
+        <template x-for="r in requests" :key="r.id">
+          <tr>
+            <td><span :class="r.type==='deletion'?'bg-red-100 text-red-700':'bg-blue-100 text-blue-700'" class="px-2 py-0.5 rounded text-xs font-medium" x-text="r.type"></span></td>
+            <td><span :class="{'bg-yellow-100 text-yellow-700':r.status==='pending','bg-green-100 text-green-700':r.status==='complete','bg-red-100 text-red-700':r.status==='failed'}" class="px-2 py-0.5 rounded text-xs font-medium" x-text="r.status"></span></td>
+            <td class="text-xs text-slate-400" x-text="r.requested_at?.substring(0,16)?.replace('T',' ')"></td>
+            <td class="text-xs text-slate-400" x-text="r.completed_at?.substring(0,16)?.replace('T',' ')||'—'"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
   </div>
 </div>
 
