@@ -1412,7 +1412,7 @@ function q_recall(int $id):?array{
     $rec['products']=$db->prepare('SELECT rp.*,b.name as brand_name,m.name as mfr_name FROM recall_products rp LEFT JOIN brands b ON b.id=rp.brand_id LEFT JOIN manufacturers m ON m.id=b.manufacturer_id WHERE rp.recall_id=?')->execute([$id])->fetchAll(); // can't chain like that
     $stmt=$db->prepare('SELECT rp.*,b.name as brand_name FROM recall_products rp LEFT JOIN brands b ON b.id=rp.brand_id WHERE rp.recall_id=?');$stmt->execute([$id]);$rec['products']=$stmt->fetchAll();
     $stmt=$db->prepare('SELECT h.type,h.name,h.slug,rh.confidence FROM recall_hazards rh JOIN hazards h ON h.id=rh.hazard_id WHERE rh.recall_id=?');$stmt->execute([$id]);$rec['hazards']=$stmt->fetchAll();
-    $stmt=$db->prepare('SELECT m.name,m.city,m.state,rm.relationship_type,rm.confidence FROM recall_manufacturers rm JOIN manufacturers m ON m.id=rm.manufacturer_id WHERE rm.recall_id=?');$stmt->execute([$id]);$rec['manufacturers']=$stmt->fetchAll();
+    $stmt=$db->prepare('SELECT m.id as mfr_id,m.name,m.city,m.state,rm.relationship_type,rm.confidence FROM recall_manufacturers rm JOIN manufacturers m ON m.id=rm.manufacturer_id WHERE rm.recall_id=?');$stmt->execute([$id]);$rec['manufacturers']=$stmt->fetchAll();
     $stmt=$db->prepare('SELECT rt.id as retailer_id,rt.name,rr.relationship_type,rr.confidence FROM recall_retailers rr JOIN retailers rt ON rt.id=rr.retailer_id WHERE rr.recall_id=?');$stmt->execute([$id]);$rec['retailers']=$stmt->fetchAll();
     $stmt=$db->prepare('SELECT state_code,nationwide FROM recall_states WHERE recall_id=?');$stmt->execute([$id]);$rec['states']=$stmt->fetchAll();
     $stmt=$db->prepare('SELECT update_type,description,field_changed,old_value,new_value,updated_at FROM recall_updates WHERE recall_id=? ORDER BY updated_at DESC');$stmt->execute([$id]);$rec['updates']=$stmt->fetchAll();
@@ -1900,6 +1900,12 @@ function run_tests():array{
         'csrf_token'  =>'test_csrf',
         'indexes'     =>'test_indexes',
         'prepared_stmts'=>'test_prepared',
+        'user_register' =>'test_user_register',
+        'user_login'    =>'test_user_login',
+        'api_key'       =>'test_api_key',
+        'rate_limit'    =>'test_rate_limit',
+        'saved_filters' =>'test_saved_filters',
+        'watchlist_user'=>'test_watchlist_user',
     ];
     foreach($tests as $name=>$fn){
         try{
@@ -2019,6 +2025,101 @@ function test_prepared():array{
     $stmt=db()->prepare('SELECT id FROM recalls WHERE status=? AND severity>=? LIMIT 1');
     $stmt->execute(['ongoing',1.0]);
     return['status'=>'PASS','msg'=>'Prepared statements work'];
+}
+function test_user_register():array{
+    $email='test_'.bin2hex(random_bytes(4)).'@fw.internal';
+    $res=user_register($email,'TestPass123!');
+    if(!is_int($res)){return['status'=>'FAIL','msg'=>"Registration failed: $res"];}
+    $uid=$res;
+    // Duplicate detection
+    $res2=user_register($email,'AnotherPass1');
+    if(is_int($res2)){db()->prepare('DELETE FROM users WHERE id=?')->execute([$uid]);return['status'=>'FAIL','msg'=>'Duplicate email was accepted'];}
+    db()->prepare('DELETE FROM users WHERE id=?')->execute([$uid]);
+    return['status'=>'PASS','msg'=>"Registered uid=$uid; duplicate rejected: $res2"];
+}
+function test_user_login():array{
+    $email='login_'.bin2hex(random_bytes(4)).'@fw.internal';
+    $uid=user_register($email,'LoginPass9!');
+    if(!is_int($uid))return['status'=>'FAIL','msg'=>"Setup failed: $uid"];
+    // Correct credentials
+    $stmt=db()->prepare('SELECT id,password_hash FROM users WHERE id=?');
+    $stmt->execute([$uid]);$row=$stmt->fetch();
+    $ok=password_verify('LoginPass9!',$row['password_hash']);
+    // Wrong credentials
+    $bad=!password_verify('WrongPass!',$row['password_hash']);
+    db()->prepare('DELETE FROM users WHERE id=?')->execute([$uid]);
+    if(!$ok)return['status'=>'FAIL','msg'=>'bcrypt verify failed for correct password'];
+    if(!$bad)return['status'=>'FAIL','msg'=>'bcrypt verify passed for wrong password'];
+    return['status'=>'PASS','msg'=>'bcrypt verify correct/wrong: PASS/REJECT'];
+}
+function test_api_key():array{
+    $email='apikey_'.bin2hex(random_bytes(4)).'@fw.internal';
+    $uid=user_register($email,'ApiKeyPass1!');
+    if(!is_int($uid))return['status'=>'FAIL','msg'=>"Setup: $uid"];
+    $kd=api_key_generate($uid,'test-key');
+    if(!str_starts_with($kd['key'],'fw_')||strlen($kd['key'])<20){
+        db()->prepare('DELETE FROM users WHERE id=?')->execute([$uid]);
+        return['status'=>'FAIL','msg'=>'Key format invalid: '.$kd['key']];
+    }
+    $krow=api_key_verify($kd['key']);
+    $match=$krow&&(int)$krow['user_id']===$uid;
+    // Tampered key should not verify
+    $bad=api_key_verify($kd['key'].'X');
+    db()->prepare('DELETE FROM users WHERE id=?')->execute([$uid]);
+    if(!$match)return['status'=>'FAIL','msg'=>'api_key_verify returned wrong user'];
+    if($bad!==null)return['status'=>'FAIL','msg'=>'Tampered key accepted'];
+    return['status'=>'PASS','msg'=>'Key generated, verified, tamper-rejected; prefix='.$kd['prefix']];
+}
+function test_rate_limit():array{
+    $email='rl_'.bin2hex(random_bytes(4)).'@fw.internal';
+    $uid=user_register($email,'RateLimit1!');
+    if(!is_int($uid))return['status'=>'FAIL','msg'=>"Setup: $uid"];
+    $kd=api_key_generate($uid,'rl-test');
+    $kid=(int)$kd['id'];$limit=3;
+    // Consume limit
+    $passes=0;
+    for($i=0;$i<$limit;$i++){
+        // Increment counter directly to avoid actual request overhead
+        $w=date('Y-m-d H').'_rl_test';
+        db()->prepare("INSERT INTO api_rate_limits(key_id,window_hour,request_count)VALUES(?,?,1)ON CONFLICT(key_id,window_hour)DO UPDATE SET request_count=request_count+1")->execute([$kid,$w]);
+    }
+    $s=db()->prepare('SELECT request_count FROM api_rate_limits WHERE key_id=? AND window_hour=?');
+    $s->execute([$kid,date('Y-m-d H').'_rl_test']);
+    $cnt=(int)$s->fetchColumn();
+    db()->prepare('DELETE FROM users WHERE id=?')->execute([$uid]);
+    if($cnt!==$limit)return['status'=>'FAIL','msg'=>"Expected count=$limit, got $cnt"];
+    return['status'=>'PASS','msg'=>"Rate-limit UPSERT: count=$cnt after $limit increments"];
+}
+function test_saved_filters():array{
+    $email='sf_'.bin2hex(random_bytes(4)).'@fw.internal';
+    $uid=user_register($email,'SavedF1lters!');
+    if(!is_int($uid))return['status'=>'FAIL','msg'=>"Setup: $uid"];
+    $fj='{"status":"ongoing","severity":"3"}';
+    db()->prepare('INSERT INTO saved_filters(user_id,name,filter_json)VALUES(?,?,?)')->execute([$uid,'My Filter',$fj]);
+    $fid=(int)db()->lastInsertId();
+    $s=db()->prepare('SELECT filter_json FROM saved_filters WHERE id=? AND user_id=?');
+    $s->execute([$fid,$uid]);
+    $stored=$s->fetchColumn();
+    db()->prepare('DELETE FROM saved_filters WHERE id=?')->execute([$fid]);
+    db()->prepare('DELETE FROM users WHERE id=?')->execute([$uid]);
+    $ok=$stored===$fj;
+    return['status'=>$ok?'PASS':'FAIL','msg'=>'Filter '.($ok?'round-tripped':'mismatch').'; stored='.h($stored??'null')];
+}
+function test_watchlist_user():array{
+    $email='wl_'.bin2hex(random_bytes(4)).'@fw.internal';
+    $uid=user_register($email,'WatchList1!');
+    if(!is_int($uid))return['status'=>'FAIL','msg'=>"Setup: $uid"];
+    $sid='test_session_'.bin2hex(random_bytes(4));
+    db()->prepare('INSERT OR IGNORE INTO watchlists(user_id,session_id,watch_type,watch_value,watch_label)VALUES(?,?,?,?,?)')->execute([$uid,$sid,'category','dairy','Dairy Products']);
+    // Duplicate should be ignored
+    db()->prepare('INSERT OR IGNORE INTO watchlists(user_id,session_id,watch_type,watch_value,watch_label)VALUES(?,?,?,?,?)')->execute([$uid,$sid,'category','dairy','Dairy Products']);
+    $s=db()->prepare('SELECT COUNT(*) FROM watchlists WHERE user_id=? AND watch_type=? AND watch_value=?');
+    $s->execute([$uid,'category','dairy']);
+    $cnt=(int)$s->fetchColumn();
+    db()->prepare('DELETE FROM watchlists WHERE user_id=?')->execute([$uid]);
+    db()->prepare('DELETE FROM users WHERE id=?')->execute([$uid]);
+    if($cnt!==1)return['status'=>'FAIL','msg'=>"Expected 1 entry, got $cnt (partial unique index failed)"];
+    return['status'=>'PASS','msg'=>'User watchlist insert+dedup: PASS'];
 }
 
 // ================================================================
@@ -2212,6 +2313,17 @@ function handle_api(string $api):void{
                 $p=db()->query("SELECT * FROM markov_params ORDER BY id DESC LIMIT 1")->fetch();
                 $tc=db()->query("SELECT COUNT(*) FROM recall_transitions")->fetchColumn();
                 echo js(['params'=>$p,'transition_count'=>(int)$tc,'matrix_est'=>markov_estimate_matrix()]);break;
+            case 'export_csv':
+                $f=['status'=>$_GET['status']??'all','state'=>$_GET['state']??'','category'=>$_GET['cat']??'','hazard'=>$_GET['haz']??'','agency'=>$_GET['agency']??'','q'=>$_GET['q']??'','sort'=>$_GET['sort']??'date','severity'=>$_GET['sev']??''];
+                $data=q_recalls(1,2000,$f);
+                header('Content-Type: text/csv; charset=utf-8');
+                header('Content-Disposition: attachment; filename="foodwatch-recalls-'.date('Y-m-d').'.csv"');
+                $out=fopen('php://output','w');
+                fputcsv($out,['ID','Title','Agency','Category','Severity','Classification','Status','Announced','States','Source ID','Source URL']);
+                foreach($data['records'] as $r){
+                    fputcsv($out,[$r['id'],$r['title'],$r['agency_code']??'',$r['category_name']??'',$r['severity'],$r['classification']??'',$r['status'],$r['announced_date']??'',implode('|',$r['states']??[]),$r['source_id']??'',$r['source_url']??'']);
+                }
+                fclose($out);exit;
             case 'export_pdf':
                 // Returns HTML fragment for print/PDF
                 $f=['status'=>$_GET['status']??'all','q'=>$_GET['q']??''];
@@ -2313,6 +2425,31 @@ function sev_badge(float $s,string $label=''):string{
 function status_badge(string $s):string{
     $cls=match($s){'ongoing'=>'bg-red-100 text-red-700','completed'=>'bg-green-100 text-green-700','terminated'=>'bg-gray-100 text-gray-600',default=>'bg-blue-100 text-blue-700'};
     return '<span class="inline-flex px-2 py-0.5 text-xs font-semibold rounded '.$cls.'">'.h(ucfirst($s)).'</span>';
+}
+
+function paginator(int $page,int $total_pages,array $query_params,int $window=2):string{
+    if($total_pages<=1)return '';
+    $params=array_filter($query_params,fn($k)=>$k!=='p',ARRAY_FILTER_USE_KEY);
+    $link=fn(int $p,string $label,bool $active=false,bool $disabled=false):string=>
+        $disabled
+            ? '<span class="px-2 py-1 text-slate-300 text-sm select-none">'.$label.'</span>'
+            : '<a href="?'.h(http_build_query(array_merge($params,['p'=>$p]))).'" class="px-2.5 py-1 rounded text-sm '.($active?'bg-fw-500 text-white font-semibold':'hover:bg-slate-100 text-slate-600').'">'.$label.'</a>';
+    $pages=[];
+    $pages[]=1;
+    for($i=max(2,$page-$window);$i<=min($total_pages-1,$page+$window);$i++)$pages[]=$i;
+    $pages[]=$total_pages;
+    $pages=array_values(array_unique($pages));
+    $out='<div class="px-4 py-3 border-t border-slate-200 flex items-center flex-wrap gap-1 text-sm">';
+    $out.=$link($page-1,'‹',false,$page<=1);
+    $prev=0;
+    foreach($pages as $p){
+        if($prev&&$p-$prev>1)$out.='<span class="text-slate-400 px-1">…</span>';
+        $out.=$link($p,(string)$p,$p===$page);
+        $prev=$p;
+    }
+    $out.=$link($page+1,'›',false,$page>=$total_pages);
+    $out.='</div>';
+    return $out;
 }
 
 function layout_head(string $title,string $page):void{ ?>
@@ -2612,11 +2749,13 @@ function view_recalls():void{
 <div class="bg-white rounded-lg border border-slate-200 shadow-sm">
   <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
     <span class="text-sm text-slate-600"><?=number_format($data['total'])?> recalls</span>
-    <div class="flex items-center gap-2 text-xs text-slate-500">
-      Sort:
+    <div class="flex items-center gap-3 text-xs text-slate-500">
+      <span>Sort:
       <?php foreach(['date'=>'Date','severity'=>'Severity','agency'=>'Agency'] as $sv=>$sl): ?>
       <a href="?<?=http_build_query(array_merge($_GET,['sort'=>$sv,'p'=>1]))?>" class="hover:text-fw-500 <?=$f['sort']===$sv?'font-semibold text-fw-500':''?>"><?=h($sl)?></a>
-      <?php endforeach; ?>
+      <?php endforeach; ?></span>
+      <a href="?api=export_csv&<?=http_build_query(array_filter(['status'=>$f['status'],'cat'=>$f['category'],'haz'=>$f['hazard'],'agency'=>$f['agency'],'sev'=>$f['severity'],'state'=>$f['state'],'q'=>$f['q']]))?>" class="flex items-center gap-1 text-fw-500 hover:underline"><i data-lucide="download" class="w-3 h-3"></i>CSV</a>
+      <a href="?api=export_pdf&status=<?=h($f['status'])?>&q=<?=h($f['q']??'')?>" target="_blank" class="flex items-center gap-1 text-slate-400 hover:text-fw-500 hover:underline"><i data-lucide="printer" class="w-3 h-3"></i>Print</a>
     </div>
   </div>
   <table class="fw-table w-full">
@@ -2639,14 +2778,7 @@ function view_recalls():void{
     <?php if(empty($data['records'])): ?><tr><td colspan="7" class="text-center py-8 text-slate-400">No recalls match the current filters.</td></tr><?php endif; ?>
     </tbody>
   </table>
-  <!-- Pagination -->
-  <?php if($data['pages']>1): ?>
-  <div class="px-4 py-3 border-t border-slate-200 flex items-center gap-2 text-sm">
-    <?php for($i=1;$i<=$data['pages'];$i++): ?>
-    <a href="?<?=http_build_query(array_merge($_GET,['p'=>$i]))?>" class="px-3 py-1 rounded <?=$i===$page?'bg-fw-500 text-white':'hover:bg-slate-100 text-slate-600'?>"><?=$i?></a>
-    <?php endfor; ?>
-  </div>
-  <?php endif; ?>
+  <?=paginator($page,$data['pages'],$_GET)?>
 </div>
 <?php layout_foot(); }
 
@@ -2754,7 +2886,7 @@ function view_recall_detail():void{
     <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
       <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="factory" class="w-4 h-4"></i>Responsible Entities</h3>
       <?php foreach($rec['manufacturers'] as $m): ?>
-      <div class="text-sm mb-2"><strong><?=h($m['name'])?></strong><?php if($m['city']||$m['state']): ?> <span class="text-slate-500"><?=h(trim($m['city'].', '.$m['state'],', '))?></span><?php endif; ?>
+      <div class="text-sm mb-2"><a href="?page=manufacturer&id=<?=(int)$m['mfr_id']?>" class="font-semibold text-fw-500 hover:underline"><?=h($m['name'])?></a><?php if($m['city']||$m['state']): ?> <span class="text-slate-500"><?=h(trim($m['city'].', '.$m['state'],', '))?></span><?php endif; ?>
         <br><span class="text-xs text-slate-500">Role: <?=h(REL_TYPES[$m['relationship_type']]??$m['relationship_type'])?> · Confidence: <?=h($m['confidence'])?></span>
       </div>
       <?php endforeach; ?>
