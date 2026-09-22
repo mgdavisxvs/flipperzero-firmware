@@ -2289,6 +2289,16 @@ function handle_api(string $api):void{
             case 'barcode':
                 $upc=preg_replace('/[^0-9]/','',trim($_GET['upc']??''));
                 echo js($upc?barcode_lookup($upc):['error'=>'No UPC provided']);break;
+            case 'alert_from_filter':
+                if(!csrf_ok())fw_abort('CSRF',403);
+                if(!is_user())fw_abort('Login required',401);
+                $uid=current_user()['id'];
+                $fj=$_POST['filter_json']??'{}';
+                $email=current_user()['email'];
+                $tok=subscription_token();
+                db()->prepare("INSERT OR IGNORE INTO subscriptions(user_id,email,filter_json,token,confirmed,confirm_sent_at)VALUES(?,?,?,?,1,datetime('now'))")
+                    ->execute([$uid,$email,$fj,$tok]);
+                echo js(['ok'=>true,'id'=>(int)db()->lastInsertId()]);break;
             case 'subscription_add':
                 if(!csrf_ok())fw_abort('CSRF',403);
                 $email=trim($_POST['email']??'');
@@ -2296,8 +2306,9 @@ function handle_api(string $api):void{
                 $f=['status'=>$_POST['status']??'','severity'=>$_POST['severity']??'','state'=>$_POST['state']??'','category'=>$_POST['category']??''];
                 $f=array_filter($f);
                 $tok=subscription_token();
-                db()->prepare("INSERT OR IGNORE INTO subscriptions(email,filter_json,token,confirmed,confirm_sent_at)VALUES(?,?,?,0,datetime('now'))")
-                    ->execute([$email,json_encode($f),$tok]);
+                $sub_uid=is_user()?current_user()['id']:null;
+                db()->prepare("INSERT OR IGNORE INTO subscriptions(user_id,email,filter_json,token,confirmed,confirm_sent_at)VALUES(?,?,?,?,0,datetime('now'))")
+                    ->execute([$sub_uid,$email,json_encode($f),$tok]);
                 // Send double opt-in confirmation email
                 $confirm_url='http'.(!empty($_SERVER['HTTPS'])?'s':'').'://'.(($_SERVER['HTTP_HOST']??'localhost')).'?api=confirm_subscription&token='.urlencode($tok);
                 $body='<html><body style="font-family:sans-serif;max-width:600px;margin:0 auto"><h2 style="color:#3b5bdb">Confirm Your FoodWatch US Subscription</h2><p>You requested food recall alerts. Click below to confirm your email address:</p><p><a href="'.htmlspecialchars($confirm_url).'" style="background:#3b5bdb;color:#fff;padding:10px 20px;border-radius:4px;text-decoration:none;font-weight:bold;display:inline-block">Confirm Subscription</a></p><p style="font-size:12px;color:#64748b">If you did not request this, ignore this email. Link expires in 72 hours.</p></body></html>';
@@ -2315,8 +2326,15 @@ function handle_api(string $api):void{
                 }
                 break;
             case 'subscription_del':
+                if(!csrf_ok())fw_abort('CSRF',403);
                 $tok=trim($_GET['token']??$_POST['token']??'');
-                if($tok)db()->prepare("UPDATE subscriptions SET active=0 WHERE token=?")->execute([$tok]);
+                $sub_del_id=(int)($_POST['id']??0);
+                if($sub_del_id&&is_user()){
+                    // Account-authenticated deletion by id
+                    db()->prepare("DELETE FROM subscriptions WHERE id=? AND user_id=?")->execute([$sub_del_id,current_user()['id']]);
+                }elseif($tok){
+                    db()->prepare("UPDATE subscriptions SET active=0 WHERE token=?")->execute([$tok]);
+                }
                 echo js(['ok'=>true]);break;
             case 'subscriptions':
                 if(!is_admin())fw_abort('Unauthorized',403);
@@ -3448,6 +3466,10 @@ function view_watchlist():void{
                 case 'state':
                     $s=$wl_stmts['state']??=db()->prepare("SELECT COUNT(*) FROM recalls r JOIN recall_states rs ON rs.recall_id=r.id WHERE r.status='ongoing' AND rs.state_code=?");
                     $s->execute([$wv]);$cnt=(int)$s->fetchColumn();break;
+                case 'upc':
+                    // Match UPC via recall_products.upc_codes (JSON array stored as text)
+                    $s=$wl_stmts['upc']??=db()->prepare("SELECT COUNT(DISTINCT r.id) FROM recalls r JOIN recall_products rp ON rp.recall_id=r.id WHERE r.status='ongoing' AND rp.upc_codes LIKE ?");
+                    $s->execute(['%'.preg_replace('/[^0-9]/','',trim($wv)).'%']);$cnt=(int)$s->fetchColumn();break;
             }
         }catch(\Throwable){$cnt=0;}
         $item_alerts[$it['id']]=['count'=>$cnt,'alert'=>$cnt>=$ramsey_threshold];
@@ -3470,7 +3492,7 @@ function view_watchlist():void{
       <select x-model="type" class="text-sm border border-slate-300 rounded px-2 py-1.5">
         <option value="retailer">Retailer</option><option value="brand">Brand</option>
         <option value="category">Food Category</option><option value="state">State</option>
-        <option value="hazard">Hazard</option>
+        <option value="hazard">Hazard</option><option value="upc">UPC Barcode</option>
       </select>
     </div>
     <div class="flex-1"><label class="text-xs font-medium text-slate-600 block mb-1">Value</label>
@@ -3755,7 +3777,7 @@ function view_account():void{
 <!-- Tab nav -->
 <?php $atab=$_GET['tab']??'overview'; ?>
 <div class="flex gap-0 border-b border-slate-200 mb-6">
-  <?php foreach(['overview'=>'Overview','filters'=>'Saved Filters','keys'=>'API Keys'] as $tv=>$tl): ?>
+  <?php foreach(['overview'=>'Overview','filters'=>'Saved Filters','alerts'=>'Alerts','keys'=>'API Keys'] as $tv=>$tl): ?>
   <a href="?page=account&tab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$atab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
   <?php endforeach; ?>
 </div>
@@ -3827,10 +3849,40 @@ function view_account():void{
         </div>
         <div class="flex gap-2 shrink-0">
           <a :href="'?page=recalls&'+new URLSearchParams(JSON.parse(f.filter_json)).toString()" class="text-xs text-fw-500 hover:underline">Apply</a>
+          <button @click="fetch('?api=alert_from_filter',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',filter_id:f.id,filter_json:f.filter_json,name:f.name})}).then(r=>r.json()).then(d=>{if(d.ok)alert('Alert created for "'+f.name+'"');else alert(d.error||'Error')})" class="text-xs text-blue-500 hover:underline flex items-center gap-1"><i data-lucide="bell-plus" class="w-3 h-3"></i>Alert</button>
           <button @click="fetch('?api=filter_del',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',id:f.id})}).then(()=>{filters=filters.filter(x=>x.id!==f.id)})" class="text-xs text-red-500 hover:underline">Delete</button>
         </div>
       </div>
     </template>
+  </div>
+</div>
+
+<?php elseif($atab==='alerts'): ?>
+<!-- Alerts tab -->
+<?php
+  $s=db()->prepare('SELECT id,email,filter_json,active,confirmed,created_at,last_sent_at FROM subscriptions WHERE user_id=? ORDER BY created_at DESC');
+  $s->execute([$user['id']]);$alerts=$s->fetchAll();
+?>
+<div x-data="{alerts:<?=js($alerts)?>,loading:false}">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4 mb-5">
+    <p class="text-xs text-slate-500">Alerts are email subscriptions linked to your account. Create them from <a href="?page=account&tab=filters" class="text-fw-500 hover:underline">Saved Filters</a>, or from the <a href="?page=subscriptions" class="text-fw-500 hover:underline">Email Alerts</a> page.</p>
+  </div>
+  <div x-show="!alerts.length" class="text-sm text-slate-400 text-center py-8 bg-white rounded-lg border border-slate-200">No alerts yet. <a href="?page=account&tab=filters" class="text-fw-500 hover:underline">Create one from a saved filter.</a></div>
+  <div x-show="alerts.length>0" class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <table class="fw-table w-full">
+      <thead><tr><th>Email</th><th>Filter</th><th>Status</th><th>Last Sent</th><th></th></tr></thead>
+      <tbody>
+        <template x-for="a in alerts" :key="a.id">
+          <tr>
+            <td class="text-xs font-mono" x-text="a.email"></td>
+            <td class="text-xs max-w-xs truncate" x-text="(d=>{try{const f=JSON.parse(a.filter_json);const lbl=[];if(f.status&&f.status!=='all')lbl.push(f.status);if(f.state)lbl.push(f.state);if(f.q)lbl.push(f.q);return lbl.join(' · ')||'All recalls'}catch{return a.filter_json}})()" :title="a.filter_json"></td>
+            <td><span :class="a.confirmed?'bg-green-100 text-green-700':'bg-yellow-100 text-yellow-700'" class="px-2 py-0.5 rounded-full text-xs font-medium" x-text="a.confirmed?'Confirmed':'Pending'"></span></td>
+            <td class="text-xs" x-text="a.last_sent_at?a.last_sent_at.substring(0,10):'Never'"></td>
+            <td><button @click="fetch('?api=subscription_del',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',id:a.id})}).then(()=>{alerts=alerts.filter(x=>x.id!==a.id)})" class="text-xs text-red-500 hover:underline">Delete</button></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
   </div>
 </div>
 
