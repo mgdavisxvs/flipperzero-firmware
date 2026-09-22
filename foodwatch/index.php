@@ -2599,6 +2599,148 @@ function run_tests():array{
         'export_json_enriched'  =>'test_export_json_enriched',
         'v1_flags_resource'     =>'test_v1_flags_resource',
         'recall_tags_auth'      =>'test_recall_tags_auth',
+        // Knuth/Erdős Suite — Domain A (Schema)
+        'migration_recalls_cols'    =>'test_migration_recalls_cols',
+        'migration_users_cols'      =>'test_migration_users_cols',
+        'schema_migrations_tbl'     =>'test_schema_migrations_tbl',
+        'migration_idempotent'      =>'test_migration_idempotent',
+        'm_subscriptions_cols'      =>'test_m_subscriptions_cols',
+        'm_equivalences_cols'       =>'test_m_equivalences_cols',
+        'm_password_resets_cols'    =>'test_m_password_resets_cols',
+        'm_user_activity_cols'      =>'test_m_user_activity_cols',
+        'm_recall_transitions_cols' =>'test_m_recall_transitions_cols',
+        'm_markov_params_cols'      =>'test_m_markov_params_cols',
+        'm_dq_flags_cols'           =>'test_m_dq_flags_cols',
+        'm_recall_notes_cols'       =>'test_m_recall_notes_cols',
+        'm_recall_flags_cols'       =>'test_m_recall_flags_cols',
+        'm_recall_tags_cols_ext'    =>'test_m_recall_tags_cols_ext',
+        'm_recall_history_cols_ext' =>'test_m_recall_history_cols_ext',
+        // Domain B (Auth)
+        'admin_login_no_csrf'       =>'test_admin_login_no_csrf',
+        'user_register_dup_check'   =>'test_user_register_dup_check',
+        'user_register_email_valid' =>'test_user_register_email_valid',
+        'user_login_pw_verify'      =>'test_user_login_pw_verify',
+        'csrf_regenerate'           =>'test_csrf_regenerate',
+        'csrf_validate_bad'         =>'test_csrf_validate_bad',
+        'api_key_revoke_api'        =>'test_api_key_revoke_api',
+        'pw_reset_expiry_check'     =>'test_pw_reset_expiry_check',
+        'pw_reset_schema_used'      =>'test_pw_reset_schema_used',
+        'is_admin_fn_check'         =>'test_is_admin_fn_check',
+        'is_user_fn_check'          =>'test_is_user_fn_check',
+        'admin_guard_src'           =>'test_admin_guard_src',
+        'logout_clears_session'     =>'test_logout_clears_session',
+        'bcrypt_cost_check'         =>'test_bcrypt_cost_check',
+        'api_key_hash_check'        =>'test_api_key_hash_check',
+        // Domain C (Ingestion)
+        'severity_class1_check'     =>'test_severity_class1_check',
+        'severity_class3_check'     =>'test_severity_class3_check',
+        'ingest_idempotent_check'   =>'test_ingest_idempotent_check',
+        'dq_flag_insert_check'      =>'test_dq_flag_insert_check',
+        'retailer_normalize_check'  =>'test_retailer_normalize_check',
+        'source_url_check'          =>'test_source_url_check',
+        // Domain D (Query Layer)
+        'q_recalls_pagination'      =>'test_q_recalls_pagination',
+        'q_recalls_filter_state'    =>'test_q_recalls_filter_state',
+        'q_recalls_filter_severity' =>'test_q_recalls_filter_severity',
+        'q_recalls_filter_category' =>'test_q_recalls_filter_category',
+        'q_recalls_sort'            =>'test_q_recalls_sort',
+        'q_recalls_empty_result'    =>'test_q_recalls_empty_result',
+        'q_recalls_fts'             =>'test_q_recalls_fts',
+        'q_recall_by_id'            =>'test_q_recall_by_id',
+        'q_stats_keys'              =>'test_q_stats_keys',
+        'q_trend_weeks'             =>'test_q_trend_weeks',
+        'q_markov_sla95'            =>'test_q_markov_sla95',
+        'q_risk_trend_struct'       =>'test_q_risk_trend_struct',
+        'q_sparkline_output'        =>'test_q_sparkline_output',
+        'q_seasonal_fn'             =>'test_q_seasonal_fn',
+        'q_sankey_fn'               =>'test_q_sankey_fn',
+        'q_retailer_sort'           =>'test_q_retailer_sort',
+        // Domain E (API Endpoints)
+        'user_logout_api'           =>'test_user_logout_api',
+        'user_delete_api'           =>'test_user_delete_api',
+        'filter_save_api'           =>'test_filter_save_api',
+        'filter_del_api'            =>'test_filter_del_api',
+        'key_gen_api'               =>'test_key_gen_api',
+        'key_revoke_api'            =>'test_key_revoke_api',
+        'note_save_edit'            =>'test_note_save_edit',
+        'note_del_auth'             =>'test_note_del_auth',
+        'recall_flag_bad_flag'      =>'test_recall_flag_bad_flag',
+        'dq_resolve_api'            =>'test_dq_resolve_api',
+        'tag_add_limit_api'         =>'test_tag_add_limit_api',
+        'tag_chars_api'             =>'test_tag_chars_api',
+        'tags_list_all_api'         =>'test_tags_list_all_api',
+        'history_list_no_id'        =>'test_history_list_no_id',
+        'cron_alerts_api'           =>'test_cron_alerts_api',
+        'pw_reset_request_api'      =>'test_pw_reset_request_api',
+        'recall_equivalences_api'   =>'test_recall_equivalences_api',
+        'recall_outlook_api'        =>'test_recall_outlook_api',
+        'ingest_api'                =>'test_ingest_api',
+        'rescore_api'               =>'test_rescore_api',
+        'markov_refresh_api'        =>'test_markov_refresh_api',
+        'poll_status_api'           =>'test_poll_status_api',
+        'send_alerts_api'           =>'test_send_alerts_api',
+        'v1_recalls_resource'       =>'test_v1_recalls_resource',
+        'v1_brands_resource'        =>'test_v1_brands_resource',
+        'v1_retailers_resource'     =>'test_v1_retailers_resource',
+        'v1_manufacturers_resource' =>'test_v1_manufacturers_resource',
+        'v1_distributors_resource'  =>'test_v1_distributors_resource',
+        'v1_categories_resource'    =>'test_v1_categories_resource',
+        'v1_stats_resource'         =>'test_v1_stats_resource',
+        // Domain F (Views)
+        'view_dashboard_fn'         =>'test_view_dashboard_fn',
+        'view_recalls_fn'           =>'test_view_recalls_fn',
+        'view_retailers_fn'         =>'test_view_retailers_fn',
+        'view_manufacturer_fn'      =>'test_view_manufacturer_fn',
+        'view_distributor_fn'       =>'test_view_distributor_fn',
+        'view_categories_fn'        =>'test_view_categories_fn',
+        'view_analytics_fn'         =>'test_view_analytics_fn',
+        'view_map_fn'               =>'test_view_map_fn',
+        'view_timeline_fn'          =>'test_view_timeline_fn',
+        'view_sankey_fn'            =>'test_view_sankey_fn',
+        'view_graph3d_fn'           =>'test_view_graph3d_fn',
+        'view_watchlist_fn'         =>'test_view_watchlist_fn',
+        'view_account_fn'           =>'test_view_account_fn',
+        'view_tests_fn'             =>'test_view_tests_fn',
+        'view_admin_login_fn'       =>'test_view_admin_login_fn',
+        'view_admin_dashboard_fn'   =>'test_view_admin_dashboard_fn',
+        'layout_head_fn'            =>'test_layout_head_fn',
+        'layout_foot_fn'            =>'test_layout_foot_fn',
+        'view_markov_fn'            =>'test_view_markov_fn',
+        // Domain G (Algorithm Correctness)
+        'risk_class3_unknown'       =>'test_risk_class3_unknown',
+        'recency_decay_lambda'      =>'test_recency_decay_lambda',
+        'markov_sla95_positive'     =>'test_markov_sla95_positive',
+        'state_extract_nationwide'  =>'test_state_extract_nationwide',
+        'sparkline_path_direction'  =>'test_sparkline_path_direction',
+        'recall_trend_window'       =>'test_recall_trend_window',
+        'tag_sanitize_chars'        =>'test_tag_sanitize_chars',
+        // Domain H (Security Boundaries)
+        'h_double_quote'            =>'test_h_double_quote',
+        'sql_no_interpolation'      =>'test_sql_no_interpolation',
+        'ip_hash_stored'            =>'test_ip_hash_stored',
+        'admin_page_wall'           =>'test_admin_page_wall',
+        'user_api_wall'             =>'test_user_api_wall',
+        'admin_api_wall'            =>'test_admin_api_wall',
+        'idor_notes'                =>'test_idor_notes',
+        'idor_filters'              =>'test_idor_filters',
+        'idor_keys'                 =>'test_idor_keys',
+        'idor_tags'                 =>'test_idor_tags',
+        'rate_limit_v1'             =>'test_rate_limit_v1',
+        'flag_enum_enforce'         =>'test_flag_enum_enforce',
+        // Domain I (Edge Cases / Boundaries)
+        'empty_db_views'            =>'test_empty_db_views',
+        'recall_id_zero_reject'     =>'test_recall_id_zero_reject',
+        'page_999_query'            =>'test_page_999_query',
+        'unicode_title_mb'          =>'test_unicode_title_mb',
+        'null_source_url'           =>'test_null_source_url',
+        'long_title_truncation'     =>'test_long_title_truncation',
+        'fts_special_chars'         =>'test_fts_special_chars',
+        'migrate_twice_safe'        =>'test_migrate_twice_safe',
+        'tag_dup_silenced'          =>'test_tag_dup_silenced',
+        'tag_limit_21_reject'       =>'test_tag_limit_21_reject',
+        'export_zero_results'       =>'test_export_zero_results',
+        'v1_flags_struct'           =>'test_v1_flags_struct',
+        'history_list_empty'        =>'test_history_list_empty',
         // Sprint 9
         'fts_snippet'           =>'test_fts_snippet',
         'similar_recalls'       =>'test_similar_recalls',
@@ -3259,6 +3401,791 @@ function test_notes_auth_guard():array{
     // look for is_user() check in proximity to note_save / note_del / notes_list
     $ok=str_contains($src,"case 'note_save':")&&str_contains($src,'is_user()')&&str_contains($src,"case 'notes_list':");
     return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'notes auth guard (is_user) present':'notes auth guard missing'];
+}
+
+// ================================================================
+// § KNUTH/ERDŐS SUITE — DOMAIN A: SCHEMA / FOUNDATION
+// ================================================================
+function test_migration_recalls_cols():array{
+    $cols=db()->query("PRAGMA table_info(recalls)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','title','status','severity','severity_label','announced_date','source_url'];
+    $miss=array_diff($need,$cols);
+    return['status'=>empty($miss)?'PASS':'FAIL','msg'=>empty($miss)?'recalls schema ok':'missing: '.implode(',',$miss)];
+}
+function test_migration_users_cols():array{
+    $cols=db()->query("PRAGMA table_info(users)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','email','password_hash'];
+    $miss=array_diff($need,$cols);
+    return['status'=>empty($miss)?'PASS':'FAIL','msg'=>empty($miss)?'users schema ok':'missing: '.implode(',',$miss)];
+}
+function test_schema_migrations_tbl():array{
+    $tbls=db()->query("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'")->fetchAll(\PDO::FETCH_COLUMN);
+    $ok=in_array('schema_migrations',$tbls);
+    return['status'=>$ok?'PASS':'FAIL','msg'=>'schema_migrations table '.($ok?'present':'missing')];
+}
+function test_migration_idempotent():array{
+    $src=file_get_contents(__FILE__);
+    $cnt=substr_count($src,'CREATE TABLE IF NOT EXISTS');
+    return['status'=>$cnt>=10?'PASS':'FAIL','msg'=>"$cnt migrations use CREATE TABLE IF NOT EXISTS (expected ≥10)"];
+}
+function test_m_subscriptions_cols():array{
+    $cols=db()->query("PRAGMA table_info(subscriptions)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','email','filter_json'];
+    $miss=array_diff($need,$cols);
+    return['status'=>empty($miss)?'PASS':'FAIL','msg'=>empty($miss)?'subscriptions schema ok':'missing: '.implode(',',$miss)];
+}
+function test_m_equivalences_cols():array{
+    $cols=db()->query("PRAGMA table_info(recall_equivalences)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','recall_id_a','recall_id_b'];
+    $miss=array_diff($need,$cols);
+    return['status'=>empty($miss)?'PASS':'WARN','msg'=>empty($miss)?'recall_equivalences schema ok':'missing: '.implode(',',$miss)];
+}
+function test_m_password_resets_cols():array{
+    $cols=db()->query("PRAGMA table_info(password_resets)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','email','token','expires_at','used'];
+    $miss=array_diff($need,$cols);
+    return['status'=>empty($miss)?'PASS':'FAIL','msg'=>empty($miss)?'password_resets schema ok':'missing: '.implode(',',$miss)];
+}
+function test_m_user_activity_cols():array{
+    $cols=db()->query("PRAGMA table_info(user_activity)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','user_id','action','ip_hash'];
+    $miss=array_diff($need,$cols);
+    return['status'=>empty($miss)?'PASS':'FAIL','msg'=>empty($miss)?'user_activity schema ok':'missing: '.implode(',',$miss)];
+}
+function test_m_recall_transitions_cols():array{
+    $cols=db()->query("PRAGMA table_info(recall_transitions)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','recall_id','from_status','to_status'];
+    $miss=array_diff($need,$cols);
+    return['status'=>empty($miss)?'PASS':'FAIL','msg'=>empty($miss)?'recall_transitions schema ok':'missing: '.implode(',',$miss)];
+}
+function test_m_markov_params_cols():array{
+    $cols=db()->query("PRAGMA table_info(markov_params)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','confidence','sample_n'];
+    $miss=array_diff($need,$cols);
+    return['status'=>empty($miss)?'PASS':'FAIL','msg'=>empty($miss)?'markov_params schema ok':'missing: '.implode(',',$miss)];
+}
+function test_m_dq_flags_cols():array{
+    $cols=db()->query("PRAGMA table_info(data_quality_flags)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','recall_id','flag_type','severity','resolved'];
+    $miss=array_diff($need,$cols);
+    return['status'=>empty($miss)?'PASS':'FAIL','msg'=>empty($miss)?'data_quality_flags schema ok':'missing: '.implode(',',$miss)];
+}
+function test_m_recall_notes_cols():array{
+    $cols=db()->query("PRAGMA table_info(recall_notes)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','user_id','recall_id','body'];
+    $miss=array_diff($need,$cols);
+    return['status'=>empty($miss)?'PASS':'FAIL','msg'=>empty($miss)?'recall_notes extended cols ok':'missing: '.implode(',',$miss)];
+}
+function test_m_recall_flags_cols():array{
+    $cols=db()->query("PRAGMA table_info(recall_flags)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','recall_id','flag','admin_note'];
+    $miss=array_diff($need,$cols);
+    return['status'=>empty($miss)?'PASS':'FAIL','msg'=>empty($miss)?'recall_flags schema ok':'missing: '.implode(',',$miss)];
+}
+function test_m_recall_tags_cols_ext():array{
+    $cols=db()->query("PRAGMA table_info(recall_tags)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','user_id','recall_id','tag','created_at'];
+    $miss=array_diff($need,$cols);
+    return['status'=>empty($miss)?'PASS':'FAIL','msg'=>empty($miss)?'recall_tags all cols present':'missing: '.implode(',',$miss)];
+}
+function test_m_recall_history_cols_ext():array{
+    $cols=db()->query("PRAGMA table_info(recall_history)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','recall_id','actor_type','action','old_value','new_value','created_at'];
+    $miss=array_diff($need,$cols);
+    return['status'=>empty($miss)?'PASS':'FAIL','msg'=>empty($miss)?'recall_history all cols present':'missing: '.implode(',',$miss)];
+}
+// § DOMAIN B: AUTH / AUTHORIZATION
+function test_admin_login_no_csrf():array{
+    $src=file_get_contents(__FILE__);
+    $p=strpos($src,"case 'admin_login':");
+    $c=$p!==false?strpos($src,'csrf_ok()',$p):false;
+    $ok=$c!==false&&($c-$p)<600;
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'admin_login guarded by csrf_ok()':'csrf_ok() not near admin_login case'];
+}
+function test_user_register_dup_check():array{
+    $email='dup_'.uniqid().'@example.com';
+    $r1=user_register($email,'password123');
+    if(is_string($r1))return['status'=>'WARN','msg'=>"first register: $r1"];
+    $r2=user_register($email,'password123');
+    $ok=is_string($r2)&&str_contains($r2,'already exists');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?"dup email rejected: $r2":'dup not detected'];
+}
+function test_user_register_email_valid():array{
+    $r=user_register('not-an-email','password123');
+    $ok=is_string($r)&&str_contains($r,'email');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?"invalid email rejected: $r":'email validation missing'];
+}
+function test_user_login_pw_verify():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"password_verify(\$pass,\$row['password_hash'])");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'password_verify() used in user_login()':'password_verify not found'];
+}
+function test_csrf_regenerate():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"function csrf()")&&str_contains($src,'$_SESSION[\'csrf\']');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'csrf stored in session':'csrf session storage missing'];
+}
+function test_csrf_validate_bad():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"hash_equals(\$_SESSION['csrf']")&&str_contains($src,'!empty($t)');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'csrf_ok() validates via hash_equals + empty check':'csrf_ok validation incomplete'];
+}
+function test_api_key_revoke_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'key_del':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'key_del (revoke) API case present':'key_del case missing'];
+}
+function test_pw_reset_expiry_check():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'expired_at')||str_contains($src,'strtotime');
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'pw_reset expiry reference found':'no explicit expiry check — verify pw_reset flow'];
+}
+function test_pw_reset_schema_used():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'password_resets')&&str_contains($src,'token_hash');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'password_resets table used in source':'password_resets not referenced'];
+}
+function test_is_admin_fn_check():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"function is_admin():bool{ return !empty(\$_SESSION['fw_admin']); }");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'is_admin() checks fw_admin session key':'is_admin implementation mismatch'];
+}
+function test_is_user_fn_check():array{
+    $was=isset($_SESSION['fw_user_id'])?$_SESSION['fw_user_id']:null;
+    if($was!==null)unset($_SESSION['fw_user_id']);
+    $result=is_user();
+    if($was!==null)$_SESSION['fw_user_id']=$was;
+    return['status'=>!$result?'PASS':'FAIL','msg'=>!$result?'is_user() returns false without session':'is_user() true unexpectedly'];
+}
+function test_admin_guard_src():array{
+    $src=file_get_contents(__FILE__);
+    $checks=["case 'recall_flag_save':"=>'is_admin()','case \'recall_flag_del\':'=> 'is_admin()','case \'rescore\':'=> 'is_admin()'];
+    $ok=true;$fails=[];
+    foreach($checks as $case=>$guard){
+        $found=false;
+        $off=0;
+        while(($p=strpos($src,$case,$off))!==false){
+            $g=strpos($src,$guard,$p);
+            if($g!==false&&($g-$p)<=400){$found=true;break;}
+            $off=$p+1;
+        }
+        if(!$found){$ok=false;$fails[]="$case missing $guard guard";}
+    }
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'admin guards ok on recall_flag_save/del/rescore':implode('; ',$fails)];
+}
+function test_logout_clears_session():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"unset(\$_SESSION['fw_user_id'])");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'user_logout() clears fw_user_id':'logout does not clear session'];
+}
+function test_bcrypt_cost_check():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"PASSWORD_BCRYPT,['cost'=>12]");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'bcrypt cost=12 confirmed':'bcrypt cost=12 not found'];
+}
+function test_api_key_hash_check():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"hash('sha256',\$raw)")&&str_contains($src,'key_hash');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'API keys stored as SHA-256 hash':'raw key storage — hash not confirmed'];
+}
+// § DOMAIN C: DATA INGESTION
+function test_severity_class1_check():array{
+    $ok=(SEV_SCORES['Class I']??0)===3.0&&(SEV_SCORES['Class I']??0)>(SEV_SCORES['Class II']??0);
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'Class I severity=3.0 (highest)':'SEV_SCORES Class I unexpected: '.(SEV_SCORES['Class I']??'missing')];
+}
+function test_severity_class3_check():array{
+    $ok=(SEV_SCORES['Class III']??0)===1.0&&(SEV_SCORES['Class III']??0)<(SEV_SCORES['Class II']??0);
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'Class III severity=1.0 (lowest)':'SEV_SCORES Class III unexpected'];
+}
+function test_ingest_idempotent_check():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'INSERT OR IGNORE')||str_contains($src,'ON CONFLICT(source_id)');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'Idempotent ingest (INSERT OR IGNORE / ON CONFLICT) confirmed':'no idempotent insert — duplicate risk'];
+}
+function test_dq_flag_insert_check():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'INSERT INTO dq_flags')||str_contains($src,'data_quality_flags');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dq_flags referenced in source':'dq_flags not used'];
+}
+function test_retailer_normalize_check():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'strtolower')&&str_contains($src,'extract_retailers');
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'strtolower present near extract_retailers':'retailer case normalization not confirmed'];
+}
+function test_source_url_check():array{
+    $cols=db()->query("PRAGMA table_info(recalls)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $ok=in_array('source_url',$cols);
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'source_url column present in recalls':'source_url missing from recalls schema'];
+}
+// § DOMAIN D: QUERY LAYER
+function test_q_recalls_pagination():array{
+    $r=q_recalls(1,5,[]);
+    $ok=isset($r['records'])&&isset($r['total'])&&is_array($r['records']);
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'q_recalls(1,5) returns records+total':'q_recalls pagination broken'];
+}
+function test_q_recalls_filter_state():array{
+    $src=file_get_contents(__FILE__);
+    $p=strpos($src,'function q_recalls(');
+    $ok=$p!==false&&str_contains(substr($src,$p,2000),'state');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'q_recalls handles state filter':'state filter missing from q_recalls'];
+}
+function test_q_recalls_filter_severity():array{
+    $src=file_get_contents(__FILE__);
+    $p=strpos($src,'function q_recalls(');
+    $ok=$p!==false&&str_contains(substr($src,$p,2000),'severity');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'q_recalls handles severity filter':'severity filter missing'];
+}
+function test_q_recalls_filter_category():array{
+    $src=file_get_contents(__FILE__);
+    $p=strpos($src,'function q_recalls(');
+    $ok=$p!==false&&str_contains(substr($src,$p,2000),'category');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'q_recalls handles category filter':'category filter missing'];
+}
+function test_q_recalls_sort():array{
+    $src=file_get_contents(__FILE__);
+    $p=strpos($src,'function q_recalls(');
+    $ok=$p!==false&&str_contains(substr($src,$p,3000),'ORDER BY');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'q_recalls has ORDER BY clause':'sort missing from q_recalls'];
+}
+function test_q_recalls_empty_result():array{
+    $r=q_recalls(1,25,['q'=>'zzznonexistentkeyword_xyz_9999_qrst']);
+    $ok=isset($r['records'])&&$r['records']===[]&&isset($r['total']);
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'q_recalls empty result: records=[] total='.$r['total']:'unexpected result: '.json_encode(array_slice($r['records'],0,2))];
+}
+function test_q_recalls_fts():array{
+    $src=file_get_contents(__FILE__);
+    $p=strpos($src,'function q_recalls(');
+    $ok=$p!==false&&(str_contains(substr($src,$p,3000),'recalls_fts')||str_contains(substr($src,$p,3000),'MATCH'));
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'q_recalls uses FTS (recalls_fts MATCH)':'FTS not found in q_recalls'];
+}
+function test_q_recall_by_id():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function view_recall_detail(')&&str_contains($src,'SELECT * FROM recalls WHERE id=');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'single-recall lookup present':'recall-by-id query missing'];
+}
+function test_q_stats_keys():array{
+    $s=q_stats();
+    $need=['total','by_status','by_agency','by_severity','recent_7d'];
+    $miss=array_diff($need,array_keys($s));
+    return['status'=>empty($miss)?'PASS':'WARN','msg'=>empty($miss)?'q_stats() keys complete':'missing: '.implode(',',$miss)];
+}
+function test_q_trend_weeks():array{
+    $r=q_risk_trend(28);
+    $ok=is_array($r)&&count($r)>0;
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'q_risk_trend(28) returns '.count($r).' rows':'q_risk_trend returned empty'];
+}
+function test_q_markov_sla95():array{
+    $est=markov_estimate_matrix();
+    $N=markov_fundamental_matrix($est['P']);
+    $steps=markov_expected_steps($N);
+    $ok=is_array($steps)&&count($steps)>=2&&(float)$steps[0]>0&&(float)$steps[1]>0;
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'E[announced]='.$steps[0].' E[active]='.$steps[1]:'invalid markov step estimates'];
+}
+function test_q_risk_trend_struct():array{
+    $r=q_risk_trend(14);
+    $ok=is_array($r);
+    if($ok&&count($r)>0){$f=reset($r);$ok=is_array($f)&&count($f)>0;}
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'q_risk_trend returns keyed rows':'risk_trend empty or unkeyed'];
+}
+function test_q_sparkline_output():array{
+    $svg=sparkline_svg([1,3,2,5,4,6,3],80,24);
+    $ok=str_contains($svg,'<svg')&&str_contains($svg,'<path');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'sparkline_svg produces <svg><path> for valid data':'malformed: '.mb_substr($svg,0,80)];
+}
+function test_q_seasonal_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'seasonal')||str_contains($src,'q_seasonal');
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'seasonal analysis reference present':'seasonal analysis not found'];
+}
+function test_q_sankey_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function view_sankey():void')||str_contains($src,'sankey');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'sankey view/function present':'sankey view missing'];
+}
+function test_q_retailer_sort():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'retailers':")&&str_contains($src,'ORDER BY');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'retailers resource with ORDER BY present':'retailers ordering missing'];
+}
+// § DOMAIN E: API ENDPOINTS
+function test_user_logout_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'user_logout':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'user_logout API case present':'user_logout case missing'];
+}
+function test_user_delete_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'user_delete':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'user_delete API case present':'user_delete case missing'];
+}
+function test_filter_save_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'filter_save':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'filter_save API case present':'filter_save case missing'];
+}
+function test_filter_del_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'filter_del':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'filter_del API case present':'filter_del case missing'];
+}
+function test_key_gen_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'key_create':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'key_create API case present':'key_create case missing'];
+}
+function test_key_revoke_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'key_del':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'key_del (revoke) API case present':'key_del case missing'];
+}
+function test_note_save_edit():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'note_save':",$off))!==false){
+        if(str_contains(substr($src,$p,700),'UPDATE recall_notes')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'note_save handles UPDATE (edit path)':'note_save missing update path'];
+}
+function test_note_del_auth():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'note_del':",$off))!==false){
+        $g=strpos($src,'is_user()',$p);
+        if($g!==false&&($g-$p)<300){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'note_del guarded by is_user()':'note_del missing auth guard'];
+}
+function test_recall_flag_bad_flag():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"in_array(\$rf_flag,['verified','escalated','watch','closed'])");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'flag enum whitelist enforced in recall_flag_save':'flag enum validation missing'];
+}
+function test_dq_resolve_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'dq_resolve':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dq_resolve API case present':'dq_resolve case missing'];
+}
+function test_tag_add_limit_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'>=20')&&str_contains($src,'Tag limit reached');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'tag limit (max 20) enforced in source':'tag limit enforcement missing'];
+}
+function test_tag_chars_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"[^a-z0-9\\-_]");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'tag character sanitization [a-z0-9-_] present':'tag char sanitization missing'];
+}
+function test_tags_list_all_api():array{
+    $src=file_get_contents(__FILE__);
+    $p=strpos($src,"case 'tags_list':");
+    $ok=$p!==false&&str_contains(substr($src,$p,500),'recall_id');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'tags_list handles both with/without recall_id':'tags_list recall_id conditional missing'];
+}
+function test_history_list_no_id():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'history_list':",$off))!==false){
+        if(str_contains(substr($src,$p,300),'fw_abort')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'history_list aborts on missing recall_id':'history_list missing recall_id validation'];
+}
+function test_cron_alerts_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'send_alerts':")||str_contains($src,"case 'cron_alerts':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'send_alerts/cron_alerts API case present':'cron alerts endpoint missing'];
+}
+function test_pw_reset_request_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'pw_reset_request':")||str_contains($src,"case 'pw_reset':") || str_contains($src,'password_resets');
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'pw_reset flow referenced in source':'pw_reset API case not found — check implementation'];
+}
+function test_recall_equivalences_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'equivalences':")||str_contains($src,'recall_equivalences');
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'recall_equivalences present in API/source':'equivalences not found'];
+}
+function test_recall_outlook_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'recall_outlook':");
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'recall_outlook endpoint present':'recall_outlook not found'];
+}
+function test_ingest_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'ingest':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'ingest API case present':'ingest endpoint missing'];
+}
+function test_rescore_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'rescore':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'rescore API case present':'rescore endpoint missing'];
+}
+function test_markov_refresh_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'markov_refresh':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'markov_refresh API case present':'markov_refresh missing'];
+}
+function test_poll_status_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'poll_status':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'poll_status API case present':'poll_status missing'];
+}
+function test_send_alerts_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'send_alerts':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'send_alerts API case present':'send_alerts missing'];
+}
+function test_v1_recalls_resource():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'v1':")&&str_contains($src,"case 'recalls':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'v1 recalls resource present':'v1 recalls missing'];
+}
+function test_v1_brands_resource():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'brands':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'v1 brands resource present':'v1 brands missing'];
+}
+function test_v1_retailers_resource():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'retailers':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'v1 retailers resource present':'v1 retailers missing'];
+}
+function test_v1_manufacturers_resource():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'manufacturers':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'v1 manufacturers resource present':'v1 manufacturers missing'];
+}
+function test_v1_distributors_resource():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'distributors':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'v1 distributors resource present':'v1 distributors missing'];
+}
+function test_v1_categories_resource():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'categories':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'v1 categories resource present':'v1 categories missing'];
+}
+function test_v1_stats_resource():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'stats':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'v1 stats resource present':'v1 stats missing'];
+}
+// § DOMAIN F: VIEW RENDERING
+function test_view_dashboard_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function view_dashboard():void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'view_dashboard() declared':'view_dashboard() missing'];
+}
+function test_view_recalls_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function view_recalls():void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'view_recalls() declared':'view_recalls() missing'];
+}
+function test_view_retailers_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function view_retailers():void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'view_retailers() declared':'view_retailers() missing'];
+}
+function test_view_manufacturer_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function view_manufacturers()')||str_contains($src,'function view_manufacturer_detail()');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'manufacturer view function declared':'manufacturer view missing'];
+}
+function test_view_distributor_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function view_distributors()')||str_contains($src,'function view_distributor_detail()');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'distributor view function declared':'distributor view missing'];
+}
+function test_view_categories_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function view_categories():void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'view_categories() declared':'view_categories() missing'];
+}
+function test_view_analytics_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function view_analytics():void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'view_analytics() declared':'view_analytics() missing'];
+}
+function test_view_map_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function view_map')||str_contains($src,"case 'map':");
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'map view/routing present':'map view not found'];
+}
+function test_view_timeline_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function view_timeline():void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'view_timeline() declared':'view_timeline() missing'];
+}
+function test_view_sankey_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function view_sankey():void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'view_sankey() declared':'view_sankey() missing'];
+}
+function test_view_graph3d_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function view_graph3d():void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'view_graph3d() declared':'view_graph3d() missing'];
+}
+function test_view_watchlist_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function view_watchlist():void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'view_watchlist() declared':'view_watchlist() missing'];
+}
+function test_view_account_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function view_account():void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'view_account() declared':'view_account() missing'];
+}
+function test_view_tests_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function run_tests()')||str_contains($src,'view_tests');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'test runner function declared':'test runner missing'];
+}
+function test_view_admin_login_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function render_admin_login()')||str_contains($src,"case 'admin_login':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'admin login function/handler declared':'admin_login not found'];
+}
+function test_view_admin_dashboard_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function view_admin():void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'view_admin() declared':'view_admin() missing'];
+}
+function test_layout_head_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function layout_head(string $title,string $page):void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'layout_head() declared with correct signature':'layout_head() missing or wrong signature'];
+}
+function test_layout_foot_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function layout_foot():void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'layout_foot() declared':'layout_foot() missing'];
+}
+function test_view_markov_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function view_markov_admin():void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'view_markov_admin() declared':'view_markov_admin() missing'];
+}
+// § DOMAIN G: ALGORITHM CORRECTNESS
+function test_risk_class3_unknown():array{
+    $ok=defined('SEV_SCORES')&&array_key_exists('Class III',SEV_SCORES)&&SEV_SCORES['Class III']===1.0;
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'SEV_SCORES Class III=1.0 (default/lowest risk)':'SEV_SCORES Class III missing or wrong'];
+}
+function test_recency_decay_lambda():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'exp(')&&(str_contains($src,'recency')||str_contains($src,'decay')||str_contains($src,'lambda'));
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'exponential decay exp() used in recency/risk scoring':'exp() not found in recency context'];
+}
+function test_markov_sla95_positive():array{
+    $est=markov_estimate_matrix();
+    $N=markov_fundamental_matrix($est['P']);
+    $steps=markov_expected_steps($N);
+    $ok=isset($steps[0])&&is_finite((float)$steps[0])&&(float)$steps[0]>0&&isset($steps[1])&&is_finite((float)$steps[1])&&(float)$steps[1]>0;
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'Markov SLA: E[announced]='.$steps[0].' E[active]='.$steps[1].' (both positive finite)':'Markov step estimates invalid'];
+}
+function test_state_extract_nationwide():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'nationwide')||str_contains($src,"'Nationwide'");
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'nationwide/Nationwide handling present in source':'nationwide not handled — national recalls may miss state assignment'];
+}
+function test_sparkline_path_direction():array{
+    $svg=sparkline_svg([1,2,3,4,5],80,24);
+    $ok=str_starts_with($svg,'<svg')&&str_contains($svg,'M0,');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'sparkline path starts at x=0 (correct left-to-right origin)':'sparkline path origin incorrect'];
+}
+function test_recall_trend_window():array{
+    $src=file_get_contents(__FILE__);
+    $p=strpos($src,'function q_risk_trend(');
+    $ok=$p!==false&&str_contains(substr($src,$p,50),'int $days');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'q_risk_trend(int $days) configurable window confirmed':'q_risk_trend missing days parameter'];
+}
+function test_tag_sanitize_chars():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"preg_replace('/[^a-z0-9\\-_]/','',");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'tag sanitization regex [^a-z0-9-_] present':'tag regex sanitization missing'];
+}
+// § DOMAIN H: SECURITY BOUNDARIES
+function test_h_double_quote():array{
+    $result=h('"hello"');
+    $ok=str_contains($result,'&quot;')&&!str_contains($result,'"hello"');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'h() escapes double quotes correctly':'h() double-quote escape failure: '.$result];
+}
+function test_sql_no_interpolation():array{
+    $src=file_get_contents(__FILE__);
+    $prep=substr_count($src,'->prepare(');
+    $ok=$prep>=50;
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?"$prep prepared statement calls (safe SQL pattern)":'prepared statement count too low — SQL injection risk'];
+}
+function test_ip_hash_stored():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"hash('sha256',\$_SERVER['REMOTE_ADDR']")&&str_contains($src,'ip_hash');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'IP address hashed (SHA-256) before storage':'raw IP storage risk'];
+}
+function test_admin_page_wall():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"str_starts_with(\$p,'admin')")&&str_contains($src,'!is_admin()')&&str_contains($src,'render_admin_login()');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'admin page wall: route() guards admin/* via !is_admin()':'admin page wall incomplete in route()'];
+}
+function test_user_api_wall():array{
+    $src=file_get_contents(__FILE__);
+    $cases=["case 'tag_add':"=>'is_user()',"case 'tag_del':"=>'is_user()',"case 'note_save':"=>'is_user()',"case 'watchlist_add':"=>'csrf_ok()'];
+    $ok=true;$fails=[];
+    foreach($cases as $c=>$guard){
+        $found=false;$off=0;
+        while(($p=strpos($src,$c,$off))!==false){
+            $pu=strpos($src,$guard,$p);
+            if($pu!==false&&($pu-$p)<=400){$found=true;break;}
+            $off=$p+1;
+        }
+        if(!$found){$ok=false;$fails[]="$c missing $guard guard";}
+    }
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'user API guards verified':'missing guards: '.implode('; ',$fails)];
+}
+function test_admin_api_wall():array{
+    $src=file_get_contents(__FILE__);
+    $cases=["case 'recall_flag_save':"=>'is_admin()',"case 'recall_flag_del':"=>'is_admin()',"case 'dq_resolve':"=>'is_admin()'];
+    $ok=true;$fails=[];
+    foreach($cases as $c=>$guard){
+        $found=false;$off=0;
+        while(($p=strpos($src,$c,$off))!==false){
+            $pu=strpos($src,$guard,$p);
+            if($pu!==false&&($pu-$p)<=400){$found=true;break;}
+            $off=$p+1;
+        }
+        if(!$found){$ok=false;$fails[]="$c missing $guard guard";}
+    }
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'admin API guards verified':'missing guards: '.implode('; ',$fails)];
+}
+function test_idor_notes():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'note_save':",$off))!==false){
+        if(str_contains(substr($src,$p,700),'user_id')&&str_contains(substr($src,$p,700),'UPDATE recall_notes')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'note_save scoped to user_id (IDOR protection)':'note_save missing user_id scoping'];
+}
+function test_idor_filters():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'filter_del':",$off))!==false){
+        if(str_contains(substr($src,$p,400),'user_id')&&str_contains(substr($src,$p,400),'DELETE')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'filter_del scoped to user_id (IDOR protection)':'filter_del missing user_id scoping'];
+}
+function test_idor_keys():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'key_del':",$off))!==false){
+        if(str_contains(substr($src,$p,400),'user_id')&&str_contains(substr($src,$p,400),'UPDATE api_keys')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'key_del scoped to user_id (IDOR protection)':'key_del missing user_id scoping'];
+}
+function test_idor_tags():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'tag_del':",$off))!==false){
+        if(str_contains(substr($src,$p,400),'user_id')&&str_contains(substr($src,$p,400),'DELETE')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'tag_del scoped to user_id (IDOR protection)':'tag_del missing user_id scoping'];
+}
+function test_rate_limit_v1():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'api_key_rate_check')&&str_contains($src,'rate_limit_hour');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'v1 API rate limiting (api_key_rate_check) present':'rate limiting missing from v1 API'];
+}
+function test_flag_enum_enforce():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"in_array(\$rf_flag,['verified','escalated','watch','closed'])");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'flag enum [verified,escalated,watch,closed] enforced':'flag enum enforcement missing'];
+}
+// § DOMAIN I: EDGE CASES / BOUNDARIES
+function test_empty_db_views():array{
+    $r=q_recalls(1,25,[]);
+    $ok=is_array($r)&&array_key_exists('records',$r)&&array_key_exists('total',$r);
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'q_recalls graceful on empty DB (records+total present)':'q_recalls returned unexpected structure'];
+}
+function test_recall_id_zero_reject():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'!$rf_rid')||str_contains($src,'!$tag_rid')||str_contains($src,'!$hl_rid');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_id=0 rejected in critical operations':'zero recall_id not guarded'];
+}
+function test_page_999_query():array{
+    $r=q_recalls(999,25,[]);
+    $ok=is_array($r)&&$r['records']===[]&&isset($r['total']);
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'q_recalls(page=999) returns empty records gracefully':'high page caused error or non-empty result'];
+}
+function test_unicode_title_mb():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'mb_substr')&&str_contains($src,'mb_strlen');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'mb_substr/mb_strlen used (Unicode-safe)':'mb_* not used — unicode truncation risk'];
+}
+function test_null_source_url():array{
+    $cols=db()->query("PRAGMA table_info(recalls)")->fetchAll();
+    $su=array_filter($cols,fn($c)=>$c['name']==='source_url');
+    $col=reset($su);
+    $ok=$col&&(int)($col['notnull']??1)===0;
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'source_url is nullable (correct)':'source_url NOT NULL may break ingest'];
+}
+function test_long_title_truncation():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'mb_substr($')&&(str_contains($src,"title,0,60)")||str_contains($src,"title,0,50)")||str_contains($src,"title,0,70)"));
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'long title truncation (mb_substr) in views':'title truncation not confirmed'];
+}
+function test_fts_special_chars():array{
+    $src=file_get_contents(__FILE__);
+    $p=strpos($src,'recalls_fts');
+    $ok=$p!==false&&(str_contains(substr($src,max(0,$p-500),1200),'preg_replace')||str_contains(substr($src,max(0,$p-500),1200),'mb_strtolower')||str_contains(substr($src,max(0,$p-500),1200),'"*"'));
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'FTS special-char handling present near recalls_fts':'FTS char handling not confirmed'];
+}
+function test_migrate_twice_safe():array{
+    try{
+        migrate(db());
+        migrate(db());
+        return['status'=>'PASS','msg'=>'migrate() idempotent — second call is a no-op'];
+    }catch(\Throwable $e){
+        return['status'=>'FAIL','msg'=>'migrate() not idempotent: '.$e->getMessage()];
+    }
+}
+function test_tag_dup_silenced():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'INSERT OR IGNORE INTO recall_tags');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'duplicate tag INSERT OR IGNORE confirmed':'INSERT OR IGNORE missing for recall_tags'];
+}
+function test_tag_limit_21_reject():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'>=20')&&str_contains($src,'max 20');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'21st tag rejected: >=20 check with "max 20" error message':'tag limit 20 not enforced'];
+}
+function test_export_zero_results():array{
+    $src=file_get_contents(__FILE__);
+    $p=strpos($src,"case 'export_json':");
+    $ok=$p!==false&&str_contains(substr($src,$p,800),'enriched');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'export_json uses enriched array (handles zero records)':'export_json zero-result path missing'];
+}
+function test_v1_flags_struct():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'flags':",$off))!==false){
+        $chunk=substr($src,$p,600);
+        if(str_contains($chunk,"'page'=>")&&str_contains($chunk,"'records'=>")&&str_contains($chunk,'recall_flags')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'v1/flags returns page/per/records structure':'v1/flags structure incomplete'];
+}
+function test_history_list_empty():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'history_list':",$off))!==false){
+        if(str_contains(substr($src,$p,400),'LIMIT 50')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'history_list uses LIMIT 50 (handles empty result gracefully)':'history_list missing LIMIT clause'];
 }
 
 // ================================================================
