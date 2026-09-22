@@ -1413,7 +1413,7 @@ function q_recall(int $id):?array{
     $stmt=$db->prepare('SELECT rp.*,b.name as brand_name FROM recall_products rp LEFT JOIN brands b ON b.id=rp.brand_id WHERE rp.recall_id=?');$stmt->execute([$id]);$rec['products']=$stmt->fetchAll();
     $stmt=$db->prepare('SELECT h.type,h.name,h.slug,rh.confidence FROM recall_hazards rh JOIN hazards h ON h.id=rh.hazard_id WHERE rh.recall_id=?');$stmt->execute([$id]);$rec['hazards']=$stmt->fetchAll();
     $stmt=$db->prepare('SELECT m.name,m.city,m.state,rm.relationship_type,rm.confidence FROM recall_manufacturers rm JOIN manufacturers m ON m.id=rm.manufacturer_id WHERE rm.recall_id=?');$stmt->execute([$id]);$rec['manufacturers']=$stmt->fetchAll();
-    $stmt=$db->prepare('SELECT rt.name,rr.relationship_type,rr.confidence FROM recall_retailers rr JOIN retailers rt ON rt.id=rr.retailer_id WHERE rr.recall_id=?');$stmt->execute([$id]);$rec['retailers']=$stmt->fetchAll();
+    $stmt=$db->prepare('SELECT rt.id as retailer_id,rt.name,rr.relationship_type,rr.confidence FROM recall_retailers rr JOIN retailers rt ON rt.id=rr.retailer_id WHERE rr.recall_id=?');$stmt->execute([$id]);$rec['retailers']=$stmt->fetchAll();
     $stmt=$db->prepare('SELECT state_code,nationwide FROM recall_states WHERE recall_id=?');$stmt->execute([$id]);$rec['states']=$stmt->fetchAll();
     $stmt=$db->prepare('SELECT update_type,description,field_changed,old_value,new_value,updated_at FROM recall_updates WHERE recall_id=? ORDER BY updated_at DESC');$stmt->execute([$id]);$rec['updates']=$stmt->fetchAll();
     $stmt=$db->prepare('SELECT flag_type,description,severity FROM data_quality_flags WHERE recall_id=?');$stmt->execute([$id]);$rec['dq_flags']=$stmt->fetchAll();
@@ -1516,6 +1516,48 @@ function q_manufacturers(int $limit=100):array{
         ORDER BY severe_recalls DESC,total_recalls DESC
         LIMIT ?");
     $stmt->execute([$limit]);return $stmt->fetchAll();
+}
+
+function q_manufacturer(int $id):?array{
+    $db=db();
+    $stmt=$db->prepare("
+        SELECT m.id,m.name,m.city,m.state,m.country,
+          COUNT(DISTINCT rm.recall_id) as total_recalls,
+          COUNT(DISTINCT CASE WHEN r.status='ongoing' THEN rm.recall_id END) as active_recalls,
+          COUNT(DISTINCT CASE WHEN r.severity>=3.0 THEN rm.recall_id END) as severe_recalls,
+          ROUND(SUM(COALESCE(re.event_risk,0)),3) as total_risk,
+          MIN(r.announced_date) as first_recall,
+          MAX(r.announced_date) as last_recall
+        FROM manufacturers m
+        JOIN recall_manufacturers rm ON rm.manufacturer_id=m.id
+        JOIN recalls r ON r.id=rm.recall_id
+        LEFT JOIN retail_exposures re ON re.recall_id=r.id
+        WHERE m.id=?
+        GROUP BY m.id");
+    $stmt->execute([$id]);
+    $row=$stmt->fetch();
+    if(!$row)return null;
+    // Associated recalls
+    $rs=$db->prepare("
+        SELECT r.id,r.title,r.status,r.severity,r.severity_label,r.agency,r.announced_date,
+          COALESCE(fc.name,'—') as category,
+          COALESCE(re.event_risk,0) as event_risk,
+          rm.relationship_type
+        FROM recall_manufacturers rm
+        JOIN recalls r ON r.id=rm.recall_id
+        LEFT JOIN food_categories fc ON fc.id=r.food_category_id
+        LEFT JOIN retail_exposures re ON re.recall_id=r.id
+        WHERE rm.manufacturer_id=?
+        ORDER BY r.severity DESC,r.announced_date DESC
+        LIMIT 200");
+    $rs->execute([$id]);$row['recalls']=$rs->fetchAll();
+    // Brand associations
+    $br=$db->prepare("SELECT b.id,b.name,COUNT(DISTINCT rp.recall_id) as recall_count FROM brands b LEFT JOIN recall_products rp ON rp.brand_id=b.id WHERE b.manufacturer_id=? GROUP BY b.id ORDER BY recall_count DESC LIMIT 30");
+    $br->execute([$id]);$row['brands']=$br->fetchAll();
+    // State footprint from recalls
+    $ss=$db->prepare("SELECT rs.state_code,COUNT(DISTINCT rs.recall_id) as cnt FROM recall_states rs JOIN recall_manufacturers rm ON rm.recall_id=rs.recall_id WHERE rm.manufacturer_id=? AND rs.state_code!='nationwide' GROUP BY rs.state_code ORDER BY cnt DESC LIMIT 20");
+    $ss->execute([$id]);$row['states']=$ss->fetchAll();
+    return $row;
 }
 
 // Erdős E02: greedy graph coloring of manufacturer hazard-sharing graph
@@ -2009,6 +2051,7 @@ function route():void{
         case 'retailers':     render_page('retailers');break;
         case 'retailer':      render_page('retailer');break;
         case 'manufacturers': render_page('manufacturers');break;
+        case 'manufacturer':  render_page('manufacturer');break;
         case 'categories':    render_page('categories');break;
         case 'analytics':     render_page('analytics');break;
         case 'map':           render_page('map');break;
@@ -2371,6 +2414,7 @@ function render_page(string $p):void{
         'retailers'     =>view_retailers(),
         'retailer'      =>view_retailer_detail(),
         'manufacturers' =>view_manufacturers(),
+        'manufacturer'  =>view_manufacturer_detail(),
         'categories'    =>view_categories(),
         'analytics'     =>view_analytics(),
         'map'           =>view_map(),
@@ -2724,7 +2768,7 @@ function view_recall_detail():void{
       <p class="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2 mb-3"><i data-lucide="alert-circle" class="w-3 h-3 inline mr-1"></i>Retailer identification is <?=$rec['retailers'][0]['confidence']==='confirmed'?'confirmed from source data':'inferred from distribution text — treat as approximate'?>.</p>
       <?php foreach($rec['retailers'] as $r): ?>
       <div class="text-sm mb-1 flex items-center justify-between">
-        <a href="?page=retailers" class="text-fw-500 hover:underline"><?=h($r['name'])?></a>
+        <a href="?page=retailer&id=<?=(int)$r['retailer_id']?>" class="text-fw-500 hover:underline"><?=h($r['name'])?></a>
         <span class="text-xs text-slate-500"><?=h($r['confidence'])?></span>
       </div>
       <?php endforeach; ?>
@@ -3724,7 +3768,7 @@ function view_manufacturers():void{
     $tier=$chrom_colors[(int)$m['id']]??1;
     $tier_cls=$tier_palette[min($tier,count($tier_palette)-1)]??'bg-slate-100 text-slate-700'; ?>
     <tr>
-      <td class="font-medium"><?=h($m['name'])?></td>
+      <td class="font-medium"><a href="?page=manufacturer&id=<?=(int)$m['id']?>" class="text-fw-500 hover:underline"><?=h($m['name'])?></a></td>
       <td class="text-xs text-slate-500"><?=h(trim(($m['city']??'').($m['state']?', '.$m['state']:'')))?></td>
       <td>
         <div class="flex items-center gap-2">
@@ -3743,6 +3787,109 @@ function view_manufacturers():void{
     <?php if(empty($mfrs)): ?><tr><td colspan="9" class="text-center py-8 text-slate-400">No manufacturer data. Run ingestion first.</td></tr><?php endif; ?>
     </tbody>
   </table>
+</div>
+<?php layout_foot(); }
+
+function view_manufacturer_detail():void{
+    $id=(int)($_GET['id']??0);
+    if(!$id)fw_abort('Missing manufacturer ID');
+    $m=q_manufacturer($id);
+    if(!$m)fw_abort('Manufacturer not found',404);
+
+    layout_head(h($m['name']),'manufacturers'); ?>
+<div class="mb-4">
+  <a href="?page=manufacturers" class="text-sm text-fw-500 hover:underline flex items-center gap-1"><i data-lucide="arrow-left" class="w-3 h-3"></i>Back to Manufacturer Profiles</a>
+</div>
+
+<div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+  <div class="lg:col-span-2 space-y-4">
+    <!-- Header stats -->
+    <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+      <div class="flex items-center gap-3 mb-4">
+        <i data-lucide="factory" class="w-8 h-8 text-fw-500"></i>
+        <div>
+          <h2 class="text-xl font-bold text-slate-800"><?=h($m['name'])?></h2>
+          <p class="text-sm text-slate-500"><?=h(trim(($m['city']??'').($m['state']?', '.$m['state']:'').($m['country']&&$m['country']!=='US'?' · '.$m['country']:''))) ?:  '—'?></p>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div class="text-center"><div class="text-2xl font-bold <?=$m['active_recalls']>0?'text-red-600':'text-slate-400'?>"><?=(int)$m['active_recalls']?></div><div class="text-xs text-slate-500">Active Recalls</div></div>
+        <div class="text-center"><div class="text-2xl font-bold text-slate-800"><?=number_format((float)$m['total_risk'],2)?></div><div class="text-xs text-slate-500">Total Risk Score</div></div>
+        <div class="text-center"><div class="text-2xl font-bold text-slate-800"><?=(int)$m['total_recalls']?></div><div class="text-xs text-slate-500">Total Recalls</div></div>
+        <div class="text-center"><div class="text-2xl font-bold <?=$m['severe_recalls']>0?'text-red-600':'text-slate-400'?>"><?=(int)$m['severe_recalls']?></div><div class="text-xs text-slate-500">Class I (Severe)</div></div>
+      </div>
+    </div>
+
+    <!-- Associated Recalls -->
+    <div class="bg-white rounded-lg border border-slate-200 shadow-sm">
+      <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+        <h3 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="alert-triangle" class="w-4 h-4 text-red-500"></i>Associated Recalls</h3>
+        <span class="text-xs text-slate-500"><?=(int)$m['total_recalls']?> total</span>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="fw-table w-full">
+          <thead><tr><th>Severity</th><th>Product</th><th>Agency</th><th>Category</th><th>Role</th><th>Date</th><th>Status</th><th>Event Risk</th></tr></thead>
+          <tbody>
+          <?php foreach($m['recalls'] as $rc): ?>
+          <tr>
+            <td><?=sev_badge((float)$rc['severity'],$rc['severity_label']??'')?></td>
+            <td><a href="?page=recall&id=<?=(int)$rc['id']?>" class="text-fw-500 hover:underline"><?=h(mb_substr($rc['title'],0,70))?></a></td>
+            <td class="font-mono text-xs"><?=h($rc['agency']??'')?></td>
+            <td class="text-xs"><?=h($rc['category']??'—')?></td>
+            <td class="text-xs capitalize"><?=h($rc['relationship_type']??'—')?></td>
+            <td class="text-xs whitespace-nowrap"><?=h($rc['announced_date']??'—')?></td>
+            <td><?=status_badge($rc['status'])?></td>
+            <td class="text-xs text-center font-mono"><?=number_format((float)$rc['event_risk'],3)?></td>
+          </tr>
+          <?php endforeach; ?>
+          <?php if(empty($m['recalls'])): ?><tr><td colspan="8" class="text-center py-8 text-slate-400">No recall associations on record.</td></tr><?php endif; ?>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sidebar -->
+  <div class="space-y-4">
+    <!-- Brands -->
+    <?php if($m['brands']): ?>
+    <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
+      <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="tag" class="w-4 h-4"></i>Brands</h3>
+      <div class="space-y-1">
+        <?php foreach($m['brands'] as $b): ?>
+        <div class="flex justify-between text-sm">
+          <span class="text-slate-700"><?=h($b['name'])?></span>
+          <span class="text-xs text-slate-400 font-mono"><?=(int)$b['recall_count']?> recall<?=$b['recall_count']!=1?'s':''?></span>
+        </div>
+        <?php endforeach; ?>
+      </div>
+    </div>
+    <?php endif; ?>
+
+    <!-- State footprint -->
+    <?php if($m['states']): ?>
+    <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
+      <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="map-pin" class="w-4 h-4"></i>Affected States (from recalls)</h3>
+      <div class="flex flex-wrap gap-1">
+        <?php foreach($m['states'] as $s): ?>
+        <span class="text-xs bg-slate-100 rounded px-1.5 py-0.5 flex items-center gap-1">
+          <?=h($s['state_code'])?><span class="text-slate-400">(<?=$s['cnt']?>)</span>
+        </span>
+        <?php endforeach; ?>
+      </div>
+    </div>
+    <?php endif; ?>
+
+    <!-- Date range -->
+    <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
+      <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="calendar" class="w-4 h-4"></i>Recall History</h3>
+      <div class="text-sm text-slate-600 space-y-1">
+        <div class="flex justify-between"><span class="text-slate-400">First recall</span><span><?=h($m['first_recall']??'—')?></span></div>
+        <div class="flex justify-between"><span class="text-slate-400">Latest recall</span><span><?=h($m['last_recall']??'—')?></span></div>
+        <div class="flex justify-between"><span class="text-slate-400">Total risk score</span><span class="font-mono font-semibold"><?=number_format((float)$m['total_risk'],3)?></span></div>
+      </div>
+    </div>
+  </div>
 </div>
 <?php layout_foot(); }
 
