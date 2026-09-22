@@ -9,8 +9,8 @@ declare(strict_types=1);
 // ================================================================
 // § CONSTANTS
 // ================================================================
-const FW_VERSION    = '5.8.0';
-const FW_SCHEMA_VER = 28;
+const FW_VERSION    = '5.9.0';
+const FW_SCHEMA_VER = 29;
 // Pre-shared secret for IONOS crontab → cron_alerts endpoint; override before deploy
 const FW_CRON_SECRET = 'change-me-before-deploy';
 const FW_DATA_DIR   = __DIR__ . '/data';
@@ -310,7 +310,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26(),27=>m27(),28=>m28()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26(),27=>m27(),28=>m28(),29=>m29()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -799,6 +799,19 @@ CREATE TABLE IF NOT EXISTS notification_prefs(
   digest_freq TEXT NOT NULL DEFAULT 'immediate' CHECK(digest_freq IN ('immediate','daily','weekly')),
   updated_at TEXT NOT NULL DEFAULT(datetime('now')));
 CREATE INDEX IF NOT EXISTS idx_np_user ON notification_prefs(user_id);
+SQL; }
+
+function m29():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS public_feeds(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  name TEXT NOT NULL,
+  slug TEXT NOT NULL UNIQUE,
+  filter_json TEXT NOT NULL DEFAULT '{}',
+  active INTEGER NOT NULL DEFAULT 1,
+  hit_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_pf_slug ON public_feeds(slug, active);
 SQL; }
 
 function m28():string{ return <<<'SQL'
@@ -2830,6 +2843,19 @@ function run_tests():array{
         'notif_prefs_digest'    =>'test_notif_prefs_digest',
         'webhook_hmac_header'   =>'test_webhook_hmac_header',
         'webhook_max_5'         =>'test_webhook_max_5',
+        // Sprint 14
+        'm_public_feeds_cols'   =>'test_m_public_feeds_cols',
+        'rss_api'               =>'test_rss_api',
+        'feed_create_api'       =>'test_feed_create_api',
+        'feed_del_ownership'    =>'test_feed_del_ownership',
+        'recall_flag_bulk_api'  =>'test_recall_flag_bulk_api',
+        'tag_rename_api'        =>'test_tag_rename_api',
+        'tags_stats_api'        =>'test_tags_stats_api',
+        'view_tags_fn'          =>'test_view_tags_fn',
+        'admin_audit_tab'       =>'test_admin_audit_tab',
+        'v1_feeds_resource'     =>'test_v1_feeds_resource',
+        'rss_content_type'      =>'test_rss_content_type',
+        'bulk_flag_history'     =>'test_bulk_flag_history',
     ];
     foreach($tests as $name=>$fn){
         try{
@@ -4267,6 +4293,114 @@ function test_history_list_empty():array{
 }
 
 // ================================================================
+// § SPRINT 14 TESTS
+// ================================================================
+function test_m_public_feeds_cols():array{
+    $cols=db()->query("PRAGMA table_info(public_feeds)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','user_id','name','slug','filter_json','active','hit_count','created_at'];
+    $miss=array_diff($need,$cols);
+    return['status'=>$miss?'FAIL':'PASS','msg'=>$miss?'Missing cols: '.implode(',',$miss):'public_feeds schema OK'];
+}
+function test_rss_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'rss':",$off))!==false){
+        if(str_contains(substr($src,$p,600),'application/rss+xml')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'rss API case emits RSS 2.0 feed':'rss case missing or missing Content-Type'];
+}
+function test_feed_create_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=true;$fails=[];
+    foreach(["case 'feed_create':"=>'is_user()',"case 'feed_create':"=>'csrf_ok()'] as $c=>$g){
+        $found=false;$off=0;
+        while(($p=strpos($src,$c,$off))!==false){
+            if(str_contains(substr($src,$p,400),$g)){$found=true;break;}
+            $off=$p+1;
+        }
+        if(!$found){$ok=false;$fails[]="$c missing $g";}
+    }
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'feed_create guards OK':implode('; ',$fails)];
+}
+function test_feed_del_ownership():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'feed_del':",$off))!==false){
+        if(str_contains(substr($src,$p,400),'user_id')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'feed_del scopes to user_id':'feed_del missing user_id ownership check'];
+}
+function test_recall_flag_bulk_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=true;$fails=[];
+    foreach(["case 'recall_flag_bulk':"=>'is_admin()',"case 'recall_flag_bulk':"=>'csrf_ok()'] as $c=>$g){
+        $found=false;$off=0;
+        while(($p=strpos($src,$c,$off))!==false){
+            if(str_contains(substr($src,$p,400),$g)){$found=true;break;}
+            $off=$p+1;
+        }
+        if(!$found){$ok=false;$fails[]="$c missing $g";}
+    }
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_flag_bulk guards OK':implode('; ',$fails)];
+}
+function test_tag_rename_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=true;$fails=[];
+    foreach(["case 'tag_rename':"=>'is_user()',"case 'tag_rename':"=>'csrf_ok()'] as $c=>$g){
+        $found=false;$off=0;
+        while(($p=strpos($src,$c,$off))!==false){
+            if(str_contains(substr($src,$p,400),$g)){$found=true;break;}
+            $off=$p+1;
+        }
+        if(!$found){$ok=false;$fails[]="$c missing $g";}
+    }
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'tag_rename guards OK':implode('; ',$fails)];
+}
+function test_tags_stats_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'tags_stats':",$off))!==false){
+        if(str_contains(substr($src,$p,300),'is_user')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'tags_stats API case exists with is_user guard':'tags_stats case missing'];
+}
+function test_view_tags_fn():array{
+    $ok=str_contains(file_get_contents(__FILE__),'function view_tags():void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'view_tags() function exists':'view_tags() function missing'];
+}
+function test_admin_audit_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'audit'=>'Audit'")&&str_contains($src,"\$admin_tab==='audit'")&&str_contains($src,'recall_history');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'Admin audit tab present and queries recall_history':'Admin audit tab missing'];
+}
+function test_v1_feeds_resource():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'feeds':",$off))!==false){
+        if(str_contains(substr($src,$p,300),'public_feeds')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'v1 feeds resource queries public_feeds':'v1 feeds resource missing'];
+}
+function test_rss_content_type():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"application/rss+xml")&&str_contains($src,"<rss version");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'RSS feed sets correct content-type and root element':'RSS content-type or root element missing'];
+}
+function test_bulk_flag_history():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'recall_flag_bulk':",$off))!==false){
+        if(str_contains(substr($src,$p,600),'recall_history')&&str_contains(substr($src,$p,600),'bulk_flag')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'recall_flag_bulk writes audit trail to recall_history':'recall_flag_bulk missing recall_history log'];
+}
+
+// ================================================================
 // § SPRINT 13 TESTS
 // ================================================================
 function test_notif_prefs_schema():array{
@@ -4415,6 +4549,7 @@ function route():void{
         case 'brand':         render_page('brand');break;
         case 'watchlist':     render_page('watchlist');break;
         case 'account':       render_page('account');break;
+        case 'tags':          render_page('tags');break;
         case 'tests':         render_page('tests');break;
         case 'admin':         render_page('admin');break;
         default:              render_page('dashboard');
@@ -4861,6 +4996,108 @@ function handle_api(string $api):void{
                 try{$resp_t=@file_get_contents($wh_tr['url'],false,$ctx_t);$sc_t=(int)preg_replace('/\D/','',$http_response_header[0]??'0');}catch(\Throwable){}
                 $ok_t=$sc_t>=200&&$sc_t<300;
                 echo js(['ok'=>$ok_t,'status_code'=>$sc_t,'note'=>$ok_t?'Test delivery succeeded':'Test delivery failed — check the URL and ensure it accepts POST']);break;
+            // SPRINT 14: RSS 2.0 feed (public, no auth)
+            case 'rss':
+                $slug_rss=trim($_GET['slug']??'');
+                $rss_f=['status'=>'all','state'=>'','category'=>'','hazard'=>'','agency'=>'','severity'=>'','sort'=>'date','q'=>''];
+                if($slug_rss){
+                    $rss_feed=db()->prepare("SELECT filter_json,name FROM public_feeds WHERE slug=? AND active=1");
+                    $rss_feed->execute([$slug_rss]);$rss_row=$rss_feed->fetch();
+                    if($rss_row){
+                        $rss_f=array_merge($rss_f,json_decode($rss_row['filter_json']??'{}',true)??[]);
+                        db()->prepare("UPDATE public_feeds SET hit_count=hit_count+1 WHERE slug=?")->execute([$slug_rss]);
+                    }
+                }else{
+                    foreach(['status','state','category','hazard','agency','severity','q'] as $k)if(isset($_GET[$k]))$rss_f[$k]=$_GET[$k];
+                }
+                $rss_data=q_recalls(1,50,$rss_f);
+                $base_url='http'.(!empty($_SERVER['HTTPS'])?'s':'').'://'.($_SERVER['HTTP_HOST']??'localhost');
+                header('Content-Type: application/rss+xml; charset=utf-8');
+                header('Cache-Control: public, max-age=900');
+                $feed_title='FoodWatch US — Food Recall Alerts'.($slug_rss?' ('.h($slug_rss).')':'');
+                echo '<?xml version="1.0" encoding="UTF-8"?>'."\n";
+                echo '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">'."\n<channel>\n";
+                echo '<title>'.htmlspecialchars($feed_title).'</title>'."\n";
+                echo '<link>'.htmlspecialchars($base_url).'</link>'."\n";
+                echo '<description>US food recall intelligence — FoodWatch US</description>'."\n";
+                echo '<language>en-us</language>'."\n";
+                echo '<lastBuildDate>'.date('r').'</lastBuildDate>'."\n";
+                echo '<atom:link href="'.htmlspecialchars($base_url.'?api=rss'.($slug_rss?'&slug='.urlencode($slug_rss):'')).'" rel="self" type="application/rss+xml"/>'."\n";
+                foreach($rss_data['records'] as $rc){
+                    $link=$base_url.'?page=recall&id='.(int)$rc['id'];
+                    echo '<item>'."\n";
+                    echo '<title>'.htmlspecialchars('['.($rc['classification']??'').'] '.mb_substr($rc['title'],0,120)).'</title>'."\n";
+                    echo '<link>'.htmlspecialchars($link).'</link>'."\n";
+                    echo '<guid isPermaLink="true">'.htmlspecialchars($link).'</guid>'."\n";
+                    echo '<pubDate>'.date('r',strtotime($rc['announced_date']??'now')).'</pubDate>'."\n";
+                    echo '<description><![CDATA[<strong>'.htmlspecialchars($rc['classification']??'').'</strong> · '.htmlspecialchars($rc['agency_code']??'').' · '.htmlspecialchars($rc['status']??'').'<br>'.htmlspecialchars(mb_substr($rc['title'],0,300)).']]></description>'."\n";
+                    echo '</item>'."\n";
+                }
+                echo '</channel></rss>';exit;
+            // SPRINT 14: public feed management
+            case 'feeds_list':
+                $fls=db()->query("SELECT id,name,slug,filter_json,hit_count,created_at FROM public_feeds WHERE active=1 ORDER BY hit_count DESC LIMIT 100");
+                echo js($fls->fetchAll());break;
+            case 'feed_create':
+                if(!is_user())fw_abort('Login required',401);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $uid_fc=current_user()['id'];
+                $fc_cnt=db()->prepare("SELECT COUNT(*) FROM public_feeds WHERE user_id=? AND active=1");$fc_cnt->execute([$uid_fc]);
+                if((int)$fc_cnt->fetchColumn()>=10)fw_abort('Maximum 10 feeds per account',400);
+                $fc_name=mb_substr(trim($_POST['name']??''),0,100);
+                if(!$fc_name)fw_abort('Feed name required',400);
+                $fc_fj=trim($_POST['filter_json']??'{}');json_decode($fc_fj);if(json_last_error())fw_abort('Invalid filter JSON',400);
+                $fc_slug=strtolower(preg_replace('/[^a-z0-9]+/','-',strtolower($fc_name))).'-'.substr(bin2hex(random_bytes(3)),0,6);
+                db()->prepare("INSERT INTO public_feeds(user_id,name,slug,filter_json)VALUES(?,?,?,?)")->execute([$uid_fc,$fc_name,$fc_slug,$fc_fj]);
+                echo js(['ok'=>true,'id'=>(int)db()->lastInsertId(),'slug'=>$fc_slug,'rss_url'=>'?api=rss&slug='.urlencode($fc_slug)]);break;
+            case 'feed_del':
+                if(!is_user())fw_abort('Login required',401);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                db()->prepare("DELETE FROM public_feeds WHERE id=? AND user_id=?")->execute([(int)($_POST['id']??0),current_user()['id']]);
+                echo js(['ok'=>true]);break;
+            // SPRINT 14: tag operations
+            case 'tags_stats':
+                if(!is_user())fw_abort('Login required',401);
+                $uid_ts=current_user()['id'];
+                $ts_s=db()->prepare("SELECT tag,COUNT(DISTINCT recall_id) as cnt FROM recall_tags WHERE user_id=? GROUP BY tag ORDER BY cnt DESC LIMIT 100");
+                $ts_s->execute([$uid_ts]);echo js($ts_s->fetchAll());break;
+            case 'tag_rename':
+                if(!is_user())fw_abort('Login required',401);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $uid_tr=current_user()['id'];
+                $old_tag=mb_strtolower(trim(preg_replace('/[^a-z0-9\-_]/','',mb_strtolower(trim($_POST['old_tag']??'')))));
+                $new_tag=mb_strtolower(trim(preg_replace('/[^a-z0-9\-_]/','',mb_strtolower(trim($_POST['new_tag']??'')))));
+                if(!$old_tag||!$new_tag||mb_strlen($new_tag)>20)fw_abort('Invalid old_tag or new_tag',400);
+                db()->prepare("UPDATE OR IGNORE recall_tags SET tag=? WHERE user_id=? AND tag=?")->execute([$new_tag,$uid_tr,$old_tag]);
+                db()->prepare("DELETE FROM recall_tags WHERE user_id=? AND tag=? AND id NOT IN(SELECT MIN(id) FROM recall_tags WHERE user_id=? AND tag=? GROUP BY recall_id)")->execute([$uid_tr,$new_tag,$uid_tr,$new_tag]);
+                echo js(['ok'=>true]);break;
+            case 'tag_del_all':
+                if(!is_user())fw_abort('Login required',401);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $uid_tda=current_user()['id'];
+                $tag_dav=mb_strtolower(trim($_POST['tag']??''));
+                if(!$tag_dav)fw_abort('tag required',400);
+                db()->prepare("DELETE FROM recall_tags WHERE user_id=? AND tag=?")->execute([$uid_tda,$tag_dav]);
+                echo js(['ok'=>true]);break;
+            // SPRINT 14: admin bulk recall flag
+            case 'recall_flag_bulk':
+                if(!is_admin())fw_abort('Unauthorized',403);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $bulk_ids_raw=trim($_POST['recall_ids']??'');
+                $bulk_flag=trim($_POST['flag']??'');
+                $bulk_note=mb_substr(trim($_POST['admin_note']??''),0,500);
+                if(!in_array($bulk_flag,['verified','escalated','watch','closed']))fw_abort('Invalid flag',400);
+                $bulk_ids=array_filter(array_map('intval',explode(',',$bulk_ids_raw)));
+                if(!$bulk_ids)fw_abort('recall_ids required (comma-separated)',400);
+                if(count($bulk_ids)>200)fw_abort('Maximum 200 ids per bulk operation',400);
+                $n_bulk=0;
+                foreach($bulk_ids as $brid){
+                    $prev_s=db()->prepare("SELECT flag FROM recall_flags WHERE recall_id=?");$prev_s->execute([$brid]);$prev_f=(string)($prev_s->fetchColumn()?:'');
+                    db()->prepare("INSERT INTO recall_flags(recall_id,flag,admin_note)VALUES(?,?,?) ON CONFLICT(recall_id) DO UPDATE SET flag=excluded.flag,admin_note=excluded.admin_note,updated_at=datetime('now')")->execute([$brid,$bulk_flag,$bulk_note]);
+                    try{db()->prepare("INSERT INTO recall_history(recall_id,actor_type,action,old_value,new_value)VALUES(?,?,?,?,?)")->execute([$brid,'admin','bulk_flag',$prev_f,$bulk_flag]);}catch(\Throwable){}
+                    $n_bulk++;
+                }
+                echo js(['ok'=>true,'updated'=>$n_bulk]);break;
             case 'v1':
                 $auth=$_SERVER['HTTP_AUTHORIZATION']??'';
                 $raw_key=str_starts_with($auth,'Bearer ')?trim(substr($auth,7)):trim($_GET['api_key']??'');
@@ -4892,6 +5129,10 @@ function handle_api(string $api):void{
                         if(!$eid)fw_abort('Requires ?resource=equivalences&id=<recall_id>',400);
                         $eq=db()->prepare("SELECT r2_id as id,sim FROM recall_equivalences WHERE r1_id=? UNION SELECT r1_id as id,sim FROM recall_equivalences WHERE r2_id=? ORDER BY sim DESC LIMIT 20");
                         $eq->execute([$eid,$eid]);echo js($eq->fetchAll());break;
+                    // SPRINT 14: public feeds listing
+                    case 'feeds':
+                        $pfl=db()->query("SELECT id,name,slug,filter_json,hit_count,created_at FROM public_feeds WHERE active=1 ORDER BY hit_count DESC LIMIT 100");
+                        echo js($pfl->fetchAll());break;
                     // SPRINT 13: user webhooks (authenticated by API key → user_id on key)
                     case 'webhooks':
                         $wuid=(int)$krow['user_id'];
@@ -4926,9 +5167,10 @@ function handle_api(string $api):void{
                             ['resource'=>'equivalences','params'=>['id'],'desc'=>'Semantically similar recalls for a given recall id'],
                             ['resource'=>'flags','params'=>['flag','page','per'],'desc'=>'Admin-flagged recalls with flag type and admin notes'],
                             ['resource'=>'webhooks','params'=>[],'desc'=>'List outbound webhooks registered to the API key owner'],
+                            ['resource'=>'feeds','params'=>[],'desc'=>'List active public RSS feed presets'],
                             ['resource'=>'docs','params'=>[],'desc'=>'This endpoint listing'],
                         ]]);break;
-                    default: fw_abort('Unknown v1 resource. Valid: recalls, retailers, manufacturers, categories, stats, brands, geo_risk, markov, co_escalation, equivalences, flags, webhooks, docs',404);
+                    default: fw_abort('Unknown v1 resource. Valid: recalls, retailers, manufacturers, categories, stats, brands, geo_risk, markov, co_escalation, equivalences, flags, webhooks, feeds, docs',404);
                 }
                 exit;
             // SPRINT 6: password reset
@@ -5091,6 +5333,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc}
     <a href="?page=markov_admin" class="fw-nav-link <?=$page==='markov_admin'?'active':''?>"><i data-lucide="activity" class="w-4 h-4"></i>Model Diagnostics</a>
     <a href="?page=search" class="fw-nav-link <?=$page==='search'?'active':''?>"><i data-lucide="search" class="w-4 h-4"></i>Search</a>
     <a href="?page=watchlist" class="fw-nav-link <?=$page==='watchlist'?'active':''?>"><i data-lucide="bell" class="w-4 h-4"></i>Watchlist</a>
+    <a href="?page=tags" class="fw-nav-link <?=$page==='tags'?'active':''?>"><i data-lucide="tags" class="w-4 h-4"></i>My Tags</a>
     <a href="?page=account" class="fw-nav-link <?=$page==='account'?'active':''?>"><i data-lucide="user" class="w-4 h-4"></i><?=is_user()?h(current_user()['email']):'Account'?></a>
     <div class="border-t border-slate-700 my-2 pt-2">
       <a href="?page=tests" class="fw-nav-link <?=$page==='tests'?'active':''?>"><i data-lucide="check-circle" class="w-4 h-4"></i>Self-Tests</a>
@@ -5151,6 +5394,7 @@ function render_page(string $p):void{
         'compare'       =>view_compare(),
         'watchlist'     =>view_watchlist(),
         'account'       =>view_account(),
+        'tags'          =>view_tags(),
         'tests'         =>view_tests(),
         'admin'         =>view_admin(),
         default         =>view_dashboard(),
@@ -7003,7 +7247,7 @@ function view_admin():void{
 
 <!-- Admin Tab Nav (GROUP 8) -->
 <div class="flex gap-0 border-b border-slate-200 mb-6 flex-wrap">
-  <?php foreach(['ingestion'=>'Ingestion','dq'=>'Data Quality','runs'=>'Run History','rate_limits'=>'Rate Limits','subscriptions'=>'Subscriptions','users'=>'Users','dbhealth'=>'DB Health'] as $tv=>$tl): ?>
+  <?php foreach(['ingestion'=>'Ingestion','dq'=>'Data Quality','runs'=>'Run History','rate_limits'=>'Rate Limits','subscriptions'=>'Subscriptions','users'=>'Users','dbhealth'=>'DB Health','audit'=>'Audit'] as $tv=>$tl): ?>
   <a href="?page=admin&atab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$admin_tab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
   <?php endforeach; ?>
 </div>
@@ -7293,11 +7537,154 @@ $migrations=db()->query("SELECT version,applied_at FROM schema_migrations ORDER 
 </div>
 <?php endif; // dbhealth tab ?>
 
+<?php if($admin_tab==='audit'): ?>
+<!-- Audit Trail & Bulk Flag (Sprint 14) -->
+<div class="space-y-6">
+  <!-- Recent audit trail from recall_history -->
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <div class="px-5 py-4 border-b border-slate-200 flex items-center gap-2">
+      <i data-lucide="scroll-text" class="w-4 h-4 text-slate-500"></i>
+      <h3 class="text-sm font-semibold text-slate-700">Recall History Audit Trail</h3>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="fw-table w-full text-sm">
+        <thead><tr><th>Time</th><th>Recall ID</th><th>Action</th><th>Actor</th><th>Detail</th></tr></thead>
+        <tbody>
+          <?php
+          $audit_rows=db()->query("SELECT rh.id,rh.recall_id,rh.action,rh.detail,rh.created_at,u.email FROM recall_history rh LEFT JOIN users u ON u.id=rh.user_id ORDER BY rh.id DESC LIMIT 200")->fetchAll();
+          foreach($audit_rows as $ar): ?>
+          <tr>
+            <td class="text-xs text-slate-400 whitespace-nowrap"><?=he(substr($ar['created_at']??'',0,16))?></td>
+            <td class="font-mono text-xs"><?=(int)$ar['recall_id']?></td>
+            <td><span class="px-2 py-0.5 rounded-full text-xs font-medium <?=$ar['action']==='bulk_flag'?'bg-amber-100 text-amber-700':($ar['action']==='flag'?'bg-red-100 text-red-700':'bg-slate-100 text-slate-600')?>"><?=he($ar['action']??'')?></span></td>
+            <td class="text-xs"><?=he($ar['email']??'system')?></td>
+            <td class="text-xs text-slate-500 max-w-xs truncate"><?=he($ar['detail']??'')?></td>
+          </tr>
+          <?php endforeach; ?>
+          <?php if(empty($audit_rows)): ?><tr><td colspan="5" class="text-center text-slate-400 py-4">No audit history yet.</td></tr><?php endif; ?>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Bulk flag form -->
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5"
+    x-data="{ids:'',reason:'review',submitting:false,msg:'',err:''}"
+    x-init="">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="flag" class="w-4 h-4 text-amber-500"></i>Bulk Flag Recalls</h3>
+    <p class="text-xs text-slate-500 mb-4">Enter comma-separated recall IDs to flag in bulk (max 200). Each flag is recorded in the audit trail.</p>
+    <div class="space-y-3">
+      <div>
+        <label class="block text-xs font-medium text-slate-600 mb-1">Recall IDs (comma-separated)</label>
+        <textarea x-model="ids" rows="3" placeholder="1001, 1002, 1003…" class="w-full text-sm font-mono border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500 resize-none"></textarea>
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-600 mb-1">Reason</label>
+        <select x-model="reason" class="text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+          <option value="review">Needs Review</option>
+          <option value="duplicate">Duplicate</option>
+          <option value="inaccurate">Inaccurate Data</option>
+          <option value="other">Other</option>
+        </select>
+      </div>
+      <button :disabled="submitting||!ids.trim()"
+        @click="submitting=true;msg='';err='';fetch('?api=recall_flag_bulk',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',recall_ids:ids,reason:reason})}).then(r=>r.json()).then(d=>{submitting=false;if(d.ok){msg='Flagged '+d.flagged+' recall(s). Reload to see audit trail.';ids=''}else{err=d.error||'Error'}}).catch(()=>{submitting=false;err='Network error'})"
+        class="bg-amber-500 text-white text-sm px-4 py-2 rounded font-medium hover:bg-amber-600 disabled:opacity-50 flex items-center gap-2">
+        <i data-lucide="flag" class="w-4 h-4"></i><span x-show="!submitting">Bulk Flag</span><span x-show="submitting">Processing…</span>
+      </button>
+      <p x-show="msg" x-text="msg" class="text-xs text-green-600"></p>
+      <p x-show="err" x-text="err" class="text-xs text-red-600"></p>
+    </div>
+  </div>
+</div>
+<?php endif; // audit tab ?>
+
 <?php layout_foot(); }
 
 // ================================================================
 // § ACCOUNT (Sprint 4)
 // ================================================================
+function view_tags():void{
+    $user=current_user();
+    layout_head('Tag Cloud','tags');
+    if(!$user): ?>
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm p-8 text-center">
+  <p class="text-slate-500 text-sm">Sign in to view your tag cloud.</p>
+  <a href="?page=account" class="mt-3 inline-block text-fw-500 text-sm hover:underline">Sign in →</a>
+</div>
+<?php else:
+    $ts=db()->prepare("SELECT tag,COUNT(DISTINCT recall_id) as cnt FROM recall_tags WHERE user_id=? GROUP BY tag ORDER BY cnt DESC LIMIT 200");
+    $ts->execute([$user['id']]);$tag_rows=$ts->fetchAll();
+    $global=db()->query("SELECT tag,COUNT(DISTINCT user_id) as users,COUNT(DISTINCT recall_id) as recalls FROM recall_tags GROUP BY tag ORDER BY recalls DESC LIMIT 50")->fetchAll();
+    $max_cnt=max(1,...array_column($tag_rows,'cnt')?:[1]);
+?>
+<div class="mb-6">
+  <h2 class="text-base font-semibold text-slate-800 mb-1">Your Tags</h2>
+  <p class="text-xs text-slate-500"><?=count($tag_rows)?> unique tag<?=count($tag_rows)!==1?'s':''?> across your recalled-recall bookmarks. Click a tag to filter the Recalls list.</p>
+</div>
+<?php if($tag_rows): ?>
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm p-6 mb-6">
+  <div class="flex flex-wrap gap-2 leading-relaxed">
+    <?php foreach($tag_rows as $t):
+        $size=max(0.75,min(1.75,0.75+($t['cnt']/$max_cnt)*1.0));
+        $opacity=max(60,min(100,60+(int)(($t['cnt']/$max_cnt)*40)));
+    ?>
+    <a href="?page=recalls&tag=<?=urlencode($t['tag'])?>" title="<?=(int)$t['cnt']?> recall<?=$t['cnt']!=1?'s':''?>"
+      style="font-size:<?=number_format($size,2)?>rem;opacity:<?=$opacity?>%"
+      class="inline-block bg-fw-50 text-fw-700 border border-fw-200 rounded px-2 py-0.5 hover:bg-fw-100 transition-colors font-medium">
+      <?=h($t['tag'])?><span class="text-fw-400 text-xs ml-1"><?=(int)$t['cnt']?></span>
+    </a>
+    <?php endforeach; ?>
+  </div>
+</div>
+<!-- Tag management table -->
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden mb-6"
+  x-data="{rows:<?=js($tag_rows)?>,renaming:null,newName:'',msg:''}">
+  <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+    <h3 class="text-sm font-semibold text-slate-700">Manage Tags</h3>
+    <p x-show="msg" x-text="msg" class="text-xs text-green-600"></p>
+  </div>
+  <table class="fw-table w-full">
+    <thead><tr><th>Tag</th><th class="text-center">Recalls</th><th></th></tr></thead>
+    <tbody>
+      <template x-for="(t,i) in rows" :key="t.tag">
+        <tr>
+          <td>
+            <div x-show="renaming!==t.tag" class="text-sm font-medium text-slate-800" x-text="t.tag"></div>
+            <div x-show="renaming===t.tag" class="flex gap-2 items-center">
+              <input x-model="newName" type="text" maxlength="20" class="text-sm border border-slate-300 rounded px-2 py-1 w-32 focus:outline-none focus:ring-1 focus:ring-fw-500">
+              <button @click="fetch('?api=tag_rename',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',old_tag:t.tag,new_tag:newName})}).then(r=>r.json()).then(d=>{if(d.ok){const oi=rows.findIndex(x=>x.tag===newName);if(oi>=0){rows[oi].cnt+=t.cnt;rows.splice(i,1);}else{t.tag=newName;}renaming=null;msg='Renamed';}else alert(d.error||'Error')})" class="text-xs bg-fw-500 text-white px-2 py-1 rounded hover:bg-fw-700">Save</button>
+              <button @click="renaming=null" class="text-xs text-slate-500 hover:underline">Cancel</button>
+            </div>
+          </td>
+          <td class="text-center font-mono text-sm" x-text="t.cnt"></td>
+          <td class="flex gap-3">
+            <button x-show="renaming!==t.tag" @click="renaming=t.tag;newName=t.tag" class="text-xs text-blue-500 hover:underline">Rename</button>
+            <button @click="if(confirm('Delete all \''+t.tag+'\' tags?'))fetch('?api=tag_del_all',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',tag:t.tag})}).then(()=>{rows=rows.filter(x=>x.tag!==t.tag);msg='Deleted '+t.tag})" class="text-xs text-red-500 hover:underline">Delete all</button>
+          </td>
+        </tr>
+      </template>
+    </tbody>
+  </table>
+</div>
+<?php else: ?>
+<div class="bg-white rounded-lg border border-slate-200 p-8 text-center text-slate-400 text-sm">No tags yet. Open any recall to add tags.</div>
+<?php endif; ?>
+<?php if($global): ?>
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+  <h3 class="text-sm font-semibold text-slate-700 mb-3">Top Tags Across All Users</h3>
+  <div class="flex flex-wrap gap-2">
+    <?php foreach($global as $g): ?>
+    <a href="?page=recalls&tag=<?=urlencode($g['tag'])?>" class="inline-flex items-center gap-1 bg-slate-100 text-slate-700 rounded px-2 py-0.5 text-xs hover:bg-slate-200 transition-colors">
+      <?=h($g['tag'])?><span class="text-slate-400"><?=(int)$g['recalls']?> recall<?=$g['recalls']!=1?'s':''?></span>
+    </a>
+    <?php endforeach; ?>
+  </div>
+</div>
+<?php endif; ?>
+<?php endif; ?>
+<?php layout_foot(); }
+
 function view_account():void{
     // Handle logout
     if(($_GET['logout']??'')&&csrf_ok()){user_logout();header('Location: ?page=account');exit;}
@@ -7409,7 +7796,7 @@ if(!$user && $reset_tok_param): ?>
 <!-- Tab nav -->
 <?php $atab=$_GET['tab']??'overview'; ?>
 <div class="flex gap-0 border-b border-slate-200 mb-6">
-  <?php foreach(['overview'=>'Overview','filters'=>'Saved Filters','alerts'=>'Alerts','keys'=>'API Keys','activity'=>'Activity','notifications'=>'Notifications'] as $tv=>$tl): ?>
+  <?php foreach(['overview'=>'Overview','filters'=>'Saved Filters','alerts'=>'Alerts','keys'=>'API Keys','activity'=>'Activity','notifications'=>'Notifications','tags'=>'Tags','feeds'=>'RSS Feeds'] as $tv=>$tl): ?>
   <a href="?page=account&tab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$atab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
   <?php endforeach; ?>
 </div>
@@ -7670,6 +8057,80 @@ Authorization: Bearer fw_...</pre>
           </tr>
           <tr x-show="testMsg[h.id]">
             <td colspan="6" class="text-xs py-1 px-4" :class="testMsg[h.id]?.startsWith('✓')?'text-green-600':'text-red-600'" x-text="testMsg[h.id]"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<?php elseif($atab==='tags'): ?>
+<!-- Tags tab (Sprint 14) -->
+<div x-data="{tags:[],loading:true,renameVal:{},renameMsg:{},delMsg:{}}"
+  x-init="fetch('?api=tags_stats').then(r=>r.json()).then(d=>{tags=d;loading=false})">
+  <div x-show="loading" class="text-sm text-slate-400 animate-pulse py-4">Loading tags…</div>
+  <div x-show="!loading&&tags.length===0" class="text-sm text-slate-400 text-center py-6 bg-white rounded-lg border border-slate-200">No tags yet. Tag recalls from the recall detail page.</div>
+  <div x-show="!loading&&tags.length>0" class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <table class="fw-table w-full">
+      <thead><tr><th>Tag</th><th class="text-center">Recalls</th><th>Rename</th><th></th></tr></thead>
+      <tbody>
+        <template x-for="t in tags" :key="t.tag">
+          <tr>
+            <td class="font-medium text-sm" x-text="t.tag"></td>
+            <td class="text-center text-sm" x-text="t.cnt"></td>
+            <td>
+              <div class="flex gap-2 items-center">
+                <input :x-model="'renameVal.'+t.tag" x-model="renameVal[t.tag]" type="text" :placeholder="t.tag" maxlength="80" class="text-xs border border-slate-300 rounded px-2 py-1 w-32 focus:outline-none focus:ring-1 focus:ring-fw-500">
+                <button @click="if(!renameVal[t.tag]?.trim()||renameVal[t.tag]===t.tag)return;fetch('?api=tag_rename',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',old_tag:t.tag,new_tag:renameVal[t.tag].trim()})}).then(r=>r.json()).then(d=>{if(d.ok){renameMsg[t.tag]='✓ Renamed';t.tag=renameVal[t.tag].trim()}else{renameMsg[t.tag]=d.error||'Error'}})" class="text-xs text-blue-500 hover:underline">Rename</button>
+                <span class="text-xs" :class="renameMsg[t.tag]?.startsWith('✓')?'text-green-600':'text-red-600'" x-text="renameMsg[t.tag]||''"></span>
+              </div>
+            </td>
+            <td>
+              <button @click="if(confirm('Delete all uses of tag &quot;'+t.tag+'&quot;?'))fetch('?api=tag_del_all',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',tag:t.tag})}).then(r=>r.json()).then(d=>{if(d.ok){tags=tags.filter(x=>x.tag!==t.tag)}else alert(d.error||'Error')})" class="text-xs text-red-500 hover:underline">Delete All</button>
+            </td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<?php elseif($atab==='feeds'): ?>
+<!-- RSS Feeds tab (Sprint 14) -->
+<div x-data="{feeds:[],loading:true,fname:'',ffilter:'',fmsg:'',fcreating:false}"
+  x-init="fetch('?api=feeds_list').then(r=>r.json()).then(d=>{feeds=d;loading=false})">
+  <!-- Create new feed -->
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="rss" class="w-4 h-4 text-orange-500"></i>Create Public RSS Feed</h3>
+    <p class="text-xs text-slate-500 mb-4">Create a public RSS 2.0 feed for your saved recall searches. Share the RSS URL with any news reader. Maximum 10 feeds per account.</p>
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+      <div><label class="text-xs text-slate-600 mb-1 block">Feed Name</label><input x-model="fname" type="text" placeholder="My Allergen Watch" maxlength="120" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500"></div>
+      <div><label class="text-xs text-slate-600 mb-1 block">Filter (optional JSON)</label><input x-model="ffilter" type="text" placeholder='{"state":"CA"}' class="w-full text-sm font-mono border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500"></div>
+    </div>
+    <button :disabled="fcreating||!fname.trim()"
+      @click="fcreating=true;fmsg='';fetch('?api=feed_create',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',name:fname,filter_json:ffilter||'{}'})}).then(r=>r.json()).then(d=>{fcreating=false;if(d.ok){feeds.push({id:d.id,name:fname,slug:d.slug,rss_url:d.rss_url,hit_count:0,created_at:new Date().toISOString()});fname='';ffilter='';fmsg='Feed created!'}else fmsg=d.error||'Error'}).catch(()=>{fcreating=false;fmsg='Network error'})"
+      class="bg-orange-500 text-white text-sm px-4 py-2 rounded font-medium hover:bg-orange-600 disabled:opacity-50 flex items-center gap-2">
+      <i data-lucide="plus-circle" class="w-4 h-4"></i><span x-show="!fcreating">Create Feed</span><span x-show="fcreating">Creating…</span>
+    </button>
+    <p x-show="fmsg" x-text="fmsg" :class="fmsg==='Feed created!'?'text-green-600':'text-red-600'" class="text-xs mt-2"></p>
+  </div>
+
+  <!-- Feed list -->
+  <div x-show="loading" class="text-sm text-slate-400 animate-pulse py-4">Loading feeds…</div>
+  <div x-show="!loading&&feeds.length===0" class="text-sm text-slate-400 text-center py-6 bg-white rounded-lg border border-slate-200">No RSS feeds yet. Create one above.</div>
+  <div x-show="!loading&&feeds.length>0" class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <table class="fw-table w-full">
+      <thead><tr><th>Name</th><th>RSS URL</th><th class="text-center">Hits</th><th>Created</th><th></th></tr></thead>
+      <tbody>
+        <template x-for="f in feeds" :key="f.id">
+          <tr>
+            <td class="font-medium text-sm" x-text="f.name"></td>
+            <td class="font-mono text-xs">
+              <a :href="'?api=rss&slug='+f.slug" target="_blank" class="text-fw-500 hover:underline" x-text="'?api=rss&slug='+f.slug"></a>
+            </td>
+            <td class="text-center text-sm" x-text="f.hit_count"></td>
+            <td class="text-xs text-slate-400" x-text="f.created_at?.substring(0,10)||''"></td>
+            <td><button @click="if(confirm('Delete feed '+f.name+'?'))fetch('?api=feed_del',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',id:f.id})}).then(r=>r.json()).then(d=>{if(d.ok)feeds=feeds.filter(x=>x.id!==f.id);else alert(d.error||'Error')})" class="text-xs text-red-500 hover:underline">Delete</button></td>
           </tr>
         </template>
       </tbody>
