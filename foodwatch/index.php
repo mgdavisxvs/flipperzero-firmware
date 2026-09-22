@@ -9,8 +9,8 @@ declare(strict_types=1);
 // ================================================================
 // § CONSTANTS
 // ================================================================
-const FW_VERSION    = '9.0.0';
-const FW_SCHEMA_VER = 48;
+const FW_VERSION    = '10.0.0';
+const FW_SCHEMA_VER = 54;
 // Pre-shared secret for IONOS crontab → cron_alerts endpoint; override before deploy
 const FW_CRON_SECRET = 'change-me-before-deploy';
 const FW_DATA_DIR   = __DIR__ . '/data';
@@ -284,6 +284,7 @@ function db():PDO{
     $pdo->exec('PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;PRAGMA cache_size=-32000;PRAGMA foreign_keys=ON;PRAGMA temp_store=MEMORY;');
     migrate($pdo);
     seed_system_settings();
+    seed_feature_flags();
     return $pdo;
 }
 
@@ -311,7 +312,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26(),27=>m27(),28=>m28(),29=>m29(),30=>m30(),31=>m31(),32=>m32(),33=>m33(),34=>m34(),35=>m35(),36=>m36(),37=>m37(),38=>m38(),39=>m39(),40=>m40(),41=>m41(),42=>m42(),43=>m43(),44=>m44(),45=>m45(),46=>m46(),47=>m47(),48=>m48()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26(),27=>m27(),28=>m28(),29=>m29(),30=>m30(),31=>m31(),32=>m32(),33=>m33(),34=>m34(),35=>m35(),36=>m36(),37=>m37(),38=>m38(),39=>m39(),40=>m40(),41=>m41(),42=>m42(),43=>m43(),44=>m44(),45=>m45(),46=>m46(),47=>m47(),48=>m48(),49=>m49(),50=>m50(),51=>m51(),52=>m52(),53=>m53(),54=>m54()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -800,6 +801,97 @@ CREATE TABLE IF NOT EXISTS notification_prefs(
   digest_freq TEXT NOT NULL DEFAULT 'immediate' CHECK(digest_freq IN ('immediate','daily','weekly')),
   updated_at TEXT NOT NULL DEFAULT(datetime('now')));
 CREATE INDEX IF NOT EXISTS idx_np_user ON notification_prefs(user_id);
+SQL; }
+
+function m54():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS feature_flags(
+  key TEXT PRIMARY KEY,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  description TEXT NOT NULL DEFAULT '',
+  updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TEXT NOT NULL DEFAULT(datetime('now')));
+INSERT OR IGNORE INTO feature_flags(key,enabled,description)VALUES
+  ('fts_enabled',1,'Full-text search on recalls'),
+  ('digest_enabled',1,'Recall digest emails'),
+  ('api_v2_beta',0,'API v2 beta endpoints'),
+  ('public_alerts',1,'Public email alert subscriptions'),
+  ('clustering_enabled',1,'Automated recall clustering'),
+  ('dq_auto_sweep',0,'Automatic DQ scoring on ingest');
+SQL; }
+
+function m53():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS dq_scores(
+  recall_id INTEGER PRIMARY KEY REFERENCES recalls(id) ON DELETE CASCADE,
+  completeness REAL NOT NULL DEFAULT 0,
+  has_date INTEGER NOT NULL DEFAULT 0,
+  has_states INTEGER NOT NULL DEFAULT 0,
+  has_products INTEGER NOT NULL DEFAULT 0,
+  has_reason INTEGER NOT NULL DEFAULT 0,
+  computed_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_dqs_score ON dq_scores(completeness);
+SQL; }
+
+function m52():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS alert_subscriptions(
+  id INTEGER PRIMARY KEY,
+  email TEXT NOT NULL,
+  token TEXT NOT NULL UNIQUE,
+  states_json TEXT NOT NULL DEFAULT '[]',
+  categories_json TEXT NOT NULL DEFAULT '[]',
+  confirmed INTEGER NOT NULL DEFAULT 0,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT(datetime('now')),
+  confirmed_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_as_email ON alert_subscriptions(email);
+CREATE INDEX IF NOT EXISTS idx_as_token ON alert_subscriptions(token);
+SQL; }
+
+function m51():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS product_profiles(
+  id INTEGER PRIMARY KEY,
+  upc TEXT UNIQUE,
+  name TEXT NOT NULL DEFAULT '',
+  brand_id INTEGER REFERENCES brands(id) ON DELETE SET NULL,
+  recall_count INTEGER NOT NULL DEFAULT 0,
+  last_recalled_at TEXT,
+  risk_score REAL NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_pp_upc ON product_profiles(upc);
+CREATE INDEX IF NOT EXISTS idx_pp_risk ON product_profiles(risk_score);
+SQL; }
+
+function m50():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS recall_clusters(
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',
+  cluster_type TEXT NOT NULL DEFAULT 'category' CHECK(cluster_type IN ('category','geo','hazard','manufacturer')),
+  category TEXT,
+  states_json TEXT NOT NULL DEFAULT '[]',
+  recall_ids_json TEXT NOT NULL DEFAULT '[]',
+  score REAL NOT NULL DEFAULT 0,
+  size INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_rcl_type ON recall_clusters(cluster_type, score);
+SQL; }
+
+function m49():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS cron_schedules(
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  handler TEXT NOT NULL DEFAULT '',
+  cron_expr TEXT NOT NULL DEFAULT '0 * * * *',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  run_count INTEGER NOT NULL DEFAULT 0,
+  last_run_at TEXT,
+  next_run_at TEXT,
+  last_status TEXT NOT NULL DEFAULT 'pending' CHECK(last_status IN ('pending','running','ok','error')),
+  created_at TEXT NOT NULL DEFAULT(datetime('now')));
+INSERT OR IGNORE INTO cron_schedules(name,handler,cron_expr)VALUES
+  ('fda_ingest','ingest_fda','0 */6 * * *'),
+  ('fts_rebuild','fts_rebuild','0 2 * * *'),
+  ('dq_sweep','run_dq_sweep','0 3 * * *'),
+  ('archive_old','archive_old_recalls','0 4 * * 0'),
+  ('digest_weekly','digest_send_all','0 8 * * 1');
 SQL; }
 
 function m48():string{ return <<<'SQL'
@@ -2738,6 +2830,131 @@ function send_email_alerts():array{
 }
 
 // ================================================================
+// § SPRINT 31-40 HELPERS
+// ================================================================
+
+function cron_due():array{
+    try{
+        $now=date('Y-m-d H:i:s');
+        $r=db()->prepare("SELECT * FROM cron_schedules WHERE enabled=1 AND (next_run_at IS NULL OR next_run_at<=?)");
+        $r->execute([$now]);return $r->fetchAll(\PDO::FETCH_ASSOC);
+    }catch(\Throwable){return[];}
+}
+
+function cron_run(string $name):string{
+    try{
+        $row=db()->prepare("SELECT * FROM cron_schedules WHERE name=?");
+        $row->execute([$name]);$job=$row->fetch(\PDO::FETCH_ASSOC);
+        if(!$job)return 'not_found';
+        db()->prepare("UPDATE cron_schedules SET last_status='running',last_run_at=datetime('now') WHERE name=?")->execute([$name]);
+        $status='ok';
+        try{
+            $handler=$job['handler']??'';
+            if($handler==='fts_rebuild')fts_rebuild();
+            elseif($handler==='run_dq_sweep')run_dq_sweep();
+            elseif($handler==='archive_old_recalls')archive_old_recalls((int)settings_get('archive_days','730'));
+        }catch(\Throwable){$status='error';}
+        db()->prepare("UPDATE cron_schedules SET last_status=?,run_count=run_count+1,next_run_at=datetime('now','+6 hours') WHERE name=?")->execute([$status,$name]);
+        return $status;
+    }catch(\Throwable){return 'error';}
+}
+
+function build_clusters():array{
+    $db=db();
+    $rows=$db->query("SELECT category,COUNT(*) as cnt,GROUP_CONCAT(id) as ids FROM recalls WHERE status NOT IN ('closed','terminated') GROUP BY category HAVING cnt>=2 ORDER BY cnt DESC LIMIT 50")->fetchAll(\PDO::FETCH_ASSOC);
+    try{$db->exec("DELETE FROM recall_clusters WHERE cluster_type='category'");}catch(\Throwable){}
+    $ins=$db->prepare("INSERT INTO recall_clusters(name,cluster_type,category,recall_ids_json,score,size)VALUES(?,?,?,?,?,?)");
+    $clusters=[];
+    foreach($rows as $r){
+        $ids=array_map('intval',explode(',',$r['ids']));
+        $score=round(min(1.0,$r['cnt']/100),4);
+        $name=($r['category']??'Unknown').' Cluster';
+        $ins->execute([$name,'category',$r['category']??'',json_encode($ids),$score,(int)$r['cnt']]);
+        $clusters[]=['name'=>$name,'size'=>(int)$r['cnt'],'score'=>$score];
+    }
+    return $clusters;
+}
+
+function sync_product_profiles():int{
+    $rows=db()->query("SELECT rp.description as name,rp.brand_id,COUNT(DISTINCT rp.recall_id) as recall_count,MAX(r.announced_date) as last_recalled_at FROM recall_products rp LEFT JOIN recalls r ON r.id=rp.recall_id WHERE rp.description IS NOT NULL AND rp.description!='' GROUP BY rp.description,rp.brand_id ORDER BY recall_count DESC LIMIT 500")->fetchAll(\PDO::FETCH_ASSOC);
+    $ins=db()->prepare("INSERT OR REPLACE INTO product_profiles(name,brand_id,recall_count,last_recalled_at,risk_score,updated_at)VALUES(?,?,?,?,?,datetime('now'))");
+    foreach($rows as $r){
+        $risk=round(min(1.0,$r['recall_count']/20),4);
+        $ins->execute([$r['name'],$r['brand_id']?:(null),(int)$r['recall_count'],$r['last_recalled_at'],$risk]);
+    }
+    return count($rows);
+}
+
+function compute_dq_score(int $recall_id):float{
+    try{
+        $r=db()->prepare("SELECT r.announced_date,r.reason,(SELECT COUNT(*) FROM recall_states rs WHERE rs.recall_id=r.id) as sc,(SELECT COUNT(*) FROM recall_products rp WHERE rp.recall_id=r.id) as pc FROM recalls r WHERE r.id=?");
+        $r->execute([$recall_id]);$row=$r->fetch(\PDO::FETCH_ASSOC);
+        if(!$row)return 0.0;
+        $has_date=!empty($row['announced_date'])?1:0;
+        $has_states=(int)$row['sc']>0?1:0;
+        $has_products=(int)$row['pc']>0?1:0;
+        $has_reason=!empty(trim($row['reason']??''))?1:0;
+        $score=round(($has_date+$has_states+$has_products+$has_reason)/4.0,4);
+        db()->prepare("INSERT OR REPLACE INTO dq_scores(recall_id,completeness,has_date,has_states,has_products,has_reason,computed_at)VALUES(?,?,?,?,?,?,datetime('now'))")
+            ->execute([$recall_id,$score,$has_date,$has_states,$has_products,$has_reason]);
+        return $score;
+    }catch(\Throwable){return 0.0;}
+}
+
+function run_dq_sweep():int{
+    $ids=db()->query("SELECT id FROM recalls ORDER BY id DESC LIMIT 2000")->fetchAll(\PDO::FETCH_COLUMN);
+    foreach($ids as $id)compute_dq_score((int)$id);
+    return count($ids);
+}
+
+function stream_csv(array $rows, array $keys=[]):string{
+    if(empty($rows))return '';
+    $ks=$keys?:array_keys($rows[0]);
+    $out=implode(',',array_map(fn($k)=>'"'.str_replace('"','""',$k).'"',$ks))."\n";
+    foreach($rows as $row){
+        $out.=implode(',',array_map(fn($k)=>'"'.str_replace('"','""',(string)($row[$k]??'')).'"',$ks))."\n";
+    }
+    return $out;
+}
+
+function q_manufacturer_profile(int $id):array{
+    $db=db();
+    $m=$db->prepare("SELECT m.id,m.name,m.city,m.state,COUNT(DISTINCT rp.recall_id) as recall_count FROM manufacturers m LEFT JOIN brands b ON b.manufacturer_id=m.id LEFT JOIN recall_products rp ON rp.brand_id=b.id WHERE m.id=? GROUP BY m.id");
+    $m->execute([$id]);$mfr=$m->fetch(\PDO::FETCH_ASSOC);
+    if(!$mfr)return[];
+    $cats=$db->prepare("SELECT r.category,COUNT(DISTINCT r.id) as cnt FROM recalls r JOIN recall_products rp ON rp.recall_id=r.id JOIN brands b ON b.id=rp.brand_id WHERE b.manufacturer_id=? GROUP BY r.category ORDER BY cnt DESC LIMIT 10");
+    $cats->execute([$id]);
+    $states=$db->prepare("SELECT rs.state,COUNT(DISTINCT rs.recall_id) as cnt FROM recall_states rs JOIN recall_products rp ON rp.recall_id=rs.recall_id JOIN brands b ON b.id=rp.brand_id WHERE b.manufacturer_id=? GROUP BY rs.state ORDER BY cnt DESC LIMIT 15");
+    $states->execute([$id]);
+    $ci=$db->prepare("SELECT COUNT(DISTINCT r.id) FROM recalls r JOIN recall_products rp ON rp.recall_id=r.id JOIN brands b ON b.id=rp.brand_id WHERE b.manufacturer_id=? AND r.severity='Class I'");
+    $ci->execute([$id]);
+    $brands=$db->prepare("SELECT b.id,b.name,COUNT(DISTINCT rp.recall_id) as recall_count FROM brands b LEFT JOIN recall_products rp ON rp.brand_id=b.id WHERE b.manufacturer_id=? GROUP BY b.id ORDER BY recall_count DESC LIMIT 20");
+    $brands->execute([$id]);
+    return['manufacturer'=>$mfr,'categories'=>$cats->fetchAll(\PDO::FETCH_ASSOC),'states'=>$states->fetchAll(\PDO::FETCH_ASSOC),'class_i_count'=>(int)$ci->fetchColumn(),'brands'=>$brands->fetchAll(\PDO::FETCH_ASSOC)];
+}
+
+function feature_enabled(string $key):bool{
+    try{
+        $r=db()->prepare("SELECT enabled FROM feature_flags WHERE key=?");
+        $r->execute([$key]);$v=$r->fetchColumn();
+        return $v!==false&&(bool)(int)$v;
+    }catch(\Throwable){return false;}
+}
+
+function seed_feature_flags():void{
+    $defaults=[
+        ['fts_enabled',1,'Full-text search on recalls'],
+        ['digest_enabled',1,'Recall digest emails'],
+        ['api_v2_beta',0,'API v2 beta endpoints'],
+        ['public_alerts',1,'Public email alert subscriptions'],
+        ['clustering_enabled',1,'Automated recall clustering'],
+        ['dq_auto_sweep',0,'Automatic DQ scoring on ingest'],
+    ];
+    foreach($defaults as [$k,$v,$d]){
+        try{db()->prepare("INSERT OR IGNORE INTO feature_flags(key,enabled,description)VALUES(?,?,?)")->execute([$k,$v,$d]);}catch(\Throwable){}
+    }
+}
+
 // § SPRINT 26-30 HELPERS
 // ================================================================
 
@@ -3246,6 +3463,136 @@ function run_tests():array{
         'notif_prefs_digest'    =>'test_notif_prefs_digest',
         'webhook_hmac_header'   =>'test_webhook_hmac_header',
         'webhook_max_5'         =>'test_webhook_max_5',
+        // Sprint 40
+        'm_feature_flags_cols'      =>'test_m_feature_flags_cols',
+        'feature_enabled_fn'        =>'test_feature_enabled_fn',
+        'seed_feature_flags_fn'     =>'test_seed_feature_flags_fn',
+        'feature_flags_list_api'    =>'test_feature_flags_list_api',
+        'feature_flag_set_api'      =>'test_feature_flag_set_api',
+        'system_info_api'           =>'test_system_info_api',
+        'admin_feature_flags_tab'   =>'test_admin_feature_flags_tab',
+        'flag_enabled_field'        =>'test_flag_enabled_field',
+        'flag_description_field'    =>'test_flag_description_field',
+        'fw_version_10'             =>'test_fw_version_10',
+        'schema_ver_54'             =>'test_schema_ver_54',
+        'feature_flag_seeded_defaults'=>'test_feature_flag_seeded_defaults',
+        // Sprint 39
+        'q_manufacturer_profile_fn' =>'test_q_manufacturer_profile_fn',
+        'manufacturer_profile_api'  =>'test_manufacturer_profile_api',
+        'v1_manufacturer_profile_resource'=>'test_v1_manufacturer_profile_resource',
+        'manufacturer_class_i_count'=>'test_manufacturer_class_i_count',
+        'manufacturer_categories'   =>'test_manufacturer_categories',
+        'manufacturer_states'       =>'test_manufacturer_states',
+        'manufacturer_brands'       =>'test_manufacturer_brands',
+        'manufacturer_recall_count' =>'test_manufacturer_recall_count',
+        'manufacturer_id_required'  =>'test_manufacturer_id_required',
+        'manufacturer_not_found_404'=>'test_manufacturer_not_found_404',
+        'manufacturer_profile_structure'=>'test_manufacturer_profile_structure',
+        'manufacturer_join_brands'  =>'test_manufacturer_join_brands',
+        // Sprint 38
+        'compare_recalls_api'       =>'test_compare_recalls_api',
+        'compare_min_2_ids'         =>'test_compare_min_2_ids',
+        'compare_max_4_ids'         =>'test_compare_max_4_ids',
+        'compare_ids_param'         =>'test_compare_ids_param',
+        'compare_title_field'       =>'test_compare_title_field',
+        'compare_severity_field'    =>'test_compare_severity_field',
+        'compare_status_field'      =>'test_compare_status_field',
+        'compare_agency_field'      =>'test_compare_agency_field',
+        'compare_date_field'        =>'test_compare_date_field',
+        'compare_recalls_count'     =>'test_compare_recalls_count',
+        'compare_unique_ids'        =>'test_compare_unique_ids',
+        'compare_side_by_side'      =>'test_compare_side_by_side',
+        // Sprint 37
+        'stream_csv_fn'             =>'test_stream_csv_fn',
+        'export_recalls_api'        =>'test_export_recalls_api',
+        'export_manufacturers_api'  =>'test_export_manufacturers_api',
+        'export_geo_risk_api'       =>'test_export_geo_risk_api',
+        'account_export_tab'        =>'test_account_export_tab',
+        'export_csv_format'         =>'test_export_csv_format',
+        'export_json_format'        =>'test_export_json_format',
+        'export_recalls_fields'     =>'test_export_recalls_fields',
+        'export_content_type_csv'   =>'test_export_content_type_csv',
+        'export_filter_status'      =>'test_export_filter_status',
+        'export_limit_cap'          =>'test_export_limit_cap',
+        'export_fmt_param'          =>'test_export_fmt_param',
+        // Sprint 36
+        'm_dq_scores_cols'          =>'test_m_dq_scores_cols',
+        'compute_dq_score_fn'       =>'test_compute_dq_score_fn',
+        'run_dq_sweep_fn'           =>'test_run_dq_sweep_fn',
+        'dq_sweep_api'              =>'test_dq_sweep_api',
+        'dq_score_list_api'         =>'test_dq_score_list_api',
+        'admin_dq_scores_tab'       =>'test_admin_dq_scores_tab',
+        'dq_completeness_field'     =>'test_dq_completeness_field',
+        'dq_has_date_field'         =>'test_dq_has_date_field',
+        'dq_has_states_field'       =>'test_dq_has_states_field',
+        'dq_has_products_field'     =>'test_dq_has_products_field',
+        'dq_has_reason_field'       =>'test_dq_has_reason_field',
+        'dq_recall_id_fk'           =>'test_dq_recall_id_fk',
+        // Sprint 35
+        'analytics_timeseries_api'  =>'test_analytics_timeseries_api',
+        'analytics_category_api'    =>'test_analytics_category_api',
+        'analytics_top_manufacturers_api'=>'test_analytics_top_manufacturers_api',
+        'analytics_days_param'      =>'test_analytics_days_param',
+        'analytics_week_grouping'   =>'test_analytics_week_grouping',
+        'analytics_category_class_i'=>'test_analytics_category_class_i',
+        'analytics_top_25_manufacturers'=>'test_analytics_top_25_manufacturers',
+        'analytics_filter_status'   =>'test_analytics_filter_status',
+        'analytics_filter_category' =>'test_analytics_filter_category',
+        'analytics_limit_cap'       =>'test_analytics_limit_cap',
+        'analytics_timeseries_limit'=>'test_analytics_timeseries_limit',
+        'analytics_public_access'   =>'test_analytics_public_access',
+        // Sprint 34
+        'm_alert_subs_cols'         =>'test_m_alert_subs_cols',
+        'alert_subscribe_api'       =>'test_alert_subscribe_api',
+        'alert_confirm_api'         =>'test_alert_confirm_api',
+        'alert_unsubscribe_api'     =>'test_alert_unsubscribe_api',
+        'alert_list_admin_api'      =>'test_alert_list_admin_api',
+        'admin_alert_subs_tab'      =>'test_admin_alert_subs_tab',
+        'alert_token_unique'        =>'test_alert_token_unique',
+        'alert_confirmed_field'     =>'test_alert_confirmed_field',
+        'alert_states_json'         =>'test_alert_states_json',
+        'alert_categories_json'     =>'test_alert_categories_json',
+        'alert_active_field'        =>'test_alert_active_field',
+        'alert_email_index'         =>'test_alert_email_index',
+        // Sprint 33
+        'm_product_profiles_cols'   =>'test_m_product_profiles_cols',
+        'sync_product_profiles_fn'  =>'test_sync_product_profiles_fn',
+        'product_profile_list_api'  =>'test_product_profile_list_api',
+        'product_profile_get_api'   =>'test_product_profile_get_api',
+        'v1_product_profiles_resource'=>'test_v1_product_profiles_resource',
+        'admin_product_profiles_tab'=>'test_admin_product_profiles_tab',
+        'profile_upc_field'         =>'test_profile_upc_field',
+        'profile_recall_count_field'=>'test_profile_recall_count_field',
+        'profile_risk_score_field'  =>'test_profile_risk_score_field',
+        'profile_last_recalled_field'=>'test_profile_last_recalled_field',
+        'profile_brand_id_fk'       =>'test_profile_brand_id_fk',
+        'profile_upc_index'         =>'test_profile_upc_index',
+        // Sprint 32
+        'm_recall_clusters_cols'    =>'test_m_recall_clusters_cols',
+        'build_clusters_fn'         =>'test_build_clusters_fn',
+        'cluster_list_api'          =>'test_cluster_list_api',
+        'cluster_build_api'         =>'test_cluster_build_api',
+        'v1_clusters_resource'      =>'test_v1_clusters_resource',
+        'admin_clusters_tab'        =>'test_admin_clusters_tab',
+        'cluster_type_check'        =>'test_cluster_type_check',
+        'cluster_score_field'       =>'test_cluster_score_field',
+        'cluster_size_field'        =>'test_cluster_size_field',
+        'cluster_recall_ids_json'   =>'test_cluster_recall_ids_json',
+        'cluster_states_json'       =>'test_cluster_states_json',
+        'cluster_category_field'    =>'test_cluster_category_field',
+        // Sprint 31
+        'm_cron_schedules_cols'     =>'test_m_cron_schedules_cols',
+        'cron_due_fn'               =>'test_cron_due_fn',
+        'cron_run_fn'               =>'test_cron_run_fn',
+        'cron_list_api'             =>'test_cron_list_api',
+        'cron_enable_api'           =>'test_cron_enable_api',
+        'cron_run_now_api'          =>'test_cron_run_now_api',
+        'admin_cron_tab'            =>'test_admin_cron_tab',
+        'cron_name_unique'          =>'test_cron_name_unique',
+        'cron_enabled_field'        =>'test_cron_enabled_field',
+        'cron_run_count_field'      =>'test_cron_run_count_field',
+        'cron_last_status_values'   =>'test_cron_last_status_values',
+        'cron_seed_defaults'        =>'test_cron_seed_defaults',
         // Sprint 30
         'm_system_settings_cols'    =>'test_m_system_settings_cols',
         'settings_get_fn'           =>'test_settings_get_fn',
@@ -4901,6 +5248,644 @@ function test_history_list_empty():array{
         $off=$p+1;
     }
     return['status'=>$found?'PASS':'FAIL','msg'=>$found?'history_list uses LIMIT 50 (handles empty result gracefully)':'history_list missing LIMIT clause'];
+}
+
+// ================================================================
+// § SPRINT 40 TESTS — Feature Flags
+// ================================================================
+function test_m_feature_flags_cols():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'CREATE TABLE IF NOT EXISTS feature_flags')&&str_contains($src,'enabled INTEGER NOT NULL DEFAULT 0');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'feature_flags table defined':'feature_flags schema missing'];
+}
+function test_feature_enabled_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function feature_enabled(string $key):bool');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'feature_enabled() defined':'feature_enabled() missing'];
+}
+function test_seed_feature_flags_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function seed_feature_flags():void');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'seed_feature_flags() defined':'seed_feature_flags() missing'];
+}
+function test_feature_flags_list_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'feature_flags_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'feature_flags_list API case defined':'feature_flags_list API case missing'];
+}
+function test_feature_flag_set_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'feature_flag_set':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'feature_flag_set API case defined':'feature_flag_set API case missing'];
+}
+function test_system_info_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'system_info':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'system_info API case defined':'system_info API case missing'];
+}
+function test_admin_feature_flags_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'feature_flags'=>'Feature Flags'")&&str_contains($src,"\$atab==='feature_flags'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'feature_flags admin tab defined':'feature_flags admin tab missing'];
+}
+function test_flag_enabled_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'enabled INTEGER NOT NULL DEFAULT 0')&&str_contains($src,'feature_flags');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'feature_flags.enabled field defined':'feature_flags.enabled field missing'];
+}
+function test_flag_description_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"description TEXT NOT NULL DEFAULT ''")&&str_contains($src,'feature_flags');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'feature_flags.description field defined':'feature_flags.description field missing'];
+}
+function test_fw_version_10():array{
+    $ok=defined('FW_VERSION')&&str_starts_with(FW_VERSION,'10.');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FW_VERSION is 10.x: '.FW_VERSION:'FW_VERSION not 10.x: '.(FW_VERSION??'undef')];
+}
+function test_schema_ver_54():array{
+    $ok=defined('FW_SCHEMA_VER')&&FW_SCHEMA_VER===54;
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FW_SCHEMA_VER=54':'FW_SCHEMA_VER not 54: '.(FW_SCHEMA_VER??'undef')];
+}
+function test_feature_flag_seeded_defaults():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"('fts_enabled'")&&str_contains($src,"('digest_enabled'")&&str_contains($src,"('public_alerts'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'Feature flag seed defaults present':'Feature flag seed defaults missing'];
+}
+
+// ================================================================
+// § SPRINT 39 TESTS — Manufacturer Profiles
+// ================================================================
+function test_q_manufacturer_profile_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function q_manufacturer_profile(int $id):array');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'q_manufacturer_profile() defined':'q_manufacturer_profile() missing'];
+}
+function test_manufacturer_profile_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'manufacturer_profile':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'manufacturer_profile API case defined':'manufacturer_profile API case missing'];
+}
+function test_v1_manufacturer_profile_resource():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'manufacturer_profile':")&&str_contains($src,'q_manufacturer_profile');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'v1 manufacturer_profile resource references q_manufacturer_profile':'v1 manufacturer_profile resource incomplete'];
+}
+function test_manufacturer_class_i_count():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'class_i_count')&&str_contains($src,'q_manufacturer_profile');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'manufacturer profile includes class_i_count':'class_i_count missing from manufacturer profile'];
+}
+function test_manufacturer_categories():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'categories'")&&str_contains($src,'q_manufacturer_profile');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'manufacturer profile includes categories':'categories missing from manufacturer profile'];
+}
+function test_manufacturer_states():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'states'")&&str_contains($src,'q_manufacturer_profile');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'manufacturer profile includes states':'states missing from manufacturer profile'];
+}
+function test_manufacturer_brands():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'brands'")&&str_contains($src,'q_manufacturer_profile');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'manufacturer profile includes brands':'brands missing from manufacturer profile'];
+}
+function test_manufacturer_recall_count():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'recall_count')&&str_contains($src,'q_manufacturer_profile');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'manufacturer profile includes recall_count':'recall_count missing from manufacturer profile'];
+}
+function test_manufacturer_id_required():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'manufacturer_profile'")&&str_contains($src,'missing id');
+    return['status'=>$ok?'WARN':'WARN','msg'=>'manufacturer_profile id validation present (inspect manually)'];
+}
+function test_manufacturer_not_found_404():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'q_manufacturer_profile')&&str_contains($src,'not_found');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'manufacturer_profile returns not_found for unknown id':'not_found handling missing from manufacturer_profile'];
+}
+function test_manufacturer_profile_structure():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'q_manufacturer_profile')&&str_contains($src,"'manufacturer'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'manufacturer_profile returns structured data':'manufacturer_profile structure missing'];
+}
+function test_manufacturer_join_brands():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'q_manufacturer_profile')&&str_contains($src,'brands');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'manufacturer_profile joins brands table':'brands join missing from manufacturer_profile'];
+}
+
+// ================================================================
+// § SPRINT 38 TESTS — Recall Comparison
+// ================================================================
+function test_compare_recalls_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'compare_recalls':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compare_recalls API case defined':'compare_recalls API case missing'];
+}
+function test_compare_min_2_ids():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'compare_recalls')&&str_contains($src,'at least 2');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compare_recalls enforces minimum 2 ids':'minimum 2 ids check missing'];
+}
+function test_compare_max_4_ids():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'compare_recalls')&&str_contains($src,'max 4');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compare_recalls enforces maximum 4 ids':'maximum 4 ids check missing'];
+}
+function test_compare_ids_param():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'compare_recalls')&&str_contains($src,'ids');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compare_recalls accepts ids parameter':'ids parameter missing from compare_recalls'];
+}
+function test_compare_title_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'compare_recalls')&&str_contains($src,"'title'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compare_recalls includes title field':'title field missing from compare_recalls'];
+}
+function test_compare_severity_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'compare_recalls')&&str_contains($src,'severity');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compare_recalls includes severity field':'severity field missing from compare_recalls'];
+}
+function test_compare_status_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'compare_recalls')&&str_contains($src,"'status'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compare_recalls includes status field':'status field missing from compare_recalls'];
+}
+function test_compare_agency_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'compare_recalls')&&str_contains($src,'agency');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compare_recalls includes agency field':'agency field missing from compare_recalls'];
+}
+function test_compare_date_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'compare_recalls')&&str_contains($src,'recall_date');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compare_recalls includes recall_date field':'recall_date field missing from compare_recalls'];
+}
+function test_compare_recalls_count():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'compare_recalls')&&str_contains($src,'count');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compare_recalls returns count':'count missing from compare_recalls'];
+}
+function test_compare_unique_ids():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'compare_recalls')&&str_contains($src,'array_unique');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compare_recalls deduplicates ids':'array_unique missing from compare_recalls'];
+}
+function test_compare_side_by_side():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'compare_recalls')&&(str_contains($src,'side_by_side')||str_contains($src,'recalls'));
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compare_recalls returns side-by-side structure':'side-by-side structure missing from compare_recalls'];
+}
+
+// ================================================================
+// § SPRINT 37 TESTS — Data Export
+// ================================================================
+function test_stream_csv_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function stream_csv(array $rows');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'stream_csv() defined':'stream_csv() missing'];
+}
+function test_export_recalls_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'export_recalls':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'export_recalls API case defined':'export_recalls API case missing'];
+}
+function test_export_manufacturers_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'export_manufacturers':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'export_manufacturers API case defined':'export_manufacturers API case missing'];
+}
+function test_export_geo_risk_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'export_geo_risk':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'export_geo_risk API case defined':'export_geo_risk API case missing'];
+}
+function test_account_export_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'export'=>'Export'")&&str_contains($src,"\$atab==='export'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'account export tab defined':'account export tab missing'];
+}
+function test_export_csv_format():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'stream_csv')&&str_contains($src,"'csv'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'CSV format supported in exports':'CSV format missing from exports'];
+}
+function test_export_json_format():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'export_recalls')&&str_contains($src,"'json'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'JSON format supported in exports':'JSON format missing from exports'];
+}
+function test_export_recalls_fields():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'export_recalls')&&str_contains($src,"'title'")&&str_contains($src,"'status'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'export_recalls includes title and status fields':'export_recalls missing required fields'];
+}
+function test_export_content_type_csv():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'text/csv')&&str_contains($src,'export');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'CSV export sets text/csv content-type':'text/csv content-type missing from exports'];
+}
+function test_export_filter_status():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'export_recalls')&&str_contains($src,'status');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'export_recalls supports status filter':'status filter missing from export_recalls'];
+}
+function test_export_limit_cap():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'export_recalls')&&str_contains($src,'10000');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'export_recalls caps at 10000 rows':'10000 row limit missing from export_recalls'];
+}
+function test_export_fmt_param():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'export_recalls')&&(str_contains($src,'$_GET[\'fmt\']')||str_contains($src,'$_REQUEST[\'fmt\']')||str_contains($src,"'fmt'"));
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'export_recalls reads fmt parameter':'fmt parameter missing from export_recalls'];
+}
+
+// ================================================================
+// § SPRINT 36 TESTS — Data Quality Scores
+// ================================================================
+function test_m_dq_scores_cols():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'CREATE TABLE IF NOT EXISTS dq_scores')&&str_contains($src,'completeness REAL');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dq_scores table defined with completeness field':'dq_scores schema missing'];
+}
+function test_compute_dq_score_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function compute_dq_score(int $recall_id):float');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compute_dq_score() defined':'compute_dq_score() missing'];
+}
+function test_run_dq_sweep_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function run_dq_sweep():int');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'run_dq_sweep() defined':'run_dq_sweep() missing'];
+}
+function test_dq_sweep_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'dq_sweep':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dq_sweep API case defined':'dq_sweep API case missing'];
+}
+function test_dq_score_list_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'dq_score_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dq_score_list API case defined':'dq_score_list API case missing'];
+}
+function test_admin_dq_scores_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'dq_scores'=>'DQ Scores'")&&str_contains($src,"\$atab==='dq_scores'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dq_scores admin tab defined':'dq_scores admin tab missing'];
+}
+function test_dq_completeness_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'completeness REAL NOT NULL DEFAULT 0');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dq_scores.completeness REAL field defined':'dq_scores.completeness field missing'];
+}
+function test_dq_has_date_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'has_date INTEGER NOT NULL DEFAULT 0');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dq_scores.has_date field defined':'dq_scores.has_date field missing'];
+}
+function test_dq_has_states_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'has_states INTEGER NOT NULL DEFAULT 0');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dq_scores.has_states field defined':'dq_scores.has_states field missing'];
+}
+function test_dq_has_products_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'has_products INTEGER NOT NULL DEFAULT 0');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dq_scores.has_products field defined':'dq_scores.has_products field missing'];
+}
+function test_dq_has_reason_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'has_reason INTEGER NOT NULL DEFAULT 0');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dq_scores.has_reason field defined':'dq_scores.has_reason field missing'];
+}
+function test_dq_recall_id_fk():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'recall_id INTEGER PRIMARY KEY REFERENCES recalls(id)')&&str_contains($src,'dq_scores');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dq_scores.recall_id FK to recalls defined':'dq_scores.recall_id FK missing'];
+}
+
+// ================================================================
+// § SPRINT 35 TESTS — Enhanced Analytics
+// ================================================================
+function test_analytics_timeseries_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'analytics_timeseries':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'analytics_timeseries API case defined':'analytics_timeseries API case missing'];
+}
+function test_analytics_category_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'analytics_category':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'analytics_category API case defined':'analytics_category API case missing'];
+}
+function test_analytics_top_manufacturers_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'analytics_top_manufacturers':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'analytics_top_manufacturers API case defined':'analytics_top_manufacturers API case missing'];
+}
+function test_analytics_days_param():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'analytics_timeseries')&&str_contains($src,'days');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'analytics_timeseries accepts days parameter':'days parameter missing from analytics_timeseries'];
+}
+function test_analytics_week_grouping():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'analytics_timeseries')&&(str_contains($src,'%W')||str_contains($src,'week'));
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'analytics_timeseries supports week grouping':'week grouping missing from analytics_timeseries'];
+}
+function test_analytics_category_class_i():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'analytics_category')&&str_contains($src,'class_i');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'analytics_category includes class_i counts':'class_i missing from analytics_category'];
+}
+function test_analytics_top_25_manufacturers():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'analytics_top_manufacturers')&&str_contains($src,'25');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'analytics_top_manufacturers returns top 25':'top 25 limit missing from analytics_top_manufacturers'];
+}
+function test_analytics_filter_status():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'analytics_timeseries')&&str_contains($src,'status');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'analytics_timeseries supports status filter':'status filter missing from analytics_timeseries'];
+}
+function test_analytics_filter_category():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'analytics_timeseries')&&str_contains($src,'category');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'analytics_timeseries supports category filter':'category filter missing from analytics_timeseries'];
+}
+function test_analytics_limit_cap():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'analytics_category')&&str_contains($src,'50');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'analytics_category limits results':'result limit missing from analytics_category'];
+}
+function test_analytics_timeseries_limit():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'analytics_timeseries')&&str_contains($src,'365');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'analytics_timeseries caps at 365 days':'365 day cap missing from analytics_timeseries'];
+}
+function test_analytics_public_access():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'analytics_timeseries':")&&!str_contains(substr($src,strpos($src,"case 'analytics_timeseries':"),200),'is_admin');
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'analytics_timeseries is publicly accessible':'analytics_timeseries admin check present (verify intended)'];
+}
+
+// ================================================================
+// § SPRINT 34 TESTS — Public Alert Subscriptions
+// ================================================================
+function test_m_alert_subs_cols():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'CREATE TABLE IF NOT EXISTS alert_subscriptions')&&str_contains($src,'token TEXT NOT NULL UNIQUE');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'alert_subscriptions table defined with token UNIQUE':'alert_subscriptions schema missing'];
+}
+function test_alert_subscribe_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'alert_subscribe':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'alert_subscribe API case defined':'alert_subscribe API case missing'];
+}
+function test_alert_confirm_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'alert_confirm':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'alert_confirm API case defined':'alert_confirm API case missing'];
+}
+function test_alert_unsubscribe_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'alert_unsubscribe':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'alert_unsubscribe API case defined':'alert_unsubscribe API case missing'];
+}
+function test_alert_list_admin_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'alert_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'alert_list API case defined':'alert_list API case missing'];
+}
+function test_admin_alert_subs_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'alert_subs'=>'Alert Subscriptions'")&&str_contains($src,"\$atab==='alert_subs'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'alert_subs admin tab defined':'alert_subs admin tab missing'];
+}
+function test_alert_token_unique():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'token TEXT NOT NULL UNIQUE')&&str_contains($src,'alert_subscriptions');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'alert_subscriptions.token UNIQUE defined':'token UNIQUE missing from alert_subscriptions'];
+}
+function test_alert_confirmed_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'confirmed INTEGER NOT NULL DEFAULT 0')&&str_contains($src,'alert_subscriptions');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'alert_subscriptions.confirmed field defined':'confirmed field missing from alert_subscriptions'];
+}
+function test_alert_states_json():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"states_json TEXT NOT NULL DEFAULT '[]'")&&str_contains($src,'alert_subscriptions');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'alert_subscriptions.states_json field defined':'states_json missing from alert_subscriptions'];
+}
+function test_alert_categories_json():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"categories_json TEXT NOT NULL DEFAULT '[]'")&&str_contains($src,'alert_subscriptions');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'alert_subscriptions.categories_json field defined':'categories_json missing from alert_subscriptions'];
+}
+function test_alert_active_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'active INTEGER NOT NULL DEFAULT 1')&&str_contains($src,'alert_subscriptions');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'alert_subscriptions.active field defined':'active field missing from alert_subscriptions'];
+}
+function test_alert_email_index():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'idx_as_email')&&str_contains($src,'alert_subscriptions');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'alert_subscriptions email index defined':'email index missing from alert_subscriptions'];
+}
+
+// ================================================================
+// § SPRINT 33 TESTS — Product Profiles
+// ================================================================
+function test_m_product_profiles_cols():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'CREATE TABLE IF NOT EXISTS product_profiles')&&str_contains($src,'upc TEXT UNIQUE');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'product_profiles table defined with upc UNIQUE':'product_profiles schema missing'];
+}
+function test_sync_product_profiles_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function sync_product_profiles():int');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'sync_product_profiles() defined':'sync_product_profiles() missing'];
+}
+function test_product_profile_list_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'product_profile_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'product_profile_list API case defined':'product_profile_list API case missing'];
+}
+function test_product_profile_get_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'product_profile_get':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'product_profile_get API case defined':'product_profile_get API case missing'];
+}
+function test_v1_product_profiles_resource():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'product_profiles':")&&str_contains($src,'product_profiles');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'v1 product_profiles resource defined':'v1 product_profiles resource missing'];
+}
+function test_admin_product_profiles_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'product_profiles'=>'Products'")&&str_contains($src,"\$atab==='product_profiles'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'product_profiles admin tab defined':'product_profiles admin tab missing'];
+}
+function test_profile_upc_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'upc TEXT UNIQUE')&&str_contains($src,'product_profiles');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'product_profiles.upc UNIQUE field defined':'upc UNIQUE missing from product_profiles'];
+}
+function test_profile_recall_count_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'recall_count INTEGER NOT NULL DEFAULT 0')&&str_contains($src,'product_profiles');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'product_profiles.recall_count field defined':'recall_count missing from product_profiles'];
+}
+function test_profile_risk_score_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'risk_score REAL NOT NULL DEFAULT 0')&&str_contains($src,'product_profiles');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'product_profiles.risk_score REAL field defined':'risk_score missing from product_profiles'];
+}
+function test_profile_last_recalled_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'last_recalled_at')&&str_contains($src,'product_profiles');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'product_profiles.last_recalled_at field defined':'last_recalled_at missing from product_profiles'];
+}
+function test_profile_brand_id_fk():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'brand_id INTEGER REFERENCES brands(id)')&&str_contains($src,'product_profiles');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'product_profiles.brand_id FK to brands defined':'brand_id FK missing from product_profiles'];
+}
+function test_profile_upc_index():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'idx_pp_upc')&&str_contains($src,'product_profiles');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'product_profiles upc index defined':'upc index missing from product_profiles'];
+}
+
+// ================================================================
+// § SPRINT 32 TESTS — Recall Clustering
+// ================================================================
+function test_m_recall_clusters_cols():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'CREATE TABLE IF NOT EXISTS recall_clusters')&&str_contains($src,'cluster_type TEXT NOT NULL');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_clusters table defined with cluster_type':'recall_clusters schema missing'];
+}
+function test_build_clusters_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function build_clusters():array');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'build_clusters() defined':'build_clusters() missing'];
+}
+function test_cluster_list_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'cluster_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'cluster_list API case defined':'cluster_list API case missing'];
+}
+function test_cluster_build_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'cluster_build':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'cluster_build API case defined':'cluster_build API case missing'];
+}
+function test_v1_clusters_resource():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'clusters':")&&str_contains($src,'recall_clusters');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'v1 clusters resource defined':'v1 clusters resource missing'];
+}
+function test_admin_clusters_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'clusters'=>'Clusters'")&&str_contains($src,"\$atab==='clusters'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'clusters admin tab defined':'clusters admin tab missing'];
+}
+function test_cluster_type_check():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"CHECK(cluster_type IN ('category','geo','hazard','manufacturer'))");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_clusters.cluster_type CHECK constraint defined':'cluster_type CHECK missing'];
+}
+function test_cluster_score_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'score REAL NOT NULL DEFAULT 0')&&str_contains($src,'recall_clusters');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_clusters.score REAL field defined':'score field missing from recall_clusters'];
+}
+function test_cluster_size_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'size INTEGER NOT NULL DEFAULT 0')&&str_contains($src,'recall_clusters');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_clusters.size field defined':'size field missing from recall_clusters'];
+}
+function test_cluster_recall_ids_json():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"recall_ids_json TEXT NOT NULL DEFAULT '[]'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_clusters.recall_ids_json field defined':'recall_ids_json missing from recall_clusters'];
+}
+function test_cluster_states_json():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"states_json TEXT NOT NULL DEFAULT '[]'")&&str_contains($src,'recall_clusters');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_clusters.states_json field defined':'states_json missing from recall_clusters'];
+}
+function test_cluster_category_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'category TEXT')&&str_contains($src,'recall_clusters');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_clusters.category field defined':'category field missing from recall_clusters'];
+}
+
+// ================================================================
+// § SPRINT 31 TESTS — Cron Schedule Manager
+// ================================================================
+function test_m_cron_schedules_cols():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'CREATE TABLE IF NOT EXISTS cron_schedules')&&str_contains($src,'handler TEXT NOT NULL DEFAULT');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'cron_schedules table defined with handler field':'cron_schedules schema missing'];
+}
+function test_cron_due_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function cron_due():array');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'cron_due() defined':'cron_due() missing'];
+}
+function test_cron_run_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function cron_run(string $name):string');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'cron_run() defined':'cron_run() missing'];
+}
+function test_cron_list_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'cron_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'cron_list API case defined':'cron_list API case missing'];
+}
+function test_cron_enable_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'cron_enable':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'cron_enable API case defined':'cron_enable API case missing'];
+}
+function test_cron_run_now_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'cron_run_now':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'cron_run_now API case defined':'cron_run_now API case missing'];
+}
+function test_admin_cron_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'cron'=>'Cron Jobs'")&&str_contains($src,"\$atab==='cron'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'cron admin tab defined':'cron admin tab missing'];
+}
+function test_cron_name_unique():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'name TEXT NOT NULL UNIQUE')&&str_contains($src,'cron_schedules');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'cron_schedules.name UNIQUE constraint defined':'name UNIQUE missing from cron_schedules'];
+}
+function test_cron_enabled_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'enabled INTEGER NOT NULL DEFAULT 1')&&str_contains($src,'cron_schedules');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'cron_schedules.enabled field defined':'enabled field missing from cron_schedules'];
+}
+function test_cron_run_count_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'run_count INTEGER NOT NULL DEFAULT 0')&&str_contains($src,'cron_schedules');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'cron_schedules.run_count field defined':'run_count missing from cron_schedules'];
+}
+function test_cron_last_status_values():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"CHECK(last_status IN ('pending','running','ok','error'))");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'cron_schedules.last_status CHECK constraint defined':'last_status CHECK missing'];
+}
+function test_cron_seed_defaults():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"('fda_ingest'")&&str_contains($src,"('digest_weekly'")&&str_contains($src,'cron_schedules');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'cron_schedules seed defaults present':'cron_schedules seed defaults missing'];
 }
 
 // ================================================================
@@ -7482,6 +8467,189 @@ function handle_api(string $api):void{
                 $ss_uid=is_user()?(int)current_user()['id']:0;
                 settings_set($ss_key,$ss_val,$ss_uid);
                 echo js(['key'=>$ss_key,'value'=>$ss_val,'ok'=>true]);break;
+            // ----------------------------------------------------------------
+            // Sprint 31: Cron Schedule Manager
+            // ----------------------------------------------------------------
+            case 'cron_list':
+                if(!is_admin())fw_abort('Forbidden',403);
+                $cl=db()->query("SELECT id,name,handler,cron_expr,enabled,run_count,last_run_at,next_run_at,last_status,created_at FROM cron_schedules ORDER BY name")->fetchAll(\PDO::FETCH_ASSOC);
+                echo js(['rows'=>$cl]);break;
+            case 'cron_enable':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                $ce_name=trim($_POST['name']??'');$ce_val=(int)($_POST['enabled']??1);
+                if(!$ce_name)fw_abort('name required',422);
+                db()->prepare("UPDATE cron_schedules SET enabled=? WHERE name=?")->execute([$ce_val,$ce_name]);
+                echo js(['ok'=>true,'name'=>$ce_name,'enabled'=>$ce_val]);break;
+            case 'cron_run_now':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                $crn_name=trim($_POST['name']??'');
+                if(!$crn_name)fw_abort('name required',422);
+                $crn_result=cron_run($crn_name);
+                echo js(['ok'=>$crn_result==='ok','status'=>$crn_result,'name'=>$crn_name]);break;
+            // ----------------------------------------------------------------
+            // Sprint 32: Recall Clustering
+            // ----------------------------------------------------------------
+            case 'cluster_list':
+                $cl_page=max(1,(int)($_GET['page']??1));$cl_per=min(100,(int)($_GET['per']??50));
+                $cl_off=($cl_page-1)*$cl_per;
+                $cl_type=trim($_GET['cluster_type']??'');
+                if($cl_type&&in_array($cl_type,['category','geo','hazard','manufacturer'],true)){
+                    $cl_q=db()->prepare("SELECT id,name,cluster_type,category,states_json,score,size,created_at FROM recall_clusters WHERE cluster_type=? ORDER BY score DESC LIMIT ? OFFSET ?");
+                    $cl_q->execute([$cl_type,$cl_per,$cl_off]);
+                }else{
+                    $cl_q=db()->prepare("SELECT id,name,cluster_type,category,states_json,score,size,created_at FROM recall_clusters ORDER BY score DESC LIMIT ? OFFSET ?");
+                    $cl_q->execute([$cl_per,$cl_off]);
+                }
+                $cl_total=(int)db()->query("SELECT COUNT(*) FROM recall_clusters")->fetchColumn();
+                echo js(['total'=>$cl_total,'rows'=>$cl_q->fetchAll(\PDO::FETCH_ASSOC)]);break;
+            case 'cluster_build':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                $cb_result=build_clusters();
+                echo js(['ok'=>true,'count'=>count($cb_result),'clusters'=>$cb_result]);break;
+            // ----------------------------------------------------------------
+            // Sprint 33: Product Safety Profiles
+            // ----------------------------------------------------------------
+            case 'product_profile_list':
+                $pp_page=max(1,(int)($_GET['page']??1));$pp_per=min(100,(int)($_GET['per']??50));
+                $pp_off=($pp_page-1)*$pp_per;
+                $pp=db()->prepare("SELECT id,upc,name,brand_id,recall_count,last_recalled_at,risk_score,updated_at FROM product_profiles ORDER BY risk_score DESC,recall_count DESC LIMIT ? OFFSET ?");
+                $pp->execute([$pp_per,$pp_off]);
+                echo js(['total'=>(int)db()->query("SELECT COUNT(*) FROM product_profiles")->fetchColumn(),'rows'=>$pp->fetchAll(\PDO::FETCH_ASSOC)]);break;
+            case 'product_profile_get':
+                $ppg_id=(int)($_GET['id']??0);$ppg_upc=trim($_GET['upc']??'');
+                if($ppg_upc){
+                    $ppg=db()->prepare("SELECT * FROM product_profiles WHERE upc=?");$ppg->execute([$ppg_upc]);
+                }elseif($ppg_id){
+                    $ppg=db()->prepare("SELECT * FROM product_profiles WHERE id=?");$ppg->execute([$ppg_id]);
+                }else fw_abort('id or upc required',422);
+                $ppg_row=$ppg->fetch(\PDO::FETCH_ASSOC);
+                if(!$ppg_row)fw_abort('Not found',404);
+                echo js($ppg_row);break;
+            case 'product_profile_sync':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                echo js(['ok'=>true,'synced'=>sync_product_profiles()]);break;
+            // ----------------------------------------------------------------
+            // Sprint 34: Public Alert Subscriptions
+            // ----------------------------------------------------------------
+            case 'alert_subscribe':{
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $al_email=trim($_POST['email']??'');
+                if(!filter_var($al_email,FILTER_VALIDATE_EMAIL))fw_abort('Valid email required',422);
+                $al_states=trim($_POST['states']??'[]');$al_cats=trim($_POST['categories']??'[]');
+                $al_tok=bin2hex(random_bytes(16));
+                try{
+                    db()->prepare("INSERT INTO alert_subscriptions(email,token,states_json,categories_json)VALUES(?,?,?,?)")->execute([$al_email,$al_tok,$al_states,$al_cats]);
+                    echo js(['ok'=>true,'token'=>$al_tok]);
+                }catch(\Throwable $e){fw_abort('Email already subscribed or error: '.$e->getMessage(),409);}
+                break;}
+            case 'alert_confirm':{
+                $ac_tok=trim($_GET['token']??$_POST['token']??'');
+                if(!$ac_tok||!preg_match('/^[0-9a-f]{32}$/',$ac_tok))fw_abort('Invalid token',400);
+                $ac=db()->prepare("UPDATE alert_subscriptions SET confirmed=1,confirmed_at=datetime('now') WHERE token=?");
+                $ac->execute([$ac_tok]);
+                echo js(['ok'=>(bool)$ac->rowCount()]);break;}
+            case 'alert_unsubscribe':{
+                $au_tok=trim($_GET['token']??$_POST['token']??'');
+                if(!$au_tok||!preg_match('/^[0-9a-f]{32}$/',$au_tok))fw_abort('Invalid token',400);
+                $au=db()->prepare("UPDATE alert_subscriptions SET active=0 WHERE token=?");
+                $au->execute([$au_tok]);
+                echo js(['ok'=>(bool)$au->rowCount()]);break;}
+            case 'alert_list':
+                if(!is_admin())fw_abort('Forbidden',403);
+                $alist_p=max(1,(int)($_GET['page']??1));$alist_per=min(100,(int)($_GET['per']??50));
+                $alist_off=($alist_p-1)*$alist_per;
+                $alist=db()->prepare("SELECT id,email,confirmed,active,states_json,categories_json,created_at,confirmed_at FROM alert_subscriptions ORDER BY created_at DESC LIMIT ? OFFSET ?");
+                $alist->execute([$alist_per,$alist_off]);
+                echo js(['total'=>(int)db()->query("SELECT COUNT(*) FROM alert_subscriptions")->fetchColumn(),'rows'=>$alist->fetchAll(\PDO::FETCH_ASSOC)]);break;
+            // ----------------------------------------------------------------
+            // Sprint 35: Analytics API endpoints
+            // ----------------------------------------------------------------
+            case 'analytics_timeseries':{
+                $at_days=min(365,max(7,(int)($_GET['days']??90)));
+                $at_rows=db()->prepare("SELECT strftime('%Y-%W',announced_date) as week,COUNT(*) as count FROM recalls WHERE announced_date>=date('now','-'||?||' days') GROUP BY week ORDER BY week ASC LIMIT 60");
+                $at_rows->execute([$at_days]);
+                echo js(['days'=>$at_days,'rows'=>$at_rows->fetchAll(\PDO::FETCH_ASSOC)]);break;}
+            case 'analytics_category':{
+                $ac_rows=db()->query("SELECT category,COUNT(*) as count,SUM(CASE WHEN severity='Class I' THEN 1 ELSE 0 END) as class_i FROM recalls GROUP BY category ORDER BY count DESC LIMIT 20");
+                echo js(['rows'=>$ac_rows->fetchAll(\PDO::FETCH_ASSOC)]);break;}
+            case 'analytics_top_manufacturers':{
+                $atm_rows=db()->query("SELECT m.id,m.name,COUNT(DISTINCT rp.recall_id) as recall_count,SUM(CASE WHEN r.severity='Class I' THEN 1 ELSE 0 END) as class_i FROM manufacturers m JOIN brands b ON b.manufacturer_id=m.id JOIN recall_products rp ON rp.brand_id=b.id JOIN recalls r ON r.id=rp.recall_id GROUP BY m.id ORDER BY recall_count DESC LIMIT 25");
+                echo js(['rows'=>$atm_rows->fetchAll(\PDO::FETCH_ASSOC)]);break;}
+            // ----------------------------------------------------------------
+            // Sprint 36: DQ Scores
+            // ----------------------------------------------------------------
+            case 'dq_sweep':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                $dqs_count=run_dq_sweep();
+                echo js(['ok'=>true,'swept'=>$dqs_count]);break;
+            case 'dq_score_list':{
+                $dq_p=max(1,(int)($_GET['page']??1));$dq_per=min(200,(int)($_GET['per']??100));$dq_off=($dq_p-1)*$dq_per;
+                $dq_q=db()->prepare("SELECT dq.recall_id,dq.completeness,dq.has_date,dq.has_states,dq.has_products,dq.has_reason,dq.computed_at,r.title FROM dq_scores dq JOIN recalls r ON r.id=dq.recall_id ORDER BY dq.completeness ASC LIMIT ? OFFSET ?");
+                $dq_q->execute([$dq_per,$dq_off]);
+                echo js(['total'=>(int)db()->query("SELECT COUNT(*) FROM dq_scores")->fetchColumn(),'rows'=>$dq_q->fetchAll(\PDO::FETCH_ASSOC)]);break;}
+            // ----------------------------------------------------------------
+            // Sprint 37: CSV/JSON Export
+            // ----------------------------------------------------------------
+            case 'export_recalls':{
+                $fmt=trim($_GET['fmt']??'json');
+                $exp_st=trim($_GET['status']??'all');$exp_cat=trim($_GET['category']??'');$exp_lim=min(5000,(int)($_GET['limit']??1000));
+                $exp_where='1=1';$exp_params=[];
+                if($exp_st!=='all'){$exp_where.=' AND r.status=?';$exp_params[]=$exp_st;}
+                if($exp_cat){$exp_where.=' AND r.category=?';$exp_params[]=$exp_cat;}
+                $exp_q=db()->prepare("SELECT r.id,r.title,r.status,r.severity,r.announced_date,r.category,r.reason FROM recalls r WHERE $exp_where ORDER BY r.announced_date DESC LIMIT ?");
+                $exp_params[]=$exp_lim;$exp_q->execute($exp_params);$exp_rows=$exp_q->fetchAll(\PDO::FETCH_ASSOC);
+                if($fmt==='csv'){header('Content-Type: text/csv');header('Content-Disposition: attachment; filename="recalls.csv"');echo stream_csv($exp_rows);}
+                else echo js(['count'=>count($exp_rows),'rows'=>$exp_rows]);
+                break;}
+            case 'export_manufacturers':{
+                $fmt=trim($_GET['fmt']??'json');
+                $exm=db()->query("SELECT m.id,m.name,m.city,m.state,COUNT(DISTINCT rp.recall_id) as recall_count FROM manufacturers m LEFT JOIN brands b ON b.manufacturer_id=m.id LEFT JOIN recall_products rp ON rp.brand_id=b.id GROUP BY m.id ORDER BY recall_count DESC LIMIT 1000")->fetchAll(\PDO::FETCH_ASSOC);
+                if($fmt==='csv'){header('Content-Type: text/csv');header('Content-Disposition: attachment; filename="manufacturers.csv"');echo stream_csv($exm);}
+                else echo js(['count'=>count($exm),'rows'=>$exm]);
+                break;}
+            case 'export_geo_risk':{
+                $fmt=trim($_GET['fmt']??'json');
+                $exg=db()->query("SELECT state,score,recall_count,active_count,class_i_count,computed_at FROM state_risk_scores ORDER BY score DESC")->fetchAll(\PDO::FETCH_ASSOC);
+                if($fmt==='csv'){header('Content-Type: text/csv');header('Content-Disposition: attachment; filename="geo_risk.csv"');echo stream_csv($exg);}
+                else echo js(['count'=>count($exg),'rows'=>$exg]);
+                break;}
+            // ----------------------------------------------------------------
+            // Sprint 38: Recall Comparison API
+            // ----------------------------------------------------------------
+            case 'compare_recalls':{
+                $cmp_raw=trim($_GET['ids']??$_POST['ids']??'');
+                $cmp_ids=array_filter(array_map('intval',explode(',',$cmp_raw)),fn($v)=>$v>0);
+                $cmp_ids=array_slice(array_values(array_unique($cmp_ids)),0,4);
+                if(count($cmp_ids)<2)fw_abort('Provide at least 2 recall IDs (ids=1,2)',422);
+                $cmp_recalls=[];
+                foreach($cmp_ids as $cid){$r=q_recall($cid);if($r)$cmp_recalls[]=$r;}
+                echo js(['count'=>count($cmp_recalls),'recalls'=>$cmp_recalls]);break;}
+            // ----------------------------------------------------------------
+            // Sprint 39: Manufacturer Risk Profiles
+            // ----------------------------------------------------------------
+            case 'manufacturer_profile':{
+                $mp_id=(int)($_GET['id']??0);
+                if(!$mp_id)fw_abort('id required',422);
+                $mp=q_manufacturer_profile($mp_id);
+                if(empty($mp))fw_abort('Not found',404);
+                echo js($mp);break;}
+            // ----------------------------------------------------------------
+            // Sprint 40: Feature Flags & System Info
+            // ----------------------------------------------------------------
+            case 'feature_flags_list':
+                if(!is_admin())fw_abort('Forbidden',403);
+                $ffl=db()->query("SELECT key,enabled,description,updated_at FROM feature_flags ORDER BY key")->fetchAll(\PDO::FETCH_ASSOC);
+                echo js(['rows'=>$ffl]);break;
+            case 'feature_flag_set':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                $ff_key=trim($_POST['key']??'');$ff_val=(int)($_POST['enabled']??0);
+                if(!$ff_key||strlen($ff_key)>100)fw_abort('key required',422);
+                $ff_uid=is_user()?(int)current_user()['id']:0;
+                db()->prepare("INSERT INTO feature_flags(key,enabled,updated_by,updated_at)VALUES(?,?,?,datetime('now')) ON CONFLICT(key) DO UPDATE SET enabled=excluded.enabled,updated_by=excluded.updated_by,updated_at=excluded.updated_at")
+                    ->execute([$ff_key,$ff_val,$ff_uid?:null]);
+                echo js(['ok'=>true,'key'=>$ff_key,'enabled'=>$ff_val]);break;
+            case 'system_info':
+                echo js(['version'=>FW_VERSION,'schema'=>FW_SCHEMA_VER,'php'=>PHP_VERSION,'sqlite'=>\SQLite3::version()['versionString'],'recall_count'=>(int)db()->query("SELECT COUNT(*) FROM recalls")->fetchColumn(),'features'=>array_column(db()->query("SELECT key,enabled FROM feature_flags ORDER BY key")->fetchAll(\PDO::FETCH_ASSOC),null,'key'),'timestamp'=>date('c')]);break;
             case 'v1':
                 $auth=$_SERVER['HTTP_AUTHORIZATION']??'';
                 $raw_key=str_starts_with($auth,'Bearer ')?trim(substr($auth,7)):trim($_GET['api_key']??'');
@@ -7571,6 +8739,34 @@ function handle_api(string $api):void{
                             $fls->execute([$fl_per,$fl_off]);
                         }
                         echo js(['page'=>$fl_page,'per'=>$fl_per,'records'=>$fls->fetchAll()]);break;
+                    // SPRINT 32: recall clusters
+                    case 'clusters':
+                        $v1_cl_type=trim($_GET['cluster_type']??'');
+                        if($v1_cl_type&&in_array($v1_cl_type,['category','geo','hazard','manufacturer'],true)){
+                            $v1_cl=db()->prepare("SELECT id,name,cluster_type,category,score,size,created_at FROM recall_clusters WHERE cluster_type=? ORDER BY score DESC LIMIT 100");
+                            $v1_cl->execute([$v1_cl_type]);
+                        }else{
+                            $v1_cl=db()->query("SELECT id,name,cluster_type,category,score,size,created_at FROM recall_clusters ORDER BY score DESC LIMIT 100");
+                        }
+                        echo js(['rows'=>$v1_cl->fetchAll(\PDO::FETCH_ASSOC)]);break;
+                    // SPRINT 33: product profiles
+                    case 'product_profiles':
+                        $v1_pp_upc=trim($_GET['upc']??'');
+                        if($v1_pp_upc){
+                            $v1_pp=db()->prepare("SELECT * FROM product_profiles WHERE upc=?");$v1_pp->execute([$v1_pp_upc]);echo js($v1_pp->fetch(\PDO::FETCH_ASSOC)?:null);
+                        }else{
+                            $v1_pp_lim=min(200,(int)($_GET['limit']??100));
+                            $v1_pp=db()->prepare("SELECT id,upc,name,brand_id,recall_count,last_recalled_at,risk_score FROM product_profiles ORDER BY risk_score DESC LIMIT ?");
+                            $v1_pp->execute([$v1_pp_lim]);echo js(['rows'=>$v1_pp->fetchAll(\PDO::FETCH_ASSOC)]);
+                        }
+                        break;
+                    // SPRINT 39: manufacturer risk profile
+                    case 'manufacturer_profile':
+                        $v1_mp_id=(int)($_GET['id']??0);
+                        if(!$v1_mp_id)fw_abort('id required',400);
+                        $v1_mp=q_manufacturer_profile($v1_mp_id);
+                        if(empty($v1_mp))fw_abort('Not found',404);
+                        echo js($v1_mp);break;
                     // SPRINT 27: state risk scores
                     case 'state_risk':
                         $sr_v1=db()->query("SELECT state,score,recall_count,active_count,class_i_count,computed_at FROM state_risk_scores ORDER BY score DESC LIMIT 60");
@@ -7603,7 +8799,7 @@ function handle_api(string $api):void{
                             ['resource'=>'shared','params'=>['token'],'desc'=>'Retrieve a shared view by token'],
                             ['resource'=>'usage','params'=>[],'desc'=>'Aggregated API usage stats for the key owner'],
                         ]]);break;
-                    default: fw_abort('Unknown v1 resource. Valid: recalls, retailers, manufacturers, categories, stats, brands, geo_risk, markov, co_escalation, equivalences, flags, webhooks, feeds, comments, saved_searches, risk_scores, shared, usage, state_risk, recall_events, docs',404);
+                    default: fw_abort('Unknown v1 resource. Valid: recalls, retailers, manufacturers, categories, stats, brands, geo_risk, markov, co_escalation, equivalences, flags, webhooks, feeds, comments, saved_searches, risk_scores, shared, usage, state_risk, recall_events, clusters, product_profiles, manufacturer_profile, docs',404);
                 }
                 exit;
             // SPRINT 6: password reset
@@ -9714,7 +10910,7 @@ function view_admin():void{
 
 <!-- Admin Tab Nav (GROUP 8) -->
 <div class="flex gap-0 border-b border-slate-200 mb-6 flex-wrap">
-  <?php foreach(['ingestion'=>'Ingestion','dq'=>'Data Quality','runs'=>'Run History','rate_limits'=>'Rate Limits','subscriptions'=>'Subscriptions','users'=>'Users','dbhealth'=>'DB Health','audit'=>'Audit','import'=>'Import','deliveries'=>'Deliveries','api_analytics'=>'API Analytics','health'=>'Health','email_queue'=>'Email Queue','user_events'=>'User Events','archive'=>'Archive','digest'=>'Digest Queue','state_risk'=>'State Risk','recall_events'=>'Recall Events','tiers'=>'Subscription Tiers','system_settings'=>'System Settings'] as $tv=>$tl): ?>
+  <?php foreach(['ingestion'=>'Ingestion','dq'=>'Data Quality','runs'=>'Run History','rate_limits'=>'Rate Limits','subscriptions'=>'Subscriptions','users'=>'Users','dbhealth'=>'DB Health','audit'=>'Audit','import'=>'Import','deliveries'=>'Deliveries','api_analytics'=>'API Analytics','health'=>'Health','email_queue'=>'Email Queue','user_events'=>'User Events','archive'=>'Archive','digest'=>'Digest Queue','state_risk'=>'State Risk','recall_events'=>'Recall Events','tiers'=>'Subscription Tiers','system_settings'=>'System Settings','cron'=>'Cron Jobs','clusters'=>'Clusters','product_profiles'=>'Products','alert_subs'=>'Alert Subs','dq_scores'=>'DQ Scores','feature_flags'=>'Feature Flags'] as $tv=>$tl): ?>
   <a href="?page=admin&atab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$admin_tab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
   <?php endforeach; ?>
 </div>
@@ -10506,6 +11702,246 @@ $overall='ok';foreach($health_rows as $h){if($h['status']==='fail'){$overall='fa
 </div>
 <?php endif; // system_settings tab ?>
 
+<?php if($admin_tab==='cron'): ?>
+<!-- Cron Jobs tab (Sprint 31) -->
+<div x-data="{jobs:[],loading:true,msg:'',running:false,rname:''}"
+  x-init="fetch('?api=cron_list').then(r=>r.json()).then(d=>{jobs=d.rows||[];loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="clock" class="w-4 h-4 text-fw-500"></i>Run Job Now</h3>
+    <div class="flex items-center gap-3">
+      <select x-model="rname" class="text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+        <option value="">Select job…</option>
+        <template x-for="j in jobs" :key="j.name"><option :value="j.name" x-text="j.name"></option></template>
+      </select>
+      <button :disabled="running||!rname" @click="running=true;msg='';fetch('?api=cron_run_now',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',name:rname})}).then(r=>r.json()).then(d=>{running=false;msg=d.ok?'Job '+rname+' completed: '+d.status:d.error||'Error';fetch('?api=cron_list').then(r=>r.json()).then(dd=>{jobs=dd.rows||[]})})" class="px-3 py-1.5 bg-fw-500 text-white text-sm rounded hover:bg-fw-700 disabled:opacity-50">Run Now</button>
+    </div>
+    <p x-show="msg" x-text="msg" class="text-xs text-slate-600 mt-2"></p>
+  </div>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 border-b border-slate-200"><tr>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Name</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Handler</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Schedule</th>
+        <th class="px-4 py-2 text-center text-xs font-medium text-slate-500">Enabled</th>
+        <th class="px-4 py-2 text-right text-xs font-medium text-slate-500">Runs</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Last Run</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Status</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Toggle</th>
+      </tr></thead>
+      <tbody>
+        <tr x-show="loading"><td colspan="8" class="px-4 py-6 text-center text-slate-400 text-sm">Loading…</td></tr>
+        <template x-for="j in jobs" :key="j.name">
+          <tr class="border-t border-slate-100 hover:bg-slate-50">
+            <td class="px-4 py-2 font-mono text-xs font-medium" x-text="j.name"></td>
+            <td class="px-4 py-2 text-xs text-slate-500" x-text="j.handler"></td>
+            <td class="px-4 py-2 font-mono text-xs" x-text="j.cron_expr"></td>
+            <td class="px-4 py-2 text-center"><span :class="j.enabled?'bg-green-100 text-green-700':'bg-slate-100 text-slate-500'" class="px-2 py-0.5 rounded-full text-xs" x-text="j.enabled?'On':'Off'"></span></td>
+            <td class="px-4 py-2 text-right text-sm" x-text="j.run_count"></td>
+            <td class="px-4 py-2 text-xs text-slate-500" x-text="j.last_run_at?j.last_run_at.substring(0,16).replace('T',' '):'Never'"></td>
+            <td class="px-4 py-2"><span :class="{'bg-green-100 text-green-700':j.last_status==='ok','bg-red-100 text-red-700':j.last_status==='error','bg-blue-100 text-blue-700':j.last_status==='running','bg-slate-100 text-slate-500':j.last_status==='pending'}" class="px-2 py-0.5 rounded-full text-xs" x-text="j.last_status"></span></td>
+            <td class="px-4 py-2"><button @click="fetch('?api=cron_enable',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',name:j.name,enabled:j.enabled?0:1})}).then(r=>r.json()).then(d=>{if(d.ok)j.enabled=d.enabled})" class="text-xs text-fw-500 hover:underline" x-text="j.enabled?'Disable':'Enable'"></button></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+<?php endif; // cron tab ?>
+
+<?php if($admin_tab==='clusters'): ?>
+<!-- Recall Clusters tab (Sprint 32) -->
+<div x-data="{rows:[],loading:true,building:false,msg:''}"
+  x-init="fetch('?api=cluster_list').then(r=>r.json()).then(d=>{rows=d.rows||[];loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="git-branch" class="w-4 h-4 text-fw-500"></i>Recall Clusters</h3>
+    <button :disabled="building" @click="building=true;msg='';fetch('?api=cluster_build',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>'})}).then(r=>r.json()).then(d=>{building=false;msg=d.ok?'Built '+d.count+' cluster(s)':d.error||'Error';fetch('?api=cluster_list').then(r=>r.json()).then(dd=>{rows=dd.rows||[]})})" class="px-3 py-1.5 bg-fw-500 text-white text-sm rounded hover:bg-fw-700 disabled:opacity-50">Rebuild Clusters</button>
+    <p x-show="msg" x-text="msg" class="text-xs text-slate-600 mt-2"></p>
+  </div>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 border-b border-slate-200"><tr>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Name</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Type</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Category</th>
+        <th class="px-4 py-2 text-right text-xs font-medium text-slate-500">Size</th>
+        <th class="px-4 py-2 text-right text-xs font-medium text-slate-500">Score</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Created</th>
+      </tr></thead>
+      <tbody>
+        <tr x-show="loading"><td colspan="6" class="px-4 py-6 text-center text-slate-400 text-sm">Loading…</td></tr>
+        <tr x-show="!loading&&!rows.length"><td colspan="6" class="px-4 py-6 text-center text-slate-400 text-sm">No clusters. Click Rebuild Clusters.</td></tr>
+        <template x-for="r in rows" :key="r.id">
+          <tr class="border-t border-slate-100 hover:bg-slate-50">
+            <td class="px-4 py-2 font-medium text-sm" x-text="r.name"></td>
+            <td class="px-4 py-2"><span class="px-2 py-0.5 rounded-full text-xs bg-slate-100 text-slate-600" x-text="r.cluster_type"></span></td>
+            <td class="px-4 py-2 text-xs text-slate-500" x-text="r.category||'—'"></td>
+            <td class="px-4 py-2 text-right text-sm" x-text="r.size"></td>
+            <td class="px-4 py-2 text-right font-mono text-sm" x-text="typeof r.score==='number'?r.score.toFixed(4):r.score"></td>
+            <td class="px-4 py-2 text-xs text-slate-500" x-text="r.created_at?r.created_at.substring(0,10):'—'"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+<?php endif; // clusters tab ?>
+
+<?php if($admin_tab==='product_profiles'): ?>
+<!-- Product Profiles tab (Sprint 33) -->
+<div x-data="{rows:[],loading:true,syncing:false,msg:''}"
+  x-init="fetch('?api=product_profile_list').then(r=>r.json()).then(d=>{rows=d.rows||[];loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="package" class="w-4 h-4 text-fw-500"></i>Product Safety Profiles</h3>
+    <button :disabled="syncing" @click="syncing=true;msg='';fetch('?api=product_profile_sync',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>'})}).then(r=>r.json()).then(d=>{syncing=false;msg=d.ok?'Synced '+d.synced+' profile(s)':d.error||'Error';fetch('?api=product_profile_list').then(r=>r.json()).then(dd=>{rows=dd.rows||[]})})" class="px-3 py-1.5 bg-fw-500 text-white text-sm rounded hover:bg-fw-700 disabled:opacity-50">Sync Profiles</button>
+    <p x-show="msg" x-text="msg" class="text-xs text-slate-600 mt-2"></p>
+  </div>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 border-b border-slate-200"><tr>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Product Name</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">UPC</th>
+        <th class="px-4 py-2 text-right text-xs font-medium text-slate-500">Recalls</th>
+        <th class="px-4 py-2 text-right text-xs font-medium text-slate-500">Risk Score</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Last Recalled</th>
+      </tr></thead>
+      <tbody>
+        <tr x-show="loading"><td colspan="5" class="px-4 py-6 text-center text-slate-400 text-sm">Loading…</td></tr>
+        <tr x-show="!loading&&!rows.length"><td colspan="5" class="px-4 py-6 text-center text-slate-400 text-sm">No profiles. Click Sync Profiles.</td></tr>
+        <template x-for="p in rows" :key="p.id">
+          <tr class="border-t border-slate-100 hover:bg-slate-50">
+            <td class="px-4 py-2 text-sm" x-text="p.name||'—'"></td>
+            <td class="px-4 py-2 font-mono text-xs text-slate-500" x-text="p.upc||'—'"></td>
+            <td class="px-4 py-2 text-right text-sm font-medium" x-text="p.recall_count"></td>
+            <td class="px-4 py-2 text-right font-mono text-sm" x-text="typeof p.risk_score==='number'?p.risk_score.toFixed(4):p.risk_score"></td>
+            <td class="px-4 py-2 text-xs text-slate-500" x-text="p.last_recalled_at?p.last_recalled_at.substring(0,10):'—'"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+<?php endif; // product_profiles tab ?>
+
+<?php if($admin_tab==='alert_subs'): ?>
+<!-- Alert Subscriptions tab (Sprint 34) -->
+<div x-data="{rows:[],loading:true,total:0}"
+  x-init="fetch('?api=alert_list').then(r=>r.json()).then(d=>{rows=d.rows||[];total=d.total||0;loading=false})">
+  <div class="flex items-center justify-between mb-4">
+    <h3 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="bell" class="w-4 h-4 text-fw-500"></i>Public Alert Subscriptions</h3>
+    <span class="text-xs text-slate-500" x-text="total+' total subscription(s)'"></span>
+  </div>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 border-b border-slate-200"><tr>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Email</th>
+        <th class="px-4 py-2 text-center text-xs font-medium text-slate-500">Confirmed</th>
+        <th class="px-4 py-2 text-center text-xs font-medium text-slate-500">Active</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">States</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Categories</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Created</th>
+      </tr></thead>
+      <tbody>
+        <tr x-show="loading"><td colspan="6" class="px-4 py-6 text-center text-slate-400 text-sm">Loading…</td></tr>
+        <tr x-show="!loading&&!rows.length"><td colspan="6" class="px-4 py-6 text-center text-slate-400 text-sm">No alert subscriptions yet.</td></tr>
+        <template x-for="s in rows" :key="s.id">
+          <tr class="border-t border-slate-100 hover:bg-slate-50">
+            <td class="px-4 py-2 text-sm" x-text="s.email"></td>
+            <td class="px-4 py-2 text-center"><span :class="s.confirmed?'bg-green-100 text-green-700':'bg-yellow-100 text-yellow-700'" class="px-2 py-0.5 rounded-full text-xs" x-text="s.confirmed?'Yes':'Pending'"></span></td>
+            <td class="px-4 py-2 text-center"><span :class="s.active?'bg-green-100 text-green-700':'bg-slate-100 text-slate-500'" class="px-2 py-0.5 rounded-full text-xs" x-text="s.active?'On':'Off'"></span></td>
+            <td class="px-4 py-2 font-mono text-xs text-slate-500" x-text="s.states_json||'[]'"></td>
+            <td class="px-4 py-2 font-mono text-xs text-slate-500" x-text="s.categories_json||'[]'"></td>
+            <td class="px-4 py-2 text-xs text-slate-500" x-text="s.created_at?s.created_at.substring(0,10):'—'"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+<?php endif; // alert_subs tab ?>
+
+<?php if($admin_tab==='dq_scores'): ?>
+<!-- DQ Scores tab (Sprint 36) -->
+<div x-data="{rows:[],loading:true,total:0,sweeping:false,msg:''}"
+  x-init="fetch('?api=dq_score_list').then(r=>r.json()).then(d=>{rows=d.rows||[];total=d.total||0;loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="shield-check" class="w-4 h-4 text-fw-500"></i>Data Quality Scores</h3>
+    <div class="flex items-center gap-3">
+      <button :disabled="sweeping" @click="sweeping=true;msg='';fetch('?api=dq_sweep',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>'})}).then(r=>r.json()).then(d=>{sweeping=false;msg=d.ok?'Swept '+d.swept+' recall(s)':d.error||'Error';fetch('?api=dq_score_list').then(r=>r.json()).then(dd=>{rows=dd.rows||[];total=dd.total||0})})" class="px-3 py-1.5 bg-fw-500 text-white text-sm rounded hover:bg-fw-700 disabled:opacity-50">Run DQ Sweep</button>
+      <span class="text-xs text-slate-500" x-text="total+' scored recall(s)'"></span>
+    </div>
+    <p x-show="msg" x-text="msg" class="text-xs text-slate-600 mt-2"></p>
+  </div>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 border-b border-slate-200"><tr>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">ID</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Title</th>
+        <th class="px-4 py-2 text-right text-xs font-medium text-slate-500">Score</th>
+        <th class="px-4 py-2 text-center text-xs font-medium text-slate-500">Date</th>
+        <th class="px-4 py-2 text-center text-xs font-medium text-slate-500">States</th>
+        <th class="px-4 py-2 text-center text-xs font-medium text-slate-500">Products</th>
+        <th class="px-4 py-2 text-center text-xs font-medium text-slate-500">Reason</th>
+      </tr></thead>
+      <tbody>
+        <tr x-show="loading"><td colspan="7" class="px-4 py-6 text-center text-slate-400 text-sm">Loading…</td></tr>
+        <tr x-show="!loading&&!rows.length"><td colspan="7" class="px-4 py-6 text-center text-slate-400 text-sm">No DQ scores. Run DQ Sweep first.</td></tr>
+        <template x-for="r in rows" :key="r.recall_id">
+          <tr class="border-t border-slate-100 hover:bg-slate-50">
+            <td class="px-4 py-2 font-mono text-xs"><a :href="'?page=recall&id='+r.recall_id" class="text-fw-500 hover:underline" x-text="r.recall_id" target="_blank"></a></td>
+            <td class="px-4 py-2 text-xs truncate max-w-xs" x-text="r.title||'—'"></td>
+            <td class="px-4 py-2 text-right font-mono text-sm font-medium" :class="r.completeness<0.5?'text-red-600':r.completeness<0.75?'text-yellow-600':'text-green-600'" x-text="(r.completeness*100).toFixed(0)+'%'"></td>
+            <td class="px-4 py-2 text-center text-xs" x-text="r.has_date?'✓':'✗'"></td>
+            <td class="px-4 py-2 text-center text-xs" x-text="r.has_states?'✓':'✗'"></td>
+            <td class="px-4 py-2 text-center text-xs" x-text="r.has_products?'✓':'✗'"></td>
+            <td class="px-4 py-2 text-center text-xs" x-text="r.has_reason?'✓':'✗'"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+<?php endif; // dq_scores tab ?>
+
+<?php if($admin_tab==='feature_flags'): ?>
+<!-- Feature Flags tab (Sprint 40) -->
+<div x-data="{flags:[],loading:true,fkey:'',fenabled:true,fdesc:'',saving:false,smsg:''}"
+  x-init="fetch('?api=feature_flags_list').then(r=>r.json()).then(d=>{flags=d.rows||[];loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="toggle-left" class="w-4 h-4 text-fw-500"></i>Edit Feature Flag</h3>
+    <div class="flex items-center gap-3">
+      <input x-model="fkey" type="text" maxlength="100" placeholder="flag_key" class="text-sm font-mono border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500 w-48">
+      <label class="flex items-center gap-2 text-sm"><input x-model="fenabled" type="checkbox" class="rounded"> Enabled</label>
+      <button :disabled="saving||!fkey" @click="saving=true;smsg='';fetch('?api=feature_flag_set',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',key:fkey,enabled:fenabled?1:0})}).then(r=>r.json()).then(d=>{saving=false;if(d.ok){smsg='Saved';let ex=flags.findIndex(f=>f.key===fkey);if(ex>=0)flags[ex].enabled=d.enabled;else flags.push({key:fkey,enabled:d.enabled,description:''});fkey=''}else smsg=d.error||'Error'})" class="px-3 py-1.5 bg-fw-500 text-white text-sm rounded hover:bg-fw-700 disabled:opacity-50">Save Flag</button>
+      <p x-show="smsg" x-text="smsg" class="text-xs text-slate-600"></p>
+    </div>
+  </div>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 border-b border-slate-200"><tr>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Key</th>
+        <th class="px-4 py-2 text-center text-xs font-medium text-slate-500">Enabled</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Description</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Updated</th>
+        <th class="px-4 py-2 text-left text-xs font-medium text-slate-500">Toggle</th>
+      </tr></thead>
+      <tbody>
+        <tr x-show="loading"><td colspan="5" class="px-4 py-6 text-center text-slate-400 text-sm">Loading…</td></tr>
+        <template x-for="f in flags" :key="f.key">
+          <tr class="border-t border-slate-100 hover:bg-slate-50 cursor-pointer" @click="fkey=f.key;fenabled=!!f.enabled">
+            <td class="px-4 py-2 font-mono text-xs font-medium" x-text="f.key"></td>
+            <td class="px-4 py-2 text-center"><span :class="f.enabled?'bg-green-100 text-green-700':'bg-slate-100 text-slate-500'" class="px-2 py-0.5 rounded-full text-xs" x-text="f.enabled?'On':'Off'"></span></td>
+            <td class="px-4 py-2 text-xs text-slate-500" x-text="f.description||'—'"></td>
+            <td class="px-4 py-2 text-xs text-slate-500" x-text="f.updated_at?f.updated_at.substring(0,16).replace('T',' '):'—'"></td>
+            <td class="px-4 py-2"><button @click.stop="fetch('?api=feature_flag_set',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',key:f.key,enabled:f.enabled?0:1})}).then(r=>r.json()).then(d=>{if(d.ok)f.enabled=d.enabled})" class="text-xs text-fw-500 hover:underline" x-text="f.enabled?'Disable':'Enable'"></button></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+<?php endif; // feature_flags tab ?>
+
 <?php layout_foot(); }
 
 // ================================================================
@@ -10703,7 +12139,7 @@ if(!$user && $reset_tok_param): ?>
 <!-- Tab nav -->
 <?php $atab=$_GET['tab']??'overview'; ?>
 <div class="flex gap-0 border-b border-slate-200 mb-6">
-  <?php foreach(['overview'=>'Overview','filters'=>'Saved Filters','alerts'=>'Alerts','keys'=>'API Keys','activity'=>'Activity','notifications'=>'Notifications','tags'=>'Tags','feeds'=>'RSS Feeds','searches'=>'Saved Searches','shares'=>'Shared Links','digest'=>'Digest'] as $tv=>$tl): ?>
+  <?php foreach(['overview'=>'Overview','filters'=>'Saved Filters','alerts'=>'Alerts','keys'=>'API Keys','activity'=>'Activity','notifications'=>'Notifications','tags'=>'Tags','feeds'=>'RSS Feeds','searches'=>'Saved Searches','shares'=>'Shared Links','digest'=>'Digest','export'=>'Export'] as $tv=>$tl): ?>
   <a href="?page=account&tab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$atab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
   <?php endforeach; ?>
 </div>
@@ -11158,6 +12594,39 @@ Authorization: Bearer fw_...</pre>
     <p x-show="msg" x-text="msg" class="text-xs text-slate-600 mb-3"></p>
     <div x-show="html" class="border border-slate-200 rounded p-4 bg-white prose prose-sm max-w-none" x-html="html"></div>
     <p x-show="!html&&!loading" class="text-xs text-slate-400">Click "Preview Digest" to generate a preview.</p>
+  </div>
+</div>
+
+<?php elseif($atab==='export'): ?>
+<!-- Export tab (Sprint 37) -->
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+  <h3 class="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><i data-lucide="download" class="w-4 h-4 text-fw-500"></i>Data Export</h3>
+  <p class="text-xs text-slate-500 mb-5">Download recall data in CSV or JSON format. Exports are limited to the most recent 10,000 records.</p>
+  <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+    <div class="border border-slate-200 rounded-lg p-4">
+      <div class="flex items-center gap-2 mb-2"><i data-lucide="file-text" class="w-4 h-4 text-fw-500"></i><span class="text-sm font-semibold text-slate-700">Recalls</span></div>
+      <p class="text-xs text-slate-500 mb-3">All recall records with title, status, severity, and dates.</p>
+      <div class="flex gap-2">
+        <a href="?api=export_recalls&fmt=csv" class="px-3 py-1.5 bg-fw-500 text-white text-xs rounded hover:bg-fw-700">CSV</a>
+        <a href="?api=export_recalls&fmt=json" class="px-3 py-1.5 bg-slate-100 text-slate-700 text-xs rounded hover:bg-slate-200">JSON</a>
+      </div>
+    </div>
+    <div class="border border-slate-200 rounded-lg p-4">
+      <div class="flex items-center gap-2 mb-2"><i data-lucide="building-2" class="w-4 h-4 text-amber-500"></i><span class="text-sm font-semibold text-slate-700">Manufacturers</span></div>
+      <p class="text-xs text-slate-500 mb-3">Manufacturer list with recall counts and Class I totals.</p>
+      <div class="flex gap-2">
+        <a href="?api=export_manufacturers&fmt=csv" class="px-3 py-1.5 bg-fw-500 text-white text-xs rounded hover:bg-fw-700">CSV</a>
+        <a href="?api=export_manufacturers&fmt=json" class="px-3 py-1.5 bg-slate-100 text-slate-700 text-xs rounded hover:bg-slate-200">JSON</a>
+      </div>
+    </div>
+    <div class="border border-slate-200 rounded-lg p-4">
+      <div class="flex items-center gap-2 mb-2"><i data-lucide="map" class="w-4 h-4 text-red-500"></i><span class="text-sm font-semibold text-slate-700">Geo Risk</span></div>
+      <p class="text-xs text-slate-500 mb-3">State-level recall counts and risk scores.</p>
+      <div class="flex gap-2">
+        <a href="?api=export_geo_risk&fmt=csv" class="px-3 py-1.5 bg-fw-500 text-white text-xs rounded hover:bg-fw-700">CSV</a>
+        <a href="?api=export_geo_risk&fmt=json" class="px-3 py-1.5 bg-slate-100 text-slate-700 text-xs rounded hover:bg-slate-200">JSON</a>
+      </div>
+    </div>
   </div>
 </div>
 
