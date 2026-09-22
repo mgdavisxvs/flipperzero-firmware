@@ -9,8 +9,8 @@ declare(strict_types=1);
 // ================================================================
 // § CONSTANTS
 // ================================================================
-const FW_VERSION    = '5.5.0';
-const FW_SCHEMA_VER = 22;
+const FW_VERSION    = '5.6.0';
+const FW_SCHEMA_VER = 24;
 // Pre-shared secret for IONOS crontab → cron_alerts endpoint; override before deploy
 const FW_CRON_SECRET = 'change-me-before-deploy';
 const FW_DATA_DIR   = __DIR__ . '/data';
@@ -184,6 +184,7 @@ function user_login(string $email,string $pass):bool{
     db()->prepare("UPDATE users SET last_login=datetime('now') WHERE id=?")->execute([$row['id']]);
     // Migrate anonymous watchlist entries to this account
     db()->prepare("UPDATE watchlists SET user_id=? WHERE session_id=? AND user_id IS NULL")->execute([$row['id'],$sid_old]);
+    try{db()->prepare("INSERT INTO user_activity(user_id,action,meta,ip_hash)VALUES(?,?,?,?)")->execute([$row['id'],'login','{}',hash('sha256',$_SERVER['REMOTE_ADDR']??'')]);}catch(\Throwable){}
     return true;
 }
 function user_logout():void{
@@ -229,6 +230,29 @@ function api_key_rate_check(int $key_id,int $limit):bool{
     return(int)$s->fetchColumn()<=$limit;
 }
 
+function sparkline_svg(array $vals, int $w=80, int $h=24, string $color='#6366f1'):string{
+    $n=count($vals);
+    if($n<2)return '';
+    $mn=min($vals);$mx=max($vals);
+    $range=max(1,$mx-$mn);
+    $pts='';
+    for($i=0;$i<$n;$i++){
+        $x=round($i/($n-1)*$w,1);
+        $y=round($h-(($vals[$i]-$mn)/$range*($h-4))-2,1);
+        $pts.=($pts?'L':'M')."$x,$y";
+    }
+    return '<svg width="'.$w.'" height="'.$h.'" viewBox="0 0 '.$w.' '.$h.'" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="'.$pts.'" fill="none" stroke="'.h($color).'" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+}
+function log_activity(string $action, array $meta=[]):void{
+    $u=current_user();
+    if(!$u)return;
+    $ip_raw=$_SERVER['REMOTE_ADDR']??'';
+    $ip_hash=$ip_raw?hash('sha256',$ip_raw):'';
+    try{
+        db()->prepare("INSERT INTO user_activity(user_id,action,meta,ip_hash)VALUES(?,?,?,?)")
+           ->execute([$u['id'],$action,json_encode($meta,JSON_UNESCAPED_UNICODE),$ip_hash]);
+    }catch(\Throwable){}
+}
 function is_ajax():bool{
     return ($_SERVER['HTTP_X_REQUESTED_WITH']??'')==='XMLHttpRequest'
         || str_contains($_SERVER['HTTP_ACCEPT']??'','application/json');
@@ -286,7 +310,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -718,6 +742,29 @@ CREATE TABLE IF NOT EXISTS recall_notes(
   updated_at TEXT NOT NULL DEFAULT(datetime('now')));
 CREATE INDEX IF NOT EXISTS idx_rn_recall ON recall_notes(recall_id);
 CREATE INDEX IF NOT EXISTS idx_rn_user ON recall_notes(user_id);
+SQL; }
+
+function m23():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS user_activity(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  action TEXT NOT NULL,
+  meta TEXT NOT NULL DEFAULT '{}',
+  ip_hash TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_ua_user ON user_activity(user_id, created_at);
+SQL; }
+
+function m24():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS recall_flags(
+  id INTEGER PRIMARY KEY,
+  recall_id INTEGER NOT NULL REFERENCES recalls(id) ON DELETE CASCADE,
+  flag TEXT NOT NULL CHECK(flag IN ('verified','escalated','watch','closed')),
+  admin_note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT(datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT(datetime('now')),
+  UNIQUE(recall_id));
+CREATE INDEX IF NOT EXISTS idx_rf_recall ON recall_flags(recall_id);
 SQL; }
 
 // ================================================================
@@ -2507,6 +2554,17 @@ function run_tests():array{
         'compare_no_dups'       =>'test_compare_no_dups',
         'dbhealth_tab'          =>'test_dbhealth_tab',
         'notes_auth_guard'      =>'test_notes_auth_guard',
+        // Sprint 11
+        'user_activity_schema'  =>'test_user_activity_schema',
+        'log_activity_fn'       =>'test_log_activity_fn',
+        'recall_flags_schema'   =>'test_recall_flags_schema',
+        'recall_flag_api'       =>'test_recall_flag_api',
+        'flag_badge_recalls'    =>'test_flag_badge_recalls',
+        'flag_badge_detail'     =>'test_flag_badge_detail',
+        'dq_resolve_all'        =>'test_dq_resolve_all',
+        'activity_tab'          =>'test_activity_tab',
+        'sparkline_fn'          =>'test_sparkline_fn',
+        'activity_logging'      =>'test_activity_logging',
         // Sprint 9
         'fts_snippet'           =>'test_fts_snippet',
         'similar_recalls'       =>'test_similar_recalls',
@@ -2994,6 +3052,65 @@ function test_recall_detail_similar():array{
     $ok=str_contains($src,'Similar Recalls')&&str_contains($src,'recall_equivalences')&&str_contains($src,'sim>=0.30');
     return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'similar recalls panel present in recall detail':'panel missing'];
 }
+// ── Sprint 11 tests ──────────────────────────────────────────────
+function test_user_activity_schema():array{
+    try{$cols=db()->query("PRAGMA table_info(user_activity)")->fetchAll(\PDO::FETCH_COLUMN,1);}catch(\Throwable){$cols=[];}
+    $need=['id','user_id','action','meta','ip_hash','created_at'];
+    $missing=array_diff($need,$cols);
+    $ok=empty($missing);
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'user_activity schema valid':'missing cols: '.implode(',',$missing)];
+}
+function test_log_activity_fn():array{
+    $ok=function_exists('log_activity');
+    $src=file_get_contents(__FILE__);
+    $inst=str_contains($src,"log_activity('login')")&&str_contains($src,"log_activity('watchlist_add')")&&str_contains($src,"log_activity('export_csv')")&&str_contains($src,"log_activity('note_save'");
+    return['status'=>($ok&&$inst)?'PASS':'FAIL','msg'=>$ok?($inst?'log_activity() present + 4 instrumentation points':'log_activity() exists but missing instrumentation'):'log_activity() not found'];
+}
+function test_recall_flags_schema():array{
+    try{$cols=db()->query("PRAGMA table_info(recall_flags)")->fetchAll(\PDO::FETCH_COLUMN,1);}catch(\Throwable){$cols=[];}
+    $need=['id','recall_id','flag','admin_note','created_at','updated_at'];
+    $missing=array_diff($need,$cols);
+    $ok=empty($missing);
+    $src=file_get_contents(__FILE__);
+    $chk=str_contains($src,"CHECK(flag IN ('verified','escalated','watch','closed'))");
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'recall_flags schema valid; CHECK constraint='.($chk?'yes':'no'):'missing cols: '.implode(',',$missing)];
+}
+function test_recall_flag_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'recall_flag_save':")&&str_contains($src,"case 'recall_flag_del':")&&str_contains($src,"case 'recall_flags_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_flag_save / recall_flag_del / recall_flags_list present':'flag API cases missing'];
+}
+function test_flag_badge_recalls():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'$flag_map')&&str_contains($src,'recall_flags WHERE recall_id')&&str_contains($src,'$flag_map[$rid]');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'flag badge lookup and display in view_recalls present':'flag badges in recall list missing'];
+}
+function test_flag_badge_detail():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'$recall_flag')&&str_contains($src,'recall_flag_save')&&str_contains($src,"recall_flags WHERE recall_id");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'flag badge + admin panel in view_recall_detail present':'flag badge in recall detail missing'];
+}
+function test_dq_resolve_all():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'dq_resolve_all':")&&str_contains($src,'Resolve All')&&str_contains($src,'dq_resolve_all');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dq_resolve_all endpoint + button present':'dq_resolve_all missing'];
+}
+function test_activity_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'activity'=>'Activity'")&&str_contains($src,"atab==='activity'")&&str_contains($src,'activity_list');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'activity tab in account page present':'activity tab missing'];
+}
+function test_sparkline_fn():array{
+    $svg=sparkline_svg([3,7,5,9,4],80,22,'#6366f1');
+    $ok=str_contains($svg,'<svg')&&str_contains($svg,'<path')&&str_contains($svg,'stroke="#6366f1"');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'sparkline_svg() renders valid SVG polyline':'sparkline_svg() output invalid'];
+}
+function test_activity_logging():array{
+    $src=file_get_contents(__FILE__);
+    // login logging uses direct INSERT (not log_activity() because user session not set yet)
+    $ok=str_contains($src,"INSERT INTO user_activity")&&str_contains($src,"'login'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'login activity INSERT present':'login activity logging missing'];
+}
 // ── Sprint 10 tests ──────────────────────────────────────────────
 function test_recall_notes_schema():array{
     try{
@@ -3142,6 +3259,7 @@ function handle_api(string $api):void{
                 if(is_user()){
                     $uid=current_user()['id'];
                     db()->prepare('INSERT OR IGNORE INTO watchlists(user_id,session_id,watch_type,watch_value,watch_label)VALUES(?,?,?,?,?)')->execute([$uid,session_id(),$wt,$wv,$wl]);
+                    log_activity('watchlist_add',['type'=>$wt,'value'=>$wv]);
                 }else{
                     db()->prepare('INSERT OR IGNORE INTO watchlists(session_id,watch_type,watch_value,watch_label)VALUES(?,?,?,?)')->execute([session_id(),$wt,$wv,$wl]);
                 }
@@ -3276,6 +3394,7 @@ function handle_api(string $api):void{
             case 'export_csv':
                 $f=['status'=>$_GET['status']??'all','state'=>$_GET['state']??'','category'=>$_GET['cat']??'','hazard'=>$_GET['haz']??'','agency'=>$_GET['agency']??'','q'=>$_GET['q']??'','sort'=>$_GET['sort']??'date','severity'=>$_GET['sev']??''];
                 $data=q_recalls(1,2000,$f);
+                log_activity('export_csv',['status'=>$f['status'],'q'=>$f['q']]);
                 header('Content-Type: text/csv; charset=utf-8');
                 header('Content-Disposition: attachment; filename="foodwatch-recalls-'.date('Y-m-d').'.csv"');
                 $out=fopen('php://output','w');
@@ -3381,6 +3500,7 @@ function handle_api(string $api):void{
                     echo js(['ok'=>true,'id'=>$note_id_upd]);
                 }else{
                     db()->prepare("INSERT INTO recall_notes(user_id,recall_id,body)VALUES(?,?,?)")->execute([$note_uid,$note_rid,$note_body]);
+                    log_activity('note_save',['recall_id'=>$note_rid]);
                     echo js(['ok'=>true,'id'=>(int)db()->lastInsertId()]);
                 }break;
             case 'note_del':
@@ -3393,6 +3513,45 @@ function handle_api(string $api):void{
                 $s=db()->prepare("SELECT id,body,created_at,updated_at FROM recall_notes WHERE recall_id=? AND user_id=? ORDER BY created_at DESC");
                 $s->execute([(int)($_GET['recall_id']??0),current_user()['id']]);
                 echo js($s->fetchAll());break;
+            // Sprint 11: recall flags (admin triage)
+            case 'recall_flag_save':
+                if(!is_admin())fw_abort('Unauthorized',403);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $rf_rid=(int)($_POST['recall_id']??0);
+                $rf_flag=trim($_POST['flag']??'');
+                $rf_note=mb_substr(trim($_POST['admin_note']??''),0,500);
+                if(!$rf_rid||!in_array($rf_flag,['verified','escalated','watch','closed']))fw_abort('Invalid recall_id or flag',400);
+                db()->prepare("INSERT INTO recall_flags(recall_id,flag,admin_note)VALUES(?,?,?) ON CONFLICT(recall_id) DO UPDATE SET flag=excluded.flag,admin_note=excluded.admin_note,updated_at=datetime('now')")->execute([$rf_rid,$rf_flag,$rf_note]);
+                echo js(['ok'=>true]);break;
+            case 'recall_flag_del':
+                if(!is_admin())fw_abort('Unauthorized',403);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                db()->prepare("DELETE FROM recall_flags WHERE recall_id=?")->execute([(int)($_POST['recall_id']??0)]);
+                echo js(['ok'=>true]);break;
+            case 'recall_flags_list':
+                $rf_rid_q=(int)($_GET['recall_id']??0);
+                if($rf_rid_q){
+                    $s=db()->prepare("SELECT flag,admin_note,created_at,updated_at FROM recall_flags WHERE recall_id=?");
+                    $s->execute([$rf_rid_q]);echo js($s->fetch()?:null);
+                }else{
+                    echo js(db()->query("SELECT recall_id,flag,admin_note,updated_at FROM recall_flags ORDER BY updated_at DESC LIMIT 100")->fetchAll());
+                }break;
+            // Sprint 11: bulk DQ resolve
+            case 'dq_resolve_all':
+                if(!is_admin())fw_abort('Unauthorized',403);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $dqt=trim($_POST['flag_type']??'');
+                if($dqt){
+                    $n=(int)db()->prepare("SELECT COUNT(*) FROM data_quality_flags WHERE resolved=0 AND flag_type=?")->execute([$dqt])||0;
+                    db()->prepare("UPDATE data_quality_flags SET resolved=1 WHERE resolved=0 AND flag_type=?")->execute([$dqt]);
+                }else{
+                    db()->exec("UPDATE data_quality_flags SET resolved=1 WHERE resolved=0");
+                }
+                echo js(['ok'=>true]);break;
+            case 'activity_list':
+                if(!is_user())fw_abort('Login required',401);
+                $s=db()->prepare("SELECT action,meta,created_at FROM user_activity WHERE user_id=? ORDER BY created_at DESC LIMIT 50");
+                $s->execute([current_user()['id']]);echo js($s->fetchAll());break;
             case 'v1':
                 $auth=$_SERVER['HTTP_AUTHORIZATION']??'';
                 $raw_key=str_starts_with($auth,'Bearer ')?trim(substr($auth,7)):trim($_GET['api_key']??'');
@@ -3680,6 +3839,10 @@ function view_dashboard():void{
     try{$velocity=q_velocity();}catch(\Throwable){$velocity=['z_score'=>0.0,'rate_30d'=>0,'baseline_monthly'=>0,'trending_cats'=>[]];}
     // Sprint 10: velocity forecast (linear regression over stored velocity history)
     try{$forecast=q_velocity_forecast();}catch(\Throwable){$forecast=['forecast'=>null,'trend'=>0.0,'confidence'=>'n/a'];}
+    // Sprint 11: 8-week sparkline data for stat tiles
+    try{$trend8=array_slice(q_recall_trend(8),0,8);}catch(\Throwable){$trend8=[];}
+    $spark_total=array_column($trend8,'total');
+    $spark_severe=array_column($trend8,'severe');
 
     layout_head('Dashboard','dashboard'); ?>
 
@@ -3728,8 +3891,8 @@ function view_dashboard():void{
 
 <!-- Stats row -->
 <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3 mb-6">
-  <div class="fw-stat"><div class="text-2xl font-bold text-slate-800"><?=number_format($stats['active'])?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="alert-circle" class="w-3 h-3 text-red-500"></i>Active Recalls</div></div>
-  <div class="fw-stat"><div class="text-2xl font-bold text-red-600"><?=number_format($stats['severe'])?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="shield-alert" class="w-3 h-3 text-red-600"></i>Class I (Severe)</div></div>
+  <div class="fw-stat"><div class="text-2xl font-bold text-slate-800"><?=number_format($stats['active'])?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="alert-circle" class="w-3 h-3 text-red-500"></i>Active Recalls</div><?php if(count($spark_total)>=2):?><div class="mt-1.5"><?=sparkline_svg($spark_total,80,22,'#6366f1')?></div><?php endif;?></div>
+  <div class="fw-stat"><div class="text-2xl font-bold text-red-600"><?=number_format($stats['severe'])?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="shield-alert" class="w-3 h-3 text-red-600"></i>Class I (Severe)</div><?php if(count($spark_severe)>=2):?><div class="mt-1.5"><?=sparkline_svg($spark_severe,80,22,'#dc2626')?></div><?php endif;?></div>
   <div class="fw-stat"><div class="text-2xl font-bold text-slate-800"><?=number_format($stats['total_retailers'])?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="store" class="w-3 h-3"></i>Retailers Affected</div></div>
   <div class="fw-stat"><div class="text-2xl font-bold text-slate-800"><?=number_format($stats['total_stores']??0)?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="map-pin" class="w-3 h-3"></i>Store Locations</div></div>
   <div class="fw-stat"><div class="text-2xl font-bold text-slate-800"><?=number_format($stats['total_distributors']??0)?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="truck" class="w-3 h-3"></i>Distributors</div></div>
@@ -3935,6 +4098,17 @@ function view_recalls():void{
   <button type="submit" class="bg-fw-500 text-white text-sm rounded px-3 py-1.5 font-medium hover:bg-fw-700">Filter</button>
 </form>
 
+<?php
+// Sprint 11: load recall flags for current page
+$page_ids=array_column($data['records'],'id');
+$flag_map=[];
+if($page_ids){
+    $pl=implode(',',array_fill(0,count($page_ids),'?'));
+    $fs=db()->prepare("SELECT recall_id,flag FROM recall_flags WHERE recall_id IN($pl)");
+    $fs->execute($page_ids);
+    foreach($fs->fetchAll() as $fr)$flag_map[(int)$fr['recall_id']]=$fr['flag'];
+}
+?>
 <!-- Sprint 10: compare state wrapper -->
 <div class="bg-white rounded-lg border border-slate-200 shadow-sm" x-data="{cmp:[],addCmp(id,title){if(this.cmp.length>=4||this.cmp.find(r=>r.id===id))return;this.cmp.push({id,title})},rmCmp(id){this.cmp=this.cmp.filter(r=>r.id!==id)},inCmp(id){return!!this.cmp.find(r=>r.id===id)}}">
   <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
@@ -3973,6 +4147,10 @@ function view_recalls():void{
       <td><a href="?page=recall&id=<?=(int)$rec['id']?>" class="text-fw-500 hover:underline font-medium"><?=h(mb_substr($rec['title'],0,80))?><?=mb_strlen($rec['title'])>80?'…':''?></a>
         <?php if($rec['reason']): ?><br><span class="text-xs text-slate-500"><?=h(mb_substr($rec['reason'],0,100))?><?=mb_strlen($rec['reason'])>100?'…':''?></span><?php endif; ?>
         <?php foreach(($rec['hazards']??[]) as $h): ?><span class="inline-block text-xs bg-slate-100 rounded px-1.5 py-0.5 mr-1 text-slate-600"><?=h($h['name'])?></span><?php endforeach; ?>
+        <?php if(isset($flag_map[$rid])): ?>
+        <?php $fc=['verified'=>'bg-green-100 text-green-700','escalated'=>'bg-red-100 text-red-700','watch'=>'bg-yellow-100 text-yellow-700','closed'=>'bg-slate-100 text-slate-500']; ?>
+        <span class="inline-block text-xs px-1.5 py-0.5 rounded font-medium <?=$fc[$flag_map[$rid]]??'bg-slate-100 text-slate-500'?>"><?=h($flag_map[$rid])?></span>
+        <?php endif; ?>
       </td>
       <td class="font-mono text-xs"><?=h($rec['agency_code']??'')?></td>
       <td class="text-xs"><?=h($rec['category_name']??'—')?></td>
@@ -4021,11 +4199,41 @@ function view_recall_detail():void{
             }
         }
     }catch(\Throwable){}
+    // Sprint 11: load recall flag
+    $recall_flag=null;
+    try{
+        $rfs=db()->prepare("SELECT flag,admin_note,updated_at FROM recall_flags WHERE recall_id=?");
+        $rfs->execute([$id]);$recall_flag=$rfs->fetch()?:null;
+    }catch(\Throwable){}
     layout_head(mb_substr($rec['title'],0,60),'recall'); ?>
 
-<div class="mb-4">
+<div class="mb-4 flex items-center gap-3">
   <a href="?page=recalls" class="text-sm text-fw-500 hover:underline flex items-center gap-1"><i data-lucide="arrow-left" class="w-3 h-3"></i>Back to recalls</a>
+  <?php if($recall_flag): ?>
+  <?php $fc=['verified'=>'bg-green-100 text-green-700 border-green-300','escalated'=>'bg-red-100 text-red-700 border-red-300','watch'=>'bg-yellow-100 text-yellow-700 border-yellow-300','closed'=>'bg-slate-100 text-slate-500 border-slate-300']; ?>
+  <span class="inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full border font-medium <?=$fc[$recall_flag['flag']]??'bg-slate-100 text-slate-500 border-slate-300'?>">
+    <i data-lucide="flag" class="w-3 h-3"></i><?=h($recall_flag['flag'])?>
+    <?php if($recall_flag['admin_note']): ?><span class="font-normal opacity-75">&middot; <?=h(mb_substr($recall_flag['admin_note'],0,40))?></span><?php endif; ?>
+  </span>
+  <?php endif; ?>
 </div>
+<?php if(is_admin()): ?>
+<div class="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 flex flex-wrap items-center gap-3" x-data="{flag:'<?=h($recall_flag['flag']??'')?>', note:'<?=addslashes($recall_flag['admin_note']??'')?>', saving:false, saved:false}">
+  <i data-lucide="shield" class="w-4 h-4 text-amber-600 shrink-0"></i>
+  <span class="text-xs font-semibold text-amber-800">Admin Flag</span>
+  <select x-model="flag" class="text-xs border border-amber-300 rounded px-2 py-1 bg-white">
+    <option value="">— none —</option>
+    <option value="verified">verified</option>
+    <option value="escalated">escalated</option>
+    <option value="watch">watch</option>
+    <option value="closed">closed</option>
+  </select>
+  <input x-model="note" type="text" placeholder="Admin note (optional)" maxlength="500" class="flex-1 min-w-0 text-xs border border-amber-300 rounded px-2 py-1 bg-white focus:outline-none focus:ring-1 focus:ring-amber-400">
+  <button @click="if(!flag){fetch('?api=recall_flag_del',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',recall_id:'<?=$id?>'})}).then(()=>{saved=true;setTimeout(()=>location.reload(),800)})}else{saving=true;fetch('?api=recall_flag_save',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',recall_id:'<?=$id?>',flag,admin_note:note})}).then(r=>r.json()).then(d=>{saving=false;if(d.ok){saved=true;setTimeout(()=>location.reload(),800)}})}" :disabled="saving" class="text-xs bg-amber-600 text-white px-3 py-1 rounded font-medium hover:bg-amber-700 disabled:opacity-50 shrink-0">
+    <span x-show="!saving&&!saved">Save Flag</span><span x-show="saving">Saving…</span><span x-show="saved">Saved ✓</span>
+  </button>
+</div>
+<?php endif; ?>
 
 <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
   <!-- Main detail -->
@@ -5492,17 +5700,23 @@ function view_admin():void{
 <div class="bg-white rounded-lg border border-slate-200 shadow-sm mb-6">
   <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
     <h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="flag" class="w-4 h-4 text-yellow-500"></i>Open Data Quality Flags — Summary</h2>
-    <span class="text-xs text-slate-400"><?=count($dq)?> flag type(s)</span>
+    <div class="flex items-center gap-3">
+      <span class="text-xs text-slate-400"><?=count($dq)?> flag type(s)</span>
+      <?php if($dq): ?>
+      <button onclick="if(confirm('Resolve ALL unresolved DQ flags?'))fetch('?api=dq_resolve_all',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>'})}).then(()=>location.reload())" class="text-xs bg-green-600 text-white px-3 py-1 rounded hover:bg-green-700 font-medium">Resolve All</button>
+      <?php endif; ?>
+    </div>
   </div>
   <?php if($dq): ?>
   <table class="fw-table w-full">
-    <thead><tr><th>Flag Type</th><th>Severity</th><th>Count</th></tr></thead>
+    <thead><tr><th>Flag Type</th><th>Severity</th><th>Count</th><th></th></tr></thead>
     <tbody>
     <?php foreach($dq as $d): ?>
     <tr>
       <td class="font-mono text-xs"><?=h($d['flag_type'])?></td>
       <td class="text-xs capitalize"><span class="px-1.5 py-0.5 rounded text-xs <?=$d['severity']==='critical'?'bg-red-100 text-red-700':($d['severity']==='warning'?'bg-yellow-100 text-yellow-700':'bg-blue-100 text-blue-700')?>"><?=h($d['severity'])?></span></td>
       <td class="text-center font-bold"><?=(int)$d['cnt']?></td>
+      <td><button onclick="fetch('?api=dq_resolve_all',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',flag_type:'<?=addslashes($d['flag_type'])?>'})}).then(()=>this.closest('tr').remove())" class="text-xs text-green-600 hover:underline">Resolve type</button></td>
     </tr>
     <?php endforeach; ?>
     </tbody>
@@ -5808,7 +6022,7 @@ if(!$user && $reset_tok_param): ?>
 <!-- Tab nav -->
 <?php $atab=$_GET['tab']??'overview'; ?>
 <div class="flex gap-0 border-b border-slate-200 mb-6">
-  <?php foreach(['overview'=>'Overview','filters'=>'Saved Filters','alerts'=>'Alerts','keys'=>'API Keys'] as $tv=>$tl): ?>
+  <?php foreach(['overview'=>'Overview','filters'=>'Saved Filters','alerts'=>'Alerts','keys'=>'API Keys','activity'=>'Activity'] as $tv=>$tl): ?>
   <a href="?page=account&tab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$atab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
   <?php endforeach; ?>
 </div>
@@ -5966,6 +6180,37 @@ GET ?api=v1&resource=stats&api_key=fw_...
 Authorization: Bearer fw_...</pre>
   </div>
 </div>
+
+<?php elseif($atab==='activity'): ?>
+<!-- Activity tab (Sprint 11) -->
+<div x-data="{rows:[],loading:true}" x-init="fetch('?api=activity_list').then(r=>r.json()).then(d=>{rows=d;loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4 mb-4">
+    <p class="text-xs text-slate-500">Your last 50 actions on this platform — logins, exports, watchlist additions, and note saves.</p>
+  </div>
+  <div x-show="loading" class="text-sm text-slate-400 text-center py-6 animate-pulse">Loading…</div>
+  <div x-show="!loading&&rows.length===0" class="text-sm text-slate-400 text-center py-8 bg-white rounded-lg border border-slate-200">No activity recorded yet.</div>
+  <div x-show="!loading&&rows.length>0" class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <table class="fw-table w-full">
+      <thead><tr><th>Action</th><th>Details</th><th>When</th></tr></thead>
+      <tbody>
+        <template x-for="(r,i) in rows" :key="i">
+          <tr>
+            <td><span :class="{
+              'bg-blue-100 text-blue-700':r.action==='login',
+              'bg-green-100 text-green-700':r.action==='note_save',
+              'bg-indigo-100 text-indigo-700':r.action==='watchlist_add',
+              'bg-orange-100 text-orange-700':r.action==='export_csv',
+              'bg-slate-100 text-slate-600':!['login','note_save','watchlist_add','export_csv'].includes(r.action)
+            }" class="px-2 py-0.5 rounded text-xs font-medium" x-text="r.action"></span></td>
+            <td class="text-xs text-slate-500 max-w-xs truncate" x-text="(()=>{try{const m=JSON.parse(r.meta||'{}');return Object.entries(m).map(([k,v])=>k+': '+v).join(' · ')||'—'}catch{return '—'}})()" :title="r.meta"></td>
+            <td class="text-xs text-slate-500 whitespace-nowrap" x-text="r.created_at?.substring(0,16)?.replace('T',' ')"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+
 <?php endif; ?>
 <?php endif; ?>
 <?php layout_foot(); }
