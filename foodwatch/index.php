@@ -1968,6 +1968,26 @@ function markov_refresh_cache():array{
     }catch(\Throwable $e){return['ok'=>false,'error'=>$e->getMessage()];}
 }
 
+// Box-Muller standard normal variate (cached second sample via static)
+function fw_normal_variate():float{
+    static $spare=null,$has=false;
+    if($has){$has=false;return $spare;}
+    $u=mt_rand(1,PHP_INT_MAX)/PHP_INT_MAX;$v=mt_rand(1,PHP_INT_MAX)/PHP_INT_MAX;
+    $r=sqrt(-2.0*log($u));$spare=$r*sin(2*M_PI*$v);$has=true;
+    return $r*cos(2*M_PI*$v);
+}
+// Marsaglia-Tsang Gamma(alpha,1) sampler — correct for all alpha>0
+function fw_gamma_variate(float $alpha):float{
+    if($alpha<1.0)return fw_gamma_variate($alpha+1.0)*pow(mt_rand(1,PHP_INT_MAX)/PHP_INT_MAX,1.0/$alpha);
+    $d=$alpha-1.0/3.0;$c=1.0/sqrt(9.0*$d);
+    while(true){
+        do{$x=fw_normal_variate();$v=1.0+$c*$x;}while($v<=0.0);
+        $v=$v*$v*$v;$u=mt_rand(1,PHP_INT_MAX)/PHP_INT_MAX;
+        if($u<1.0-0.0331*($x*$x)*($x*$x))return $d*$v;
+        if(log($u)<0.5*$x*$x+$d*(1.0-$v+log($v)))return $d*$v;
+    }
+}
+
 // GROUP 17: Bayesian credible interval via Dirichlet posterior sampling
 // alpha: row vector of pseudo-counts α_j for state s (Dirichlet concentration)
 // Returns ['lo'=>pct, 'hi'=>pct, 'base'=>pct] at horizon k for state s
@@ -1975,9 +1995,9 @@ function markov_bayesian_ci(array $alpha,array $P_base,int $s,int $k,int $sample
     $p_samples=[];
     $K=count($alpha);
     for($iter=0;$iter<$samples;$iter++){
-        // Sample from Dirichlet(alpha) via Gamma variates
+        // Sample from Dirichlet(alpha) via Gamma(alpha_i,1) variates (Marsaglia-Tsang)
         $G=[];$sumG=0;
-        foreach($alpha as $a){$g=-log(mt_rand(1,PHP_INT_MAX)/PHP_INT_MAX)*$a;$G[]=$g;$sumG+=$g;}
+        foreach($alpha as $a){$g=fw_gamma_variate(max(1e-6,(float)$a));$G[]=$g;$sumG+=$g;}
         if($sumG<1e-9){$p_samples[]=$P_base;continue;}
         $row_s=array_map(fn($g)=>$g/$sumG,$G);
         $P_s=$P_base;$P_s[$s]=$row_s+array_fill(0,4,0.0);
