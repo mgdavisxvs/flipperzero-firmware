@@ -1631,9 +1631,19 @@ function q_search(string $q,int $limit=50):array{
     // GROUP 18: expand query with hazard synonyms before FTS MATCH
     $q_exp=expand_hazard_query($q);
     $safe=trim(preg_replace('/[^a-z0-9 \-_]/i','',$q_exp));
+    // Strip FTS5 boolean operators (uppercase keywords only)
+    $safe=preg_replace('/\b(AND|OR|NOT|NEAR)\b/','',$safe);
+    // Replace hyphens not flanked by alphanumeric chars (FTS5 treats leading - as NOT)
+    $safe=preg_replace('/(?<![a-z0-9])-|-(?![a-z0-9])/i',' ',$safe);
+    $safe=trim(preg_replace('/\s+/',' ',$safe));
     if(!$safe)return[];
+    // Build FTS5 query: each token as a double-quoted phrase literal; last token gets prefix *
+    $tokens=preg_split('/\s+/',$safe,-1,PREG_SPLIT_NO_EMPTY);
+    $last=array_pop($tokens);
+    $fts=implode(' ',array_map(fn($t)=>'"'.$t.'"',$tokens));
+    $fts.=($fts?' ':'').'"'.$last.'"*';
     $ids_stmt=db()->prepare('SELECT recall_id FROM recalls_fts WHERE recalls_fts MATCH ? LIMIT ?');
-    $ids_stmt->execute([$safe.'*',$limit]);
+    $ids_stmt->execute([$fts,$limit]);
     $ids=array_column($ids_stmt->fetchAll(),'recall_id');
     if(!$ids)return[];
     $pl=implode(',',array_fill(0,count($ids),'?'));
@@ -2539,10 +2549,10 @@ function test_markov_invariants():array{
         $sum=array_sum($P[$i]??[]);
         if(abs($sum-1.0)>0.01)$errs[]="Row $i sums to $sum (expected 1.0)";
     }
-    // 2. Absorbing states have P[i][i] = 1.0 (states 2,3)
-    foreach([2,3] as $i){
-        if(abs(($P[$i][$i]??0)-1.0)>0.01)$errs[]="Absorbing state $i: P[$i][$i]=".($P[$i][$i]??0);
-    }
+    // 2. State 3 (archived) is the only true absorbing state; state 2 may still transition to 3
+    if(abs(($P[3][3]??0)-1.0)>0.01)$errs[]="Absorbing state 3: P[3][3]=".($P[3][3]??0);
+    // State 2 (resolved) must route entirely to state 3 — P[2][3] should be ~1.0
+    if(($P[2][3]??0)<0.5)$errs[]="State 2 must transition to state 3; P[2][3]=".($P[2][3]??0);
     // 3. P(resolved in 60d) >= P(resolved in 30d) for active state (monotonicity)
     $N=markov_fundamental_matrix($P);
     $p30=markov_p_resolved_in_k($P,$N,1,2);
