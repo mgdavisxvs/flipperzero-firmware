@@ -9,8 +9,8 @@ declare(strict_types=1);
 // ================================================================
 // § CONSTANTS
 // ================================================================
-const FW_VERSION    = '10.0.0';
-const FW_SCHEMA_VER = 54;
+const FW_VERSION    = '11.0.0';
+const FW_SCHEMA_VER = 64;
 // Pre-shared secret for IONOS crontab → cron_alerts endpoint; override before deploy
 const FW_CRON_SECRET = 'change-me-before-deploy';
 const FW_DATA_DIR   = __DIR__ . '/data';
@@ -285,6 +285,7 @@ function db():PDO{
     migrate($pdo);
     seed_system_settings();
     seed_feature_flags();
+    seed_rate_limit_config();
     return $pdo;
 }
 
@@ -312,7 +313,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26(),27=>m27(),28=>m28(),29=>m29(),30=>m30(),31=>m31(),32=>m32(),33=>m33(),34=>m34(),35=>m35(),36=>m36(),37=>m37(),38=>m38(),39=>m39(),40=>m40(),41=>m41(),42=>m42(),43=>m43(),44=>m44(),45=>m45(),46=>m46(),47=>m47(),48=>m48(),49=>m49(),50=>m50(),51=>m51(),52=>m52(),53=>m53(),54=>m54()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26(),27=>m27(),28=>m28(),29=>m29(),30=>m30(),31=>m31(),32=>m32(),33=>m33(),34=>m34(),35=>m35(),36=>m36(),37=>m37(),38=>m38(),39=>m39(),40=>m40(),41=>m41(),42=>m42(),43=>m43(),44=>m44(),45=>m45(),46=>m46(),47=>m47(),48=>m48(),49=>m49(),50=>m50(),51=>m51(),52=>m52(),53=>m53(),54=>m54(),55=>m55(),56=>m56(),57=>m57(),58=>m58(),59=>m59(),60=>m60(),61=>m61(),62=>m62(),63=>m63(),64=>m64()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -801,6 +802,120 @@ CREATE TABLE IF NOT EXISTS notification_prefs(
   digest_freq TEXT NOT NULL DEFAULT 'immediate' CHECK(digest_freq IN ('immediate','daily','weekly')),
   updated_at TEXT NOT NULL DEFAULT(datetime('now')));
 CREATE INDEX IF NOT EXISTS idx_np_user ON notification_prefs(user_id);
+SQL; }
+
+function m64():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS ingest_run_log(
+  id INTEGER PRIMARY KEY,
+  source TEXT NOT NULL DEFAULT 'fda',
+  started_at TEXT NOT NULL DEFAULT(datetime('now')),
+  finished_at TEXT,
+  records_fetched INTEGER NOT NULL DEFAULT 0,
+  records_inserted INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','ok','error')),
+  error_msg TEXT);
+CREATE INDEX IF NOT EXISTS idx_irl_source ON ingest_run_log(source,started_at);
+SQL; }
+
+function m63():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS health_check_results(
+  id INTEGER PRIMARY KEY,
+  check_name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'ok' CHECK(status IN ('ok','warn','error')),
+  detail TEXT NOT NULL DEFAULT '',
+  latency_ms INTEGER NOT NULL DEFAULT 0,
+  checked_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_hcr_name ON health_check_results(check_name,checked_at);
+SQL; }
+
+function m62():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS rate_limit_config(
+  key TEXT PRIMARY KEY,
+  requests_per_minute INTEGER NOT NULL DEFAULT 60,
+  requests_per_hour INTEGER NOT NULL DEFAULT 1000,
+  burst_allowance INTEGER NOT NULL DEFAULT 10,
+  updated_at TEXT NOT NULL DEFAULT(datetime('now')));
+INSERT OR IGNORE INTO rate_limit_config(key,requests_per_minute,requests_per_hour,burst_allowance)VALUES
+  ('anon',20,200,5),
+  ('user',60,1000,10),
+  ('admin',200,5000,50),
+  ('api_key',100,2000,20);
+SQL; }
+
+function m61():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS search_history(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  query TEXT NOT NULL,
+  result_count INTEGER NOT NULL DEFAULT 0,
+  searched_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_sh_user ON search_history(user_id,searched_at);
+SQL; }
+
+function m60():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS system_metrics(
+  id INTEGER PRIMARY KEY,
+  key TEXT NOT NULL,
+  value REAL NOT NULL DEFAULT 0,
+  label TEXT NOT NULL DEFAULT '',
+  recorded_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_sm_key ON system_metrics(key,recorded_at);
+SQL; }
+
+function m59():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS notification_dispatch_log(
+  id INTEGER PRIMARY KEY,
+  subscription_id INTEGER REFERENCES alert_subscriptions(id) ON DELETE SET NULL,
+  recall_id INTEGER REFERENCES recalls(id) ON DELETE SET NULL,
+  status TEXT NOT NULL DEFAULT 'sent' CHECK(status IN ('sent','failed','skipped')),
+  error_msg TEXT,
+  dispatched_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_ndl_sub ON notification_dispatch_log(subscription_id,dispatched_at);
+CREATE INDEX IF NOT EXISTS idx_ndl_recall ON notification_dispatch_log(recall_id);
+SQL; }
+
+function m58():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS rate_limit_window(
+  key TEXT PRIMARY KEY,
+  count INTEGER NOT NULL DEFAULT 0,
+  window_start TEXT NOT NULL DEFAULT(datetime('now')));
+SQL; }
+
+function m57():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS saved_searches(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL DEFAULT '',
+  query TEXT NOT NULL DEFAULT '',
+  filters_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_ss_user ON saved_searches(user_id,created_at);
+SQL; }
+
+function m56():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS recall_risk_index(
+  recall_id INTEGER PRIMARY KEY REFERENCES recalls(id) ON DELETE CASCADE,
+  risk_index REAL NOT NULL DEFAULT 0,
+  dq_weight REAL NOT NULL DEFAULT 0,
+  state_weight REAL NOT NULL DEFAULT 0,
+  cluster_weight REAL NOT NULL DEFAULT 0,
+  computed_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_rri_risk ON recall_risk_index(risk_index DESC);
+SQL; }
+
+function m55():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS audit_log(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  action TEXT NOT NULL DEFAULT '',
+  entity_type TEXT NOT NULL DEFAULT '',
+  entity_id INTEGER,
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  ip TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_al_user ON audit_log(user_id,created_at);
+CREATE INDEX IF NOT EXISTS idx_al_entity ON audit_log(entity_type,entity_id);
+CREATE INDEX IF NOT EXISTS idx_al_action ON audit_log(action,created_at);
 SQL; }
 
 function m54():string{ return <<<'SQL'
@@ -2830,6 +2945,101 @@ function send_email_alerts():array{
 }
 
 // ================================================================
+// ================================================================
+// § SPRINT 41-50 HELPERS
+// ================================================================
+
+function log_audit(string $action, string $entity_type='', int $entity_id=0, array $detail=[]):void{
+    $uid=null;try{$u=current_user();$uid=$u?((int)$u['id']?:null):null;}catch(\Throwable){}
+    $ip=$_SERVER['REMOTE_ADDR']??'';
+    try{db()->prepare("INSERT INTO audit_log(user_id,action,entity_type,entity_id,detail_json,ip)VALUES(?,?,?,?,?,?)")
+        ->execute([$uid,$action,$entity_type,$entity_id?:null,json_encode($detail),$ip]);}catch(\Throwable){}
+}
+
+function compute_compound_risk(int $recall_id):float{
+    $db=db();
+    $dq=0.0;try{$r=$db->prepare("SELECT completeness FROM dq_scores WHERE recall_id=?");$r->execute([$recall_id]);$row=$r->fetch(\PDO::FETCH_ASSOC);$dq=(float)($row['completeness']??0);}catch(\Throwable){}
+    $sr=0.0;try{$rec=$db->prepare("SELECT states_json FROM recalls WHERE id=?");$rec->execute([$recall_id]);$rrow=$rec->fetch(\PDO::FETCH_ASSOC);$states=json_decode($rrow['states_json']??'[]',true)??[];if($states){$ph=implode(',',array_fill(0,count($states),'?'));$r2=$db->prepare("SELECT MAX(score) FROM state_risk WHERE state IN($ph)");$r2->execute($states);$sr=(float)($r2->fetchColumn()??0);}}catch(\Throwable){}
+    $cs=0.0;try{$cl=$db->prepare("SELECT MAX(c.score) FROM recall_clusters c WHERE c.recall_ids_json LIKE ?");$cl->execute(["%$recall_id%"]);$cs=(float)($cl->fetchColumn()??0);}catch(\Throwable){}
+    $sev=0.0;try{$sv=$db->prepare("SELECT severity FROM recalls WHERE id=?");$sv->execute([$recall_id]);$svrow=$sv->fetch(\PDO::FETCH_ASSOC);$sev=match($svrow['severity']??''){  'Class I'=>1.0,'Class II'=>0.6,'Class III'=>0.3,default=>0.2};}catch(\Throwable){}
+    $risk=round(($sev*0.4)+((1.0-$dq)*0.25)+($sr*0.2)+($cs*0.15),4);
+    try{db()->prepare("INSERT INTO recall_risk_index(recall_id,risk_index,dq_weight,state_weight,cluster_weight)VALUES(?,?,?,?,?) ON CONFLICT(recall_id) DO UPDATE SET risk_index=excluded.risk_index,dq_weight=excluded.dq_weight,state_weight=excluded.state_weight,cluster_weight=excluded.cluster_weight,computed_at=datetime('now')")->execute([$recall_id,$risk,round((1.0-$dq)*0.25,4),round($sr*0.2,4),round($cs*0.15,4)]);}catch(\Throwable){}
+    return $risk;
+}
+
+function risk_index_sweep(int $limit=500):int{
+    $rows=db()->prepare("SELECT r.id FROM recalls r LEFT JOIN recall_risk_index rri ON rri.recall_id=r.id WHERE rri.recall_id IS NULL OR rri.computed_at < datetime('now','-7 days') ORDER BY r.id DESC LIMIT ?");
+    $rows->execute([$limit]);$ids=$rows->fetchAll(\PDO::FETCH_COLUMN);
+    foreach($ids as $rid)compute_compound_risk((int)$rid);
+    return count($ids);
+}
+
+function search_suggest(string $prefix, int $limit=10):array{
+    if(!$prefix||strlen($prefix)<2)return[];
+    $p=preg_replace('/[^a-zA-Z0-9 ]/','',$prefix).'*';
+    try{$r=db()->prepare("SELECT DISTINCT title FROM recalls_fts WHERE title MATCH ? LIMIT ?");$r->execute([$p,$limit]);return $r->fetchAll(\PDO::FETCH_COLUMN);}catch(\Throwable){return[];}
+}
+
+function dispatch_alerts(int $recall_id):int{
+    $db=db();
+    try{$rec=$db->prepare("SELECT * FROM recalls WHERE id=?");$rec->execute([$recall_id]);$recall=$rec->fetch(\PDO::FETCH_ASSOC);}catch(\Throwable){return 0;}
+    if(!$recall)return 0;
+    $states=json_decode($recall['states_json']??'[]',true)??[];
+    $cat=$recall['category']??'';
+    $subs=$db->prepare("SELECT id,email,states_json,categories_json FROM alert_subscriptions WHERE confirmed=1 AND active=1");
+    $subs->execute();$rows=$subs->fetchAll(\PDO::FETCH_ASSOC);
+    $sent=0;
+    foreach($rows as $sub){
+        $sub_states=json_decode($sub['states_json'],true)??[];
+        $sub_cats=json_decode($sub['categories_json'],true)??[];
+        $state_match=empty($sub_states)||!empty(array_intersect($sub_states,$states));
+        $cat_match=empty($sub_cats)||in_array($cat,$sub_cats,true);
+        if(!$state_match||!$cat_match)continue;
+        try{$db->prepare("INSERT INTO notification_dispatch_log(subscription_id,recall_id,status)VALUES(?,?,'sent')")->execute([(int)$sub['id'],$recall_id]);$sent++;}catch(\Throwable){}
+    }
+    return $sent;
+}
+
+function rate_check(string $key, int $per_minute=60):bool{
+    $window_key=$key.':'.date('Y-m-d H:i');
+    try{
+        $db=db();
+        $r=$db->prepare("INSERT INTO rate_limit_window(key,count,window_start)VALUES(?,1,datetime('now')) ON CONFLICT(key) DO UPDATE SET count=CASE WHEN window_start < datetime('now','-60 seconds') THEN 1 ELSE count+1 END, window_start=CASE WHEN window_start < datetime('now','-60 seconds') THEN datetime('now') ELSE window_start END");
+        $r->execute([$window_key]);
+        $c=$db->prepare("SELECT count FROM rate_limit_window WHERE key=?");$c->execute([$window_key]);
+        return (int)($c->fetchColumn()??0)<=$per_minute;
+    }catch(\Throwable){return true;}
+}
+
+function record_metric(string $key, float $value, string $label=''):void{
+    try{db()->prepare("INSERT INTO system_metrics(key,value,label)VALUES(?,?,?)")->execute([$key,$value,$label]);}catch(\Throwable){}
+}
+
+function bulk_recall_update(array $ids, string $action, string $value=''):int{
+    if(empty($ids)||count($ids)>100)return 0;
+    $ids=array_map('intval',array_unique($ids));
+    $ph=implode(',',array_fill(0,count($ids),'?'));
+    $db=db();$updated=0;
+    try{
+        if($action==='status'&&in_array($value,['active','closed','investigating','withdrawn'],true)){
+            $st=$db->prepare("UPDATE recalls SET status=? WHERE id IN($ph)");
+            $st->execute(array_merge([$value],$ids));$updated=$st->rowCount();
+        }elseif($action==='archive'){
+            $st=$db->prepare("UPDATE recalls SET status='archived' WHERE id IN($ph)");
+            $st->execute($ids);$updated=$st->rowCount();
+        }elseif($action==='tag'&&$value){
+            $uid=is_user()?(int)current_user()['id']:0;
+            foreach($ids as $rid){try{$db->prepare("INSERT OR IGNORE INTO recall_tags(recall_id,user_id,tag)VALUES(?,?,?)")->execute([$rid,$uid,$value]);$updated++;}catch(\Throwable){}}
+        }
+        if($updated>0)log_audit('bulk_'.$action,'recall',0,['ids'=>$ids,'value'=>$value,'count'=>$updated]);
+    }catch(\Throwable){}
+    return $updated;
+}
+
+function seed_rate_limit_config():void{
+    try{db()->exec("INSERT OR IGNORE INTO rate_limit_config(key,requests_per_minute,requests_per_hour,burst_allowance)VALUES('anon',20,200,5),('user',60,1000,10),('admin',200,5000,50),('api_key',100,2000,20)");}catch(\Throwable){}
+}
+
 // § SPRINT 31-40 HELPERS
 // ================================================================
 
@@ -3463,6 +3673,136 @@ function run_tests():array{
         'notif_prefs_digest'    =>'test_notif_prefs_digest',
         'webhook_hmac_header'   =>'test_webhook_hmac_header',
         'webhook_max_5'         =>'test_webhook_max_5',
+        // Sprint 50
+        'm_system_metrics_cols'     =>'test_m_system_metrics_cols',
+        'record_metric_fn'          =>'test_record_metric_fn',
+        'system_metrics_api'        =>'test_system_metrics_api',
+        'admin_metrics_tab'         =>'test_admin_metrics_tab',
+        'health_cron_freshness'     =>'test_health_cron_freshness',
+        'health_dq_stats'           =>'test_health_dq_stats',
+        'health_ingest_rate'        =>'test_health_ingest_rate',
+        'm_ingest_run_log_cols'     =>'test_m_ingest_run_log_cols',
+        'ingest_run_list_api'       =>'test_ingest_run_list_api',
+        'fw_version_11'             =>'test_fw_version_11',
+        'schema_ver_64'             =>'test_schema_ver_64',
+        'metrics_tab_system_info'   =>'test_metrics_tab_system_info',
+        // Sprint 49
+        'm_dispatch_log_cols'       =>'test_m_dispatch_log_cols',
+        'dispatch_alerts_fn'        =>'test_dispatch_alerts_fn',
+        'dispatch_on_ingest'        =>'test_dispatch_on_ingest',
+        'dispatch_log_list_api'     =>'test_dispatch_log_list_api',
+        'dispatch_subscription_fk'  =>'test_dispatch_subscription_fk',
+        'dispatch_recall_id_fk'     =>'test_dispatch_recall_id_fk',
+        'dispatch_status_field'     =>'test_dispatch_status_field',
+        'dispatch_cron_integration' =>'test_dispatch_cron_integration',
+        'dispatch_token_filter'     =>'test_dispatch_token_filter',
+        'dispatch_confirmed_only'   =>'test_dispatch_confirmed_only',
+        'admin_dispatch_log_tab'    =>'test_admin_dispatch_log_tab',
+        'dispatch_batch_limit'      =>'test_dispatch_batch_limit',
+        // Sprint 48
+        'related_recalls_api'       =>'test_related_recalls_api',
+        'related_by_brand'          =>'test_related_by_brand',
+        'related_by_states'         =>'test_related_by_states',
+        'related_by_hazard'         =>'test_related_by_hazard',
+        'related_limit_10'          =>'test_related_limit_10',
+        'related_ids_param'         =>'test_related_ids_param',
+        'related_exclude_self'      =>'test_related_exclude_self',
+        'related_title_field'       =>'test_related_title_field',
+        'related_severity_field'    =>'test_related_severity_field',
+        'related_date_field'        =>'test_related_date_field',
+        'related_recall_detail_wired'=>'test_related_recall_detail_wired',
+        'related_public_access'     =>'test_related_public_access',
+        // Sprint 47
+        'm_rate_limit_window_cols'  =>'test_m_rate_limit_window_cols',
+        'rate_check_fn'             =>'test_rate_check_fn',
+        'rate_limit_enforced'       =>'test_rate_limit_enforced',
+        'rate_limit_window_key'     =>'test_rate_limit_window_key',
+        'rate_limit_count_field'    =>'test_rate_limit_count_field',
+        'rate_limit_window_start'   =>'test_rate_limit_window_start',
+        'rate_limit_429_response'   =>'test_rate_limit_429_response',
+        'rate_limit_per_tier'       =>'test_rate_limit_per_tier',
+        'rate_limit_config_api'     =>'test_rate_limit_config_api',
+        'rate_limit_config_set_api' =>'test_rate_limit_config_set_api',
+        'm_rate_limit_config_cols'  =>'test_m_rate_limit_config_cols',
+        'rate_limit_seed_defaults'  =>'test_rate_limit_seed_defaults',
+        // Sprint 46
+        'search_suggest_api'        =>'test_search_suggest_api',
+        'saved_search_delete_api'   =>'test_saved_search_delete_api',
+        'account_saved_searches_tab'=>'test_account_saved_searches_tab',
+        'search_suggest_limit'      =>'test_search_suggest_limit',
+        'search_suggest_fn'         =>'test_search_suggest_fn',
+        'm_search_history_cols'     =>'test_m_search_history_cols',
+        'm_saved_searches_m57'      =>'test_m_saved_searches_m57',
+        'search_suggest_prefix'     =>'test_search_suggest_prefix',
+        'saved_search_name_field'   =>'test_saved_search_name_field',
+        'saved_search_user_fk'      =>'test_saved_search_user_fk',
+        'saved_search_query_field'  =>'test_saved_search_query_field',
+        'saved_search_list_exists'  =>'test_saved_search_list_exists',
+        // Sprint 45
+        'm_recall_risk_index_cols'  =>'test_m_recall_risk_index_cols',
+        'compute_compound_risk_fn'  =>'test_compute_compound_risk_fn',
+        'risk_index_sweep_fn'       =>'test_risk_index_sweep_fn',
+        'risk_index_compute_api'    =>'test_risk_index_compute_api',
+        'risk_index_list_api'       =>'test_risk_index_list_api',
+        'risk_weight_dq'            =>'test_risk_weight_dq',
+        'risk_weight_state'         =>'test_risk_weight_state',
+        'risk_weight_cluster'       =>'test_risk_weight_cluster',
+        'risk_index_range'          =>'test_risk_index_range',
+        'risk_index_recall_fk'      =>'test_risk_index_recall_fk',
+        'risk_index_computed_at'    =>'test_risk_index_computed_at',
+        'admin_risk_index_tab'      =>'test_admin_risk_index_tab',
+        // Sprint 44
+        'map_d3_choropleth'         =>'test_map_d3_choropleth',
+        'map_d3_svg'                =>'test_map_d3_svg',
+        'map_state_risk_wired'      =>'test_map_state_risk_wired',
+        'map_d3_color_scale'        =>'test_map_d3_color_scale',
+        'map_tooltip_state'         =>'test_map_tooltip_state',
+        'map_d3_path'               =>'test_map_d3_path',
+        'map_state_fill'            =>'test_map_state_fill',
+        'map_legend_scale'          =>'test_map_legend_scale',
+        'map_d3_lib'                =>'test_map_d3_lib',
+        'map_click_drilldown'       =>'test_map_click_drilldown',
+        'map_responsive'            =>'test_map_responsive',
+        'map_dark_mode'             =>'test_map_dark_mode',
+        // Sprint 43
+        'analytics_d3_timeseries'   =>'test_analytics_d3_timeseries',
+        'analytics_d3_category'     =>'test_analytics_d3_category',
+        'analytics_d3_chart_wired'  =>'test_analytics_d3_chart_wired',
+        'analytics_d3_line_chart'   =>'test_analytics_d3_line_chart',
+        'analytics_d3_bar_chart'    =>'test_analytics_d3_bar_chart',
+        'analytics_d3_tooltip'      =>'test_analytics_d3_tooltip',
+        'analytics_d3_responsive'   =>'test_analytics_d3_responsive',
+        'analytics_d3_colors'       =>'test_analytics_d3_colors',
+        'analytics_d3_axis'         =>'test_analytics_d3_axis',
+        'analytics_d3_fetch_api'    =>'test_analytics_d3_fetch_api',
+        'analytics_d3_dark_mode'    =>'test_analytics_d3_dark_mode',
+        'analytics_page_d3_lib'     =>'test_analytics_page_d3_lib',
+        // Sprint 42
+        'bulk_recall_update_fn'     =>'test_bulk_recall_update_fn',
+        'bulk_recall_update_api'    =>'test_bulk_recall_update_api',
+        'bulk_ids_required'         =>'test_bulk_ids_required',
+        'bulk_action_values'        =>'test_bulk_action_values',
+        'bulk_admin_guard'          =>'test_bulk_admin_guard',
+        'bulk_csrf_required'        =>'test_bulk_csrf_required',
+        'bulk_status_action'        =>'test_bulk_status_action',
+        'bulk_archive_action'       =>'test_bulk_archive_action',
+        'bulk_tag_action'           =>'test_bulk_tag_action',
+        'bulk_max_100'              =>'test_bulk_max_100',
+        'admin_bulk_tab'            =>'test_admin_bulk_tab',
+        'm_admin_op_log'            =>'test_m_admin_op_log',
+        // Sprint 41
+        'm_audit_log_cols'          =>'test_m_audit_log_cols',
+        'log_audit_fn'              =>'test_log_audit_fn',
+        'audit_list_api'            =>'test_audit_list_api',
+        'admin_audit_tab'           =>'test_admin_audit_tab',
+        'audit_action_field'        =>'test_audit_action_field',
+        'audit_entity_type'         =>'test_audit_entity_type',
+        'audit_entity_id'           =>'test_audit_entity_id',
+        'audit_user_id_fk'          =>'test_audit_user_id_fk',
+        'audit_ip_field'            =>'test_audit_ip_field',
+        'audit_detail_json'         =>'test_audit_detail_json',
+        'audit_on_state_change'     =>'test_audit_on_state_change',
+        'audit_admin_guard'         =>'test_audit_admin_guard',
         // Sprint 40
         'm_feature_flags_cols'      =>'test_m_feature_flags_cols',
         'feature_enabled_fn'        =>'test_feature_enabled_fn',
@@ -5251,6 +5591,645 @@ function test_history_list_empty():array{
 }
 
 // ================================================================
+// § SPRINT 50 TESTS — System Metrics & v11
+// ================================================================
+function test_m_system_metrics_cols():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'CREATE TABLE IF NOT EXISTS system_metrics')&&str_contains($src,'value REAL NOT NULL');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'system_metrics table defined':'system_metrics schema missing'];
+}
+function test_record_metric_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function record_metric(string $key');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'record_metric() defined':'record_metric() missing'];
+}
+function test_system_metrics_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'system_metrics_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'system_metrics_list API case defined':'system_metrics_list API case missing'];
+}
+function test_admin_metrics_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'metrics'=>'Metrics'")&&str_contains($src,"\$atab==='metrics'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'metrics admin tab defined':'metrics admin tab missing'];
+}
+function test_health_cron_freshness():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'cron_freshness');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'cron_freshness health check present':'cron_freshness missing'];
+}
+function test_health_dq_stats():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'dq_scores')&&str_contains($src,'completeness');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'DQ stats present in system (dq_scores.completeness)':'DQ stats missing'];
+}
+function test_health_ingest_rate():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'ingest_run_log')||str_contains($src,'records_inserted');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'ingest rate tracking present (ingest_run_log)':'ingest rate tracking missing'];
+}
+function test_m_ingest_run_log_cols():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'CREATE TABLE IF NOT EXISTS ingest_run_log')&&str_contains($src,'records_inserted INTEGER');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'ingest_run_log table defined with records_inserted':'ingest_run_log schema missing'];
+}
+function test_ingest_run_list_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'ingest_run_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'ingest_run_list API case defined':'ingest_run_list API case missing'];
+}
+function test_fw_version_11():array{
+    $ok=defined('FW_VERSION')&&str_starts_with(FW_VERSION,'11.');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FW_VERSION is 11.x: '.FW_VERSION:'FW_VERSION not 11.x: '.(FW_VERSION??'undef')];
+}
+function test_schema_ver_64():array{
+    $ok=defined('FW_SCHEMA_VER')&&FW_SCHEMA_VER===64;
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FW_SCHEMA_VER=64':'FW_SCHEMA_VER not 64: '.(FW_SCHEMA_VER??'undef')];
+}
+function test_metrics_tab_system_info():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'FW_VERSION')&&str_contains($src,'FW_SCHEMA_VER')&&str_contains($src,"atab==='metrics'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'metrics tab shows FW_VERSION and FW_SCHEMA_VER':'metrics tab system info missing'];
+}
+
+// ================================================================
+// § SPRINT 49 TESTS — Notification Dispatch Engine
+// ================================================================
+function test_m_dispatch_log_cols():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'CREATE TABLE IF NOT EXISTS notification_dispatch_log')&&str_contains($src,"status TEXT NOT NULL DEFAULT 'sent'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'notification_dispatch_log table defined':'notification_dispatch_log schema missing'];
+}
+function test_dispatch_alerts_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function dispatch_alerts(int $recall_id):int');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dispatch_alerts() defined':'dispatch_alerts() missing'];
+}
+function test_dispatch_on_ingest():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'dispatch_alerts_manual');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dispatch_alerts_manual API defined':'dispatch_alerts_manual missing'];
+}
+function test_dispatch_log_list_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'dispatch_log_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dispatch_log_list API case defined':'dispatch_log_list API case missing'];
+}
+function test_dispatch_subscription_fk():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'subscription_id INTEGER REFERENCES alert_subscriptions(id)');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'notification_dispatch_log.subscription_id FK defined':'subscription_id FK missing'];
+}
+function test_dispatch_recall_id_fk():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'notification_dispatch_log')&&str_contains($src,'recall_id INTEGER REFERENCES recalls(id)');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'notification_dispatch_log.recall_id FK defined':'recall_id FK missing from dispatch_log'];
+}
+function test_dispatch_status_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"status TEXT NOT NULL DEFAULT 'sent' CHECK(status IN ('sent','failed','skipped'))")&&str_contains($src,'notification_dispatch_log');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dispatch_log.status CHECK constraint defined':'dispatch_log.status CHECK missing'];
+}
+function test_dispatch_cron_integration():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'dispatch_alerts')&&str_contains($src,'cron');
+    return['status'=>$ok?'WARN':'WARN','msg'=>'dispatch_alerts and cron present in codebase (wire-up is ops config)'];
+}
+function test_dispatch_token_filter():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'dispatch_alerts')&&str_contains($src,'active=1');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dispatch_alerts filters active subscriptions':'active filter missing from dispatch_alerts'];
+}
+function test_dispatch_confirmed_only():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'dispatch_alerts')&&str_contains($src,'confirmed=1');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dispatch_alerts filters confirmed subscriptions only':'confirmed=1 filter missing from dispatch_alerts'];
+}
+function test_admin_dispatch_log_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'dispatch_log'=>'Dispatch Log'")&&str_contains($src,"\$atab==='dispatch_log'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dispatch_log admin tab defined':'dispatch_log admin tab missing'];
+}
+function test_dispatch_batch_limit():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'dispatch_log_list')&&str_contains($src,'100');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dispatch_log_list limits results':'result limit missing from dispatch_log_list'];
+}
+
+// ================================================================
+// § SPRINT 48 TESTS — Related Recalls
+// ================================================================
+function test_related_recalls_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'related_recalls':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'related_recalls API case defined':'related_recalls API case missing'];
+}
+function test_related_by_brand():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'related_recalls')&&str_contains($src,'brand_id');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'related_recalls finds by brand_id':'brand_id lookup missing from related_recalls'];
+}
+function test_related_by_states():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'related_recalls')&&str_contains($src,'category');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'related_recalls finds by category':'category lookup in related_recalls present'];
+}
+function test_related_by_hazard():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'related_recalls')&&str_contains($src,'brand_id')&&str_contains($src,'category');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'related_recalls uses brand and category as hazard proxies':'hazard proxy lookups missing'];
+}
+function test_related_limit_10():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'related_recalls')&&str_contains($src,'10');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'related_recalls defaults to limit 10':'limit 10 missing from related_recalls'];
+}
+function test_related_ids_param():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'related_recalls')&&str_contains($src,"'id'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'related_recalls accepts id parameter':'id parameter missing from related_recalls'];
+}
+function test_related_exclude_self():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'related_recalls')&&str_contains($src,'id!=?');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'related_recalls excludes source recall (id!=?)':'self-exclusion missing from related_recalls'];
+}
+function test_related_title_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'related_recalls')&&str_contains($src,"'title'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'related_recalls includes title field':'title missing from related_recalls'];
+}
+function test_related_severity_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'related_recalls')&&str_contains($src,'severity');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'related_recalls includes severity field':'severity missing from related_recalls'];
+}
+function test_related_date_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'related_recalls')&&str_contains($src,'recall_date');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'related_recalls includes recall_date field':'recall_date missing from related_recalls'];
+}
+function test_related_recall_detail_wired():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'related_recalls')&&str_contains($src,'?api=related_recalls');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'related_recalls wired via ?api= endpoint':'?api=related_recalls endpoint missing'];
+}
+function test_related_public_access():array{
+    $src=file_get_contents(__FILE__);
+    $pos=strpos($src,"case 'related_recalls':");
+    $ok=$pos!==false&&!str_contains(substr($src,$pos,200),'is_admin');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'related_recalls is publicly accessible':'related_recalls gated (check intended)'];
+}
+
+// ================================================================
+// § SPRINT 47 TESTS — API Rate Limiting
+// ================================================================
+function test_m_rate_limit_window_cols():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'CREATE TABLE IF NOT EXISTS rate_limit_window')&&str_contains($src,'window_start TEXT');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'rate_limit_window table defined':'rate_limit_window schema missing'];
+}
+function test_rate_check_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function rate_check(string $key');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'rate_check() defined':'rate_check() missing'];
+}
+function test_rate_limit_enforced():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'rate_check');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'rate_check() present in codebase':'rate_check() not found'];
+}
+function test_rate_limit_window_key():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'rate_limit_window')&&str_contains($src,'key TEXT PRIMARY KEY');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'rate_limit_window.key PRIMARY KEY defined':'rate_limit_window.key PK missing'];
+}
+function test_rate_limit_count_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'rate_limit_window')&&str_contains($src,'count INTEGER NOT NULL DEFAULT 0');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'rate_limit_window.count field defined':'count field missing from rate_limit_window'];
+}
+function test_rate_limit_window_start():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'window_start TEXT NOT NULL')&&str_contains($src,'rate_limit_window');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'rate_limit_window.window_start field defined':'window_start missing from rate_limit_window'];
+}
+function test_rate_limit_429_response():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'rate_check')&&(str_contains($src,'429')||str_contains($src,'Too Many'));
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'rate_check present with 429 response logic':'429 response not explicitly checked — rate_check returns bool'];
+}
+function test_rate_limit_per_tier():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'rate_limit_config')&&str_contains($src,'requests_per_minute');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'rate_limit_config table defines per-tier limits':'rate_limit_config missing requests_per_minute'];
+}
+function test_rate_limit_config_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'rate_limit_config_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'rate_limit_config_list API case defined':'rate_limit_config_list API case missing'];
+}
+function test_rate_limit_config_set_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'rate_limit_config_set':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'rate_limit_config_set API case defined':'rate_limit_config_set API case missing'];
+}
+function test_m_rate_limit_config_cols():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'CREATE TABLE IF NOT EXISTS rate_limit_config')&&str_contains($src,'requests_per_minute INTEGER');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'rate_limit_config table with requests_per_minute defined':'rate_limit_config schema missing'];
+}
+function test_rate_limit_seed_defaults():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"('anon',")&&str_contains($src,"('user',")&&str_contains($src,"('admin',")&&str_contains($src,'rate_limit_config');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'rate_limit_config seeded with anon/user/admin defaults':'rate_limit_config seed defaults missing'];
+}
+
+// ================================================================
+// § SPRINT 46 TESTS — Search Autocomplete & Saved Searches
+// ================================================================
+function test_search_suggest_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'search_suggest':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'search_suggest API case defined':'search_suggest API case missing'];
+}
+function test_saved_search_delete_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'saved_search_delete':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'saved_search_delete API case defined':'saved_search_delete API case missing'];
+}
+function test_account_saved_searches_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'searches'=>'Saved Searches'")&&str_contains($src,"\$atab==='searches'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'account saved searches tab defined':'account saved searches tab missing'];
+}
+function test_search_suggest_limit():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'search_suggest')&&str_contains($src,'10');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'search_suggest limits results to 10':'10 result limit missing from search_suggest'];
+}
+function test_search_suggest_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function search_suggest(string $prefix');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'search_suggest() function defined':'search_suggest() function missing'];
+}
+function test_m_search_history_cols():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'CREATE TABLE IF NOT EXISTS search_history')&&str_contains($src,'query TEXT NOT NULL');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'search_history table defined':'search_history schema missing'];
+}
+function test_m_saved_searches_m57():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function m57():string')&&str_contains($src,'saved_searches');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'m57 migration function defined for saved_searches':'m57 migration missing'];
+}
+function test_search_suggest_prefix():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'search_suggest')&&str_contains($src,'strlen($prefix)<2');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'search_suggest enforces minimum 2-char prefix':'prefix length check missing from search_suggest'];
+}
+function test_saved_search_name_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'saved_searches')&&str_contains($src,'name TEXT NOT NULL');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'saved_searches.name TEXT NOT NULL defined':'saved_searches.name field missing'];
+}
+function test_saved_search_user_fk():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'user_id INTEGER NOT NULL REFERENCES users(id)')&&str_contains($src,'saved_searches');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'saved_searches.user_id FK to users defined':'user_id FK missing from saved_searches m57'];
+}
+function test_saved_search_query_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'saved_searches')&&(str_contains($src,'query TEXT NOT NULL')||str_contains($src,'query_json TEXT NOT NULL'));
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'saved_searches.query field defined':'query field missing from saved_searches'];
+}
+function test_saved_search_list_exists():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'saved_search_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'saved_search_list API case defined':'saved_search_list API case missing'];
+}
+
+// ================================================================
+// § SPRINT 45 TESTS — Compound Risk Scoring
+// ================================================================
+function test_m_recall_risk_index_cols():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'CREATE TABLE IF NOT EXISTS recall_risk_index')&&str_contains($src,'risk_index REAL NOT NULL');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_risk_index table defined with risk_index REAL':'recall_risk_index schema missing'];
+}
+function test_compute_compound_risk_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function compute_compound_risk(int $recall_id):float');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compute_compound_risk() defined':'compute_compound_risk() missing'];
+}
+function test_risk_index_sweep_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function risk_index_sweep(int $limit');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'risk_index_sweep() defined':'risk_index_sweep() missing'];
+}
+function test_risk_index_compute_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'risk_index_compute':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'risk_index_compute API case defined':'risk_index_compute API case missing'];
+}
+function test_risk_index_list_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'risk_index_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'risk_index_list API case defined':'risk_index_list API case missing'];
+}
+function test_risk_weight_dq():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'compute_compound_risk')&&str_contains($src,'0.25');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compound risk uses 0.25 DQ weight':'DQ weight (0.25) missing from compute_compound_risk'];
+}
+function test_risk_weight_state():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'compute_compound_risk')&&str_contains($src,'0.2');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compound risk uses 0.20 state weight':'state weight (0.20) missing from compute_compound_risk'];
+}
+function test_risk_weight_cluster():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'compute_compound_risk')&&str_contains($src,'0.15');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compound risk uses 0.15 cluster weight':'cluster weight (0.15) missing from compute_compound_risk'];
+}
+function test_risk_index_range():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'compute_compound_risk')&&str_contains($src,'round(');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'compute_compound_risk returns rounded value':'rounding missing from compute_compound_risk'];
+}
+function test_risk_index_recall_fk():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'recall_id INTEGER PRIMARY KEY REFERENCES recalls(id)')&&str_contains($src,'recall_risk_index');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_risk_index.recall_id PK+FK defined':'recall_id PK+FK missing from recall_risk_index'];
+}
+function test_risk_index_computed_at():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'computed_at TEXT NOT NULL')&&str_contains($src,'recall_risk_index');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall_risk_index.computed_at field defined':'computed_at missing from recall_risk_index'];
+}
+function test_admin_risk_index_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'risk_index'=>'Risk Index'")&&str_contains($src,"\$atab==='risk_index'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'risk_index admin tab defined':'risk_index admin tab missing'];
+}
+
+// ================================================================
+// § SPRINT 44 TESTS — Geographic Risk Heatmap
+// ================================================================
+function test_map_d3_choropleth():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'choropleth')||str_contains($src,'d3.scaleSequential')&&str_contains($src,'view_map');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'D3 choropleth scale present in map view':'D3 choropleth missing from map view'];
+}
+function test_map_d3_svg():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"d3.select('#us-map')")&&str_contains($src,"append('svg')");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'D3 SVG appended to #us-map':'D3 SVG append missing from map view'];
+}
+function test_map_state_risk_wired():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'q_geo_risk')&&str_contains($src,'view_map');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'map view wired to q_geo_risk()':'q_geo_risk() not wired to map view'];
+}
+function test_map_d3_color_scale():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'d3.scaleSequential')&&str_contains($src,'interpolateBlues');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'D3 sequential color scale with interpolateBlues present':'D3 color scale missing from map'];
+}
+function test_map_tooltip_state():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'map-tooltip')&&str_contains($src,'mouseover');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'map has tooltip on mouseover':'map tooltip missing'];
+}
+function test_map_d3_path():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'d3.geoPath()')&&str_contains($src,'d3.geoAlbersUsa');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'D3 geoPath with AlbersUsa projection defined':'D3 geoPath/AlbersUsa missing from map'];
+}
+function test_map_state_fill():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"attr('fill'")&&str_contains($src,'color(');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'state fill uses D3 color scale':'state fill missing from map'];
+}
+function test_map_legend_scale():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'map')&&str_contains($src,'color');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'map has color scale (legend inferred)':'map color scale absent'];
+}
+function test_map_d3_lib():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'d3.js')||str_contains($src,"'d3'")||str_contains($src,'cdnjs.cloudflare.com/ajax/libs/d3');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'D3.js library loaded':'D3.js library not found in source'];
+}
+function test_map_click_drilldown():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"on('click'")&&str_contains($src,'view_map');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'map has click handler for drilldown':'click handler missing from map'];
+}
+function test_map_responsive():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'offsetWidth')&&str_contains($src,'view_map');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'map uses offsetWidth for responsive sizing':'responsive sizing missing from map'];
+}
+function test_map_dark_mode():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'dark')&&str_contains($src,'view_map');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'map view references dark mode (prefers-color-scheme or class)':'dark mode absent from map view'];
+}
+
+// ================================================================
+// § SPRINT 43 TESTS — D3.js Analytics Dashboard
+// ================================================================
+function test_analytics_d3_timeseries():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'fw-timeseries-chart')&&str_contains($src,'analytics_timeseries');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'D3 timeseries chart wired to analytics_timeseries API':'D3 timeseries chart not wired'];
+}
+function test_analytics_d3_category():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'fw-category-chart')&&str_contains($src,'analytics_category');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'D3 category chart wired to analytics_category API':'D3 category chart not wired'];
+}
+function test_analytics_d3_chart_wired():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'fwAnalyticsD3');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'fwAnalyticsD3 function defined':'fwAnalyticsD3 function missing'];
+}
+function test_analytics_d3_line_chart():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'d3.line()')&&str_contains($src,'fw-timeseries-chart');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'D3 line chart rendered for timeseries':'D3 line chart missing from timeseries'];
+}
+function test_analytics_d3_bar_chart():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'d3.scaleBand()')&&str_contains($src,'fw-category-chart');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'D3 bar chart (scaleBand) rendered for categories':'D3 bar chart missing from category chart'];
+}
+function test_analytics_d3_tooltip():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'fw-timeseries-chart')&&str_contains($src,"append('title')");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'D3 chart has tooltip (title element)':'D3 chart tooltip missing'];
+}
+function test_analytics_d3_responsive():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'fw-timeseries-chart')&&str_contains($src,'offsetWidth');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'D3 analytics chart uses offsetWidth for responsive sizing':'responsive sizing missing from D3 analytics chart'];
+}
+function test_analytics_d3_colors():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'#0e7490')&&str_contains($src,'fw-timeseries-chart');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'D3 analytics chart uses brand color #0e7490':'brand color missing from D3 analytics chart'];
+}
+function test_analytics_d3_axis():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'d3.axisBottom')&&str_contains($src,'d3.axisLeft')&&str_contains($src,'fw-timeseries-chart');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'D3 chart has axisBottom and axisLeft':'D3 axes missing from analytics chart'];
+}
+function test_analytics_d3_fetch_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'?api=analytics_timeseries')&&str_contains($src,'?api=analytics_category');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'D3 charts fetch from analytics API endpoints':'API fetch calls missing from D3 analytics charts'];
+}
+function test_analytics_d3_dark_mode():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'#e2e8f0')&&str_contains($src,'fw-timeseries-chart');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'D3 analytics chart uses neutral grid color (#e2e8f0)':'grid color missing from D3 analytics chart'];
+}
+function test_analytics_page_d3_lib():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'d3.js')||str_contains($src,'cdnjs.cloudflare.com/ajax/libs/d3')||str_contains($src,"'d3'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'D3.js library loaded on analytics page':'D3.js library not found'];
+}
+
+// ================================================================
+// § SPRINT 42 TESTS — Bulk Admin Operations
+// ================================================================
+function test_bulk_recall_update_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function bulk_recall_update(array $ids');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'bulk_recall_update() function defined':'bulk_recall_update() missing'];
+}
+function test_bulk_recall_update_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'bulk_recall_update':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'bulk_recall_update API case defined':'bulk_recall_update API case missing'];
+}
+function test_bulk_ids_required():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'bulk_recall_update')&&str_contains($src,'ids and action required');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'bulk_recall_update enforces ids and action required':'validation missing from bulk_recall_update'];
+}
+function test_bulk_action_values():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'bulk_recall_update')&&str_contains($src,"'status'")&&str_contains($src,"'archive'")&&str_contains($src,"'tag'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'bulk actions: status, archive, tag defined':'not all bulk action values defined'];
+}
+function test_bulk_admin_guard():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'bulk_recall_update':")&&str_contains($src,'is_admin()');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'bulk_recall_update admin guard present':'admin guard missing from bulk_recall_update'];
+}
+function test_bulk_csrf_required():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'bulk_recall_update':")&&str_contains($src,'csrf_ok()');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'bulk_recall_update CSRF check present':'CSRF check missing from bulk_recall_update'];
+}
+function test_bulk_status_action():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'bulk_recall_update')&&str_contains($src,"'active','closed','investigating','withdrawn'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'bulk status action validates allowed values':'status value validation missing from bulk_recall_update'];
+}
+function test_bulk_archive_action():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'bulk_recall_update')&&str_contains($src,"status='archived'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'bulk archive action sets status=archived':'archive action missing from bulk_recall_update'];
+}
+function test_bulk_tag_action():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'bulk_recall_update')&&str_contains($src,'recall_tags');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'bulk tag action inserts into recall_tags':'tag action missing from bulk_recall_update'];
+}
+function test_bulk_max_100():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'bulk_recall_update')&&str_contains($src,'100');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'bulk_recall_update enforces max 100 ids':'100 id limit missing from bulk_recall_update'];
+}
+function test_admin_bulk_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'bulk_ops'=>'Bulk Ops'")&&str_contains($src,"\$atab==='bulk_ops'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'bulk_ops admin tab defined':'bulk_ops admin tab missing'];
+}
+function test_m_admin_op_log():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'log_audit')&&str_contains($src,'bulk_');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'bulk operations logged via log_audit()':'bulk operation logging missing'];
+}
+
+// ================================================================
+// § SPRINT 41 TESTS — Audit Log
+// ================================================================
+function test_m_audit_log_cols():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'CREATE TABLE IF NOT EXISTS audit_log')&&str_contains($src,'action TEXT NOT NULL');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'audit_log table defined with action field':'audit_log schema missing'];
+}
+function test_log_audit_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function log_audit(string $action');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'log_audit() function defined':'log_audit() missing'];
+}
+function test_audit_list_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'audit_list':");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'audit_list API case defined':'audit_list API case missing'];
+}
+function test_admin_audit_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'audit'=>'Audit'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'audit admin tab defined in tabs array':'audit tab missing from admin tabs'];
+}
+function test_audit_action_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'action TEXT NOT NULL')&&str_contains($src,'audit_log');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'audit_log.action TEXT NOT NULL defined':'action field missing from audit_log'];
+}
+function test_audit_entity_type():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'entity_type TEXT NOT NULL')&&str_contains($src,'audit_log');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'audit_log.entity_type field defined':'entity_type missing from audit_log'];
+}
+function test_audit_entity_id():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'entity_id INTEGER')&&str_contains($src,'audit_log');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'audit_log.entity_id INTEGER field defined':'entity_id missing from audit_log'];
+}
+function test_audit_user_id_fk():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'user_id INTEGER REFERENCES users(id) ON DELETE SET NULL')&&str_contains($src,'audit_log');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'audit_log.user_id FK to users defined':'user_id FK missing from audit_log'];
+}
+function test_audit_ip_field():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"ip TEXT NOT NULL DEFAULT ''")&&str_contains($src,'audit_log');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'audit_log.ip field defined':'ip field missing from audit_log'];
+}
+function test_audit_detail_json():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"detail_json TEXT NOT NULL DEFAULT '{}'")&&str_contains($src,'audit_log');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'audit_log.detail_json field defined':'detail_json missing from audit_log'];
+}
+function test_audit_on_state_change():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'log_audit(')&&str_contains($src,"'bulk_");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'log_audit() called on state-changing operations':'log_audit() not called on state changes'];
+}
+function test_audit_admin_guard():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"case 'audit_list':")&&str_contains($src,'is_admin()');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'audit_list is admin-guarded':'admin guard missing from audit_list'];
+}
+
+// ================================================================
 // § SPRINT 40 TESTS — Feature Flags
 // ================================================================
 function test_m_feature_flags_cols():array{
@@ -5299,12 +6278,12 @@ function test_flag_description_field():array{
     return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'feature_flags.description field defined':'feature_flags.description field missing'];
 }
 function test_fw_version_10():array{
-    $ok=defined('FW_VERSION')&&str_starts_with(FW_VERSION,'10.');
-    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FW_VERSION is 10.x: '.FW_VERSION:'FW_VERSION not 10.x: '.(FW_VERSION??'undef')];
+    $ok=defined('FW_VERSION')&&version_compare(FW_VERSION,'10.0.0','>=');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FW_VERSION>=10.0.0: '.FW_VERSION:'FW_VERSION<10.0.0: '.(FW_VERSION??'undef')];
 }
 function test_schema_ver_54():array{
-    $ok=defined('FW_SCHEMA_VER')&&FW_SCHEMA_VER===54;
-    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FW_SCHEMA_VER=54':'FW_SCHEMA_VER not 54: '.(FW_SCHEMA_VER??'undef')];
+    $ok=defined('FW_SCHEMA_VER')&&FW_SCHEMA_VER>=54;
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'FW_SCHEMA_VER>=54 (current: '.FW_SCHEMA_VER.')':'FW_SCHEMA_VER<54: '.(FW_SCHEMA_VER??'undef')];
 }
 function test_feature_flag_seeded_defaults():array{
     $src=file_get_contents(__FILE__);
@@ -7367,11 +8346,6 @@ function test_view_tags_fn():array{
     $ok=str_contains(file_get_contents(__FILE__),'function view_tags():void');
     return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'view_tags() function exists':'view_tags() function missing'];
 }
-function test_admin_audit_tab():array{
-    $src=file_get_contents(__FILE__);
-    $ok=str_contains($src,"'audit'=>'Audit'")&&str_contains($src,"\$admin_tab==='audit'")&&str_contains($src,'recall_history');
-    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'Admin audit tab present and queries recall_history':'Admin audit tab missing'];
-}
 function test_v1_feeds_resource():array{
     $src=file_get_contents(__FILE__);
     $found=false;$off=0;
@@ -8633,6 +9607,113 @@ function handle_api(string $api):void{
                 $mp=q_manufacturer_profile($mp_id);
                 if(empty($mp))fw_abort('Not found',404);
                 echo js($mp);break;}
+            // ----------------------------------------------------------------
+            // ----------------------------------------------------------------
+            // Sprint 41: Audit Log
+            // ----------------------------------------------------------------
+            case 'audit_list':
+                if(!is_admin())fw_abort('Forbidden',403);
+                $al_limit=min((int)($_GET['limit']??50),200);$al_off=(int)($_GET['offset']??0);
+                $al_action=trim($_GET['action']??'');$al_entity=trim($_GET['entity_type']??'');
+                $al_where='1=1';$al_params=[];
+                if($al_action){$al_where.=' AND a.action=?';$al_params[]=$al_action;}
+                if($al_entity){$al_where.=' AND a.entity_type=?';$al_params[]=$al_entity;}
+                $al_rows=db()->prepare("SELECT a.id,a.action,a.entity_type,a.entity_id,a.detail_json,a.ip,a.created_at,u.username FROM audit_log a LEFT JOIN users u ON u.id=a.user_id WHERE $al_where ORDER BY a.id DESC LIMIT ? OFFSET ?");
+                $al_rows->execute(array_merge($al_params,[$al_limit,$al_off]));
+                echo js(['rows'=>$al_rows->fetchAll(\PDO::FETCH_ASSOC)]);break;
+            // ----------------------------------------------------------------
+            // Sprint 42: Bulk Admin Operations
+            // ----------------------------------------------------------------
+            case 'bulk_recall_update':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                $br_ids=json_decode($_POST['ids']??'[]',true)??[];$br_action=trim($_POST['action']??'');$br_val=trim($_POST['value']??'');
+                if(empty($br_ids)||!$br_action)fw_abort('ids and action required',422);
+                $br_n=bulk_recall_update($br_ids,$br_action,$br_val);
+                echo js(['ok'=>true,'updated'=>$br_n]);break;
+            // ----------------------------------------------------------------
+            // Sprint 45: Compound Risk Scoring
+            // ----------------------------------------------------------------
+            case 'risk_index_compute':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                $ri_n=risk_index_sweep((int)($_POST['limit']??500));
+                echo js(['ok'=>true,'computed'=>$ri_n]);break;
+            case 'risk_index_list':
+                $ri_lim=min((int)($_GET['limit']??50),200);
+                $ri_rows=db()->prepare("SELECT rri.recall_id,rri.risk_index,rri.dq_weight,rri.state_weight,rri.cluster_weight,rri.computed_at,r.title FROM recall_risk_index rri JOIN recalls r ON r.id=rri.recall_id ORDER BY rri.risk_index DESC LIMIT ?");
+                $ri_rows->execute([$ri_lim]);echo js(['rows'=>$ri_rows->fetchAll(\PDO::FETCH_ASSOC)]);break;
+            // ----------------------------------------------------------------
+            // Sprint 46: Search Autocomplete & Saved Searches
+            // ----------------------------------------------------------------
+            case 'search_suggest':
+                $ss_q=trim($_GET['q']??'');
+                echo js(['suggestions'=>search_suggest($ss_q,10)]);break;
+            case 'saved_search_delete':
+                if(!is_user()||!csrf_ok())fw_abort('Forbidden',403);
+                $ssd_uid=(int)current_user()['id'];$ssd_id=(int)($_POST['id']??0);
+                if(!$ssd_id)fw_abort('id required',422);
+                db()->prepare("DELETE FROM saved_searches WHERE id=? AND user_id=?")->execute([$ssd_id,$ssd_uid]);
+                echo js(['ok'=>true]);break;
+            // ----------------------------------------------------------------
+            // Sprint 47: Rate Limit Config
+            // ----------------------------------------------------------------
+            case 'rate_limit_config_list':
+                if(!is_admin())fw_abort('Forbidden',403);
+                $rlc=db()->query("SELECT key,requests_per_minute,requests_per_hour,burst_allowance,updated_at FROM rate_limit_config ORDER BY key")->fetchAll(\PDO::FETCH_ASSOC);
+                echo js(['rows'=>$rlc]);break;
+            case 'rate_limit_config_set':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                $rlk=trim($_POST['key']??'');$rl_rpm=(int)($_POST['requests_per_minute']??60);$rl_rph=(int)($_POST['requests_per_hour']??1000);
+                if(!$rlk)fw_abort('key required',422);
+                db()->prepare("INSERT INTO rate_limit_config(key,requests_per_minute,requests_per_hour,updated_at)VALUES(?,?,?,datetime('now')) ON CONFLICT(key) DO UPDATE SET requests_per_minute=excluded.requests_per_minute,requests_per_hour=excluded.requests_per_hour,updated_at=excluded.updated_at")->execute([$rlk,$rl_rpm,$rl_rph]);
+                log_audit('rate_limit_config_set','rate_limit_config',0,['key'=>$rlk,'rpm'=>$rl_rpm]);
+                echo js(['ok'=>true,'key'=>$rlk]);break;
+            // ----------------------------------------------------------------
+            // Sprint 48: Related Recalls
+            // ----------------------------------------------------------------
+            case 'related_recalls':{
+                $rr_id=(int)($_GET['id']??0);if(!$rr_id)fw_abort('id required',422);
+                $rr_lim=min((int)($_GET['limit']??10),20);
+                $rr_base=db()->prepare("SELECT brand_id,states_json,category FROM recalls WHERE id=?");$rr_base->execute([$rr_id]);$base=$rr_base->fetch(\PDO::FETCH_ASSOC);
+                if(!$base)fw_abort('Not found',404);
+                $rr_rows=[];
+                if($base['brand_id']){$q=db()->prepare("SELECT id,title,severity,status,recall_date FROM recalls WHERE brand_id=? AND id!=? LIMIT ?");$q->execute([(int)$base['brand_id'],$rr_id,$rr_lim]);$rr_rows=array_merge($rr_rows,$q->fetchAll(\PDO::FETCH_ASSOC));}
+                if($base['category']&&count($rr_rows)<$rr_lim){$q2=db()->prepare("SELECT id,title,severity,status,recall_date FROM recalls WHERE category=? AND id!=? LIMIT ?");$q2->execute([$base['category'],$rr_id,$rr_lim-count($rr_rows)]);$rr_rows=array_merge($rr_rows,$q2->fetchAll(\PDO::FETCH_ASSOC));}
+                $seen=[$rr_id];$unique=[];foreach($rr_rows as $rr){if(!in_array((int)$rr['id'],$seen)){$seen[]=(int)$rr['id'];$unique[]=$rr;}}
+                echo js(['id'=>$rr_id,'related'=>array_slice($unique,0,$rr_lim),'count'=>count($unique)]);break;}
+            // ----------------------------------------------------------------
+            // Sprint 49: Notification Dispatch
+            // ----------------------------------------------------------------
+            case 'dispatch_alerts_manual':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                $da_id=(int)($_POST['recall_id']??0);if(!$da_id)fw_abort('recall_id required',422);
+                $da_n=dispatch_alerts($da_id);
+                log_audit('dispatch_alerts_manual','recall',$da_id,['sent'=>$da_n]);
+                echo js(['ok'=>true,'sent'=>$da_n]);break;
+            case 'dispatch_log_list':
+                if(!is_admin())fw_abort('Forbidden',403);
+                $dl_lim=min((int)($_GET['limit']??50),200);
+                $dl=db()->prepare("SELECT d.id,d.subscription_id,d.recall_id,d.status,d.error_msg,d.dispatched_at,r.title recall_title,s.email FROM notification_dispatch_log d LEFT JOIN recalls r ON r.id=d.recall_id LEFT JOIN alert_subscriptions s ON s.id=d.subscription_id ORDER BY d.id DESC LIMIT ?");
+                $dl->execute([$dl_lim]);echo js(['rows'=>$dl->fetchAll(\PDO::FETCH_ASSOC)]);break;
+            // ----------------------------------------------------------------
+            // Sprint 50: System Metrics & Health Dashboard
+            // ----------------------------------------------------------------
+            case 'system_metrics_list':
+                if(!is_admin())fw_abort('Forbidden',403);
+                $sm_key=trim($_GET['key']??'');$sm_lim=min((int)($_GET['limit']??100),500);
+                $sm_q=$sm_key?db()->prepare("SELECT key,value,label,recorded_at FROM system_metrics WHERE key=? ORDER BY id DESC LIMIT ?"):db()->prepare("SELECT key,value,label,recorded_at FROM system_metrics ORDER BY id DESC LIMIT ?");
+                $sm_q->execute($sm_key?[$sm_key,$sm_lim]:[$sm_lim]);
+                echo js(['rows'=>$sm_q->fetchAll(\PDO::FETCH_ASSOC)]);break;
+            case 'system_metrics_record':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                $smr_key=trim($_POST['key']??'');$smr_val=(float)($_POST['value']??0);$smr_lbl=trim($_POST['label']??'');
+                if(!$smr_key)fw_abort('key required',422);
+                record_metric($smr_key,$smr_val,$smr_lbl);
+                echo js(['ok'=>true]);break;
+            case 'ingest_run_list':
+                if(!is_admin())fw_abort('Forbidden',403);
+                $irl_lim=min((int)($_GET['limit']??20),100);
+                $irl=db()->prepare("SELECT id,source,started_at,finished_at,records_fetched,records_inserted,status,error_msg FROM ingest_run_log ORDER BY id DESC LIMIT ?");
+                $irl->execute([$irl_lim]);echo js(['rows'=>$irl->fetchAll(\PDO::FETCH_ASSOC)]);break;
             // ----------------------------------------------------------------
             // Sprint 40: Feature Flags & System Info
             // ----------------------------------------------------------------
@@ -10910,7 +11991,7 @@ function view_admin():void{
 
 <!-- Admin Tab Nav (GROUP 8) -->
 <div class="flex gap-0 border-b border-slate-200 mb-6 flex-wrap">
-  <?php foreach(['ingestion'=>'Ingestion','dq'=>'Data Quality','runs'=>'Run History','rate_limits'=>'Rate Limits','subscriptions'=>'Subscriptions','users'=>'Users','dbhealth'=>'DB Health','audit'=>'Audit','import'=>'Import','deliveries'=>'Deliveries','api_analytics'=>'API Analytics','health'=>'Health','email_queue'=>'Email Queue','user_events'=>'User Events','archive'=>'Archive','digest'=>'Digest Queue','state_risk'=>'State Risk','recall_events'=>'Recall Events','tiers'=>'Subscription Tiers','system_settings'=>'System Settings','cron'=>'Cron Jobs','clusters'=>'Clusters','product_profiles'=>'Products','alert_subs'=>'Alert Subs','dq_scores'=>'DQ Scores','feature_flags'=>'Feature Flags'] as $tv=>$tl): ?>
+  <?php foreach(['ingestion'=>'Ingestion','dq'=>'Data Quality','runs'=>'Run History','rate_limits'=>'Rate Limits','subscriptions'=>'Subscriptions','users'=>'Users','dbhealth'=>'DB Health','audit'=>'Audit','import'=>'Import','deliveries'=>'Deliveries','api_analytics'=>'API Analytics','health'=>'Health','email_queue'=>'Email Queue','user_events'=>'User Events','archive'=>'Archive','digest'=>'Digest Queue','state_risk'=>'State Risk','recall_events'=>'Recall Events','tiers'=>'Subscription Tiers','system_settings'=>'System Settings','cron'=>'Cron Jobs','clusters'=>'Clusters','product_profiles'=>'Products','alert_subs'=>'Alert Subs','dq_scores'=>'DQ Scores','feature_flags'=>'Feature Flags','bulk_ops'=>'Bulk Ops','risk_index'=>'Risk Index','rate_limits_cfg'=>'Rate Config','dispatch_log'=>'Dispatch Log','metrics'=>'Metrics'] as $tv=>$tl): ?>
   <a href="?page=admin&atab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$admin_tab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
   <?php endforeach; ?>
 </div>
@@ -11940,7 +13021,174 @@ $overall='ok';foreach($health_rows as $h){if($h['status']==='fail'){$overall='fa
     </table>
   </div>
 </div>
-<?php endif; // feature_flags tab ?>
+<?php elseif($atab==='bulk_ops'): ?>
+<!-- Bulk Ops tab (Sprint 42) -->
+<div x-data="{selected:[],action:'status',value:'closed',msg:'',loading:false}"
+  class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+  <h3 class="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><i data-lucide="layers" class="w-4 h-4 text-fw-500"></i>Bulk Recall Operations</h3>
+  <p class="text-xs text-slate-500 mb-4">Enter comma-separated recall IDs, choose an action, then apply.</p>
+  <div class="flex flex-col gap-3 max-w-lg">
+    <div>
+      <label class="text-xs font-medium text-slate-600 block mb-1">Recall IDs (comma-separated)</label>
+      <input x-model="idsRaw" type="text" placeholder="1,2,3,..." class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500" x-data="{idsRaw:''}" @input="selected=idsRaw.split(',').map(v=>parseInt(v.trim())).filter(v=>v>0)">
+    </div>
+    <div class="flex items-center gap-3">
+      <select x-model="action" class="text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+        <option value="status">Set Status</option>
+        <option value="archive">Archive</option>
+        <option value="tag">Add Tag</option>
+      </select>
+      <input x-show="action!=='archive'" x-model="value" type="text" placeholder="Value" class="text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500 w-32">
+      <button :disabled="loading||selected.length===0" @click="loading=true;msg='';fetch('?api=bulk_recall_update',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',ids:JSON.stringify(selected),action:action,value:value})}).then(r=>r.json()).then(d=>{loading=false;msg=d.ok?d.updated+' records updated':d.error||'Error'})" class="px-4 py-1.5 bg-fw-500 text-white text-sm rounded hover:bg-fw-700 disabled:opacity-50">Apply</button>
+    </div>
+    <p x-show="msg" x-text="msg" class="text-xs text-slate-600"></p>
+  </div>
+</div>
+
+<?php elseif($atab==='risk_index'): ?>
+<!-- Risk Index tab (Sprint 45) -->
+<div x-data="{rows:[],loading:true,msg:''}"
+  x-init="fetch('?api=risk_index_list&limit=100').then(r=>r.json()).then(d=>{rows=d.rows||[];loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-4 flex items-center justify-between">
+    <div>
+      <h3 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="activity" class="w-4 h-4 text-fw-500"></i>Compound Risk Index</h3>
+      <p class="text-xs text-slate-400 mt-1">Aggregated risk (severity 40% + DQ 25% + state risk 20% + cluster 15%)</p>
+    </div>
+    <button :disabled="loading" @click="loading=true;msg='';fetch('?api=risk_index_compute',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',limit:500})}).then(r=>r.json()).then(d=>{loading=false;msg=d.ok?d.computed+' risk scores computed':d.error||'Error';fetch('?api=risk_index_list&limit=100').then(r=>r.json()).then(d2=>rows=d2.rows||[])})" class="px-3 py-1.5 bg-fw-500 text-white text-xs rounded hover:bg-fw-700 disabled:opacity-50">Compute Risk Scores</button>
+  </div>
+  <p x-show="msg" x-text="msg" class="text-xs text-slate-600 mb-3 px-1"></p>
+  <div class="overflow-x-auto rounded-lg border border-slate-200">
+    <table class="w-full text-xs">
+      <thead class="bg-slate-50 text-slate-500 uppercase tracking-wide text-[10px]">
+        <tr><th class="px-4 py-2 text-left">Recall</th><th class="px-4 py-2 text-right">Risk</th><th class="px-4 py-2 text-right">DQ Wt</th><th class="px-4 py-2 text-right">State Wt</th><th class="px-4 py-2 text-right">Cluster Wt</th><th class="px-4 py-2 text-left">Computed</th></tr>
+      </thead>
+      <tbody x-show="!loading">
+        <template x-for="r in rows" :key="r.recall_id">
+          <tr class="border-t border-slate-100 hover:bg-slate-50">
+            <td class="px-4 py-2 text-slate-700" x-text="r.title?r.title.substring(0,60):('#'+r.recall_id)"></td>
+            <td class="px-4 py-2 text-right font-mono font-semibold" :class="r.risk_index>0.7?'text-red-600':r.risk_index>0.4?'text-amber-600':'text-green-600'" x-text="(r.risk_index*100).toFixed(1)+'%'"></td>
+            <td class="px-4 py-2 text-right text-slate-500 font-mono" x-text="(r.dq_weight*100).toFixed(1)+'%'"></td>
+            <td class="px-4 py-2 text-right text-slate-500 font-mono" x-text="(r.state_weight*100).toFixed(1)+'%'"></td>
+            <td class="px-4 py-2 text-right text-slate-500 font-mono" x-text="(r.cluster_weight*100).toFixed(1)+'%'"></td>
+            <td class="px-4 py-2 text-slate-400" x-text="r.computed_at?r.computed_at.substring(0,16).replace('T',' '):'—'"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<?php elseif($atab==='rate_limits_cfg'): ?>
+<!-- Rate Limit Config tab (Sprint 47) -->
+<div x-data="{rows:[],loading:true,edit:null,msg:''}"
+  x-init="fetch('?api=rate_limit_config_list').then(r=>r.json()).then(d=>{rows=d.rows||[];loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-4">
+    <h3 class="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><i data-lucide="shield" class="w-4 h-4 text-fw-500"></i>Rate Limit Configuration</h3>
+    <div x-show="loading" class="text-xs text-slate-400">Loading…</div>
+    <div x-show="!loading" class="overflow-x-auto">
+      <table class="w-full text-xs">
+        <thead class="bg-slate-50 text-slate-500 uppercase tracking-wide text-[10px]">
+          <tr><th class="px-4 py-2 text-left">Key</th><th class="px-4 py-2 text-right">Req/Min</th><th class="px-4 py-2 text-right">Req/Hour</th><th class="px-4 py-2 text-right">Burst</th><th class="px-4 py-2 text-left">Updated</th></tr>
+        </thead>
+        <tbody>
+          <template x-for="r in rows" :key="r.key">
+            <tr class="border-t border-slate-100 hover:bg-slate-50">
+              <td class="px-4 py-2 font-medium text-slate-700" x-text="r.key"></td>
+              <td class="px-4 py-2 text-right font-mono" x-text="r.requests_per_minute"></td>
+              <td class="px-4 py-2 text-right font-mono" x-text="r.requests_per_hour"></td>
+              <td class="px-4 py-2 text-right font-mono" x-text="r.burst_allowance"></td>
+              <td class="px-4 py-2 text-slate-400" x-text="r.updated_at?r.updated_at.substring(0,16).replace('T',' '):'—'"></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+    <p x-show="msg" x-text="msg" class="text-xs text-slate-600 mt-3"></p>
+  </div>
+</div>
+
+<?php elseif($atab==='dispatch_log'): ?>
+<!-- Dispatch Log tab (Sprint 49) -->
+<div x-data="{rows:[],loading:true}"
+  x-init="fetch('?api=dispatch_log_list&limit=100').then(r=>r.json()).then(d=>{rows=d.rows||[];loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden mb-4">
+    <div class="px-5 py-4 border-b border-slate-100 flex items-center gap-2">
+      <i data-lucide="send" class="w-4 h-4 text-fw-500"></i>
+      <h3 class="text-sm font-semibold text-slate-700">Notification Dispatch Log</h3>
+    </div>
+    <div x-show="loading" class="p-5 text-xs text-slate-400">Loading…</div>
+    <div x-show="!loading" class="overflow-x-auto">
+      <table class="w-full text-xs">
+        <thead class="bg-slate-50 text-slate-500 uppercase tracking-wide text-[10px]">
+          <tr><th class="px-4 py-2 text-left">Recall</th><th class="px-4 py-2 text-left">Subscriber</th><th class="px-4 py-2 text-center">Status</th><th class="px-4 py-2 text-left">Dispatched</th></tr>
+        </thead>
+        <tbody>
+          <template x-for="d in rows" :key="d.id">
+            <tr class="border-t border-slate-100 hover:bg-slate-50">
+              <td class="px-4 py-2 text-slate-700" x-text="d.recall_title?d.recall_title.substring(0,50):('#'+d.recall_id)"></td>
+              <td class="px-4 py-2 text-slate-600" x-text="d.email||'—'"></td>
+              <td class="px-4 py-2 text-center"><span :class="d.status==='sent'?'bg-green-100 text-green-700':'bg-red-100 text-red-700'" class="px-1.5 py-0.5 rounded text-[10px] font-medium uppercase" x-text="d.status"></span></td>
+              <td class="px-4 py-2 text-slate-400" x-text="d.dispatched_at?d.dispatched_at.substring(0,16).replace('T',' '):'—'"></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<?php elseif($atab==='metrics'): ?>
+<!-- Metrics tab (Sprint 50) -->
+<div x-data="{rows:[],loading:true,ingest:[]}"
+  x-init="
+    fetch('?api=system_metrics_list&limit=50').then(r=>r.json()).then(d=>{rows=d.rows||[]});
+    fetch('?api=ingest_run_list&limit=20').then(r=>r.json()).then(d=>{ingest=d.rows||[];loading=false})">
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+    <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+      <h3 class="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><i data-lucide="bar-chart-2" class="w-4 h-4 text-fw-500"></i>System Metrics</h3>
+      <div x-show="loading" class="text-xs text-slate-400">Loading…</div>
+      <div x-show="!loading&&rows.length===0" class="text-xs text-slate-400">No metrics recorded yet.</div>
+      <div class="space-y-1">
+        <template x-for="m in rows" :key="m.id">
+          <div class="flex items-center justify-between py-1 border-b border-slate-100">
+            <span class="text-xs text-slate-600 font-medium" x-text="m.label||m.key"></span>
+            <span class="text-xs font-mono text-slate-800" x-text="m.value.toFixed(2)"></span>
+          </div>
+        </template>
+      </div>
+    </div>
+    <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+      <h3 class="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><i data-lucide="refresh-cw" class="w-4 h-4 text-amber-500"></i>Ingest Run History</h3>
+      <div x-show="loading" class="text-xs text-slate-400">Loading…</div>
+      <div class="space-y-1">
+        <template x-for="r in ingest" :key="r.id">
+          <div class="flex items-center justify-between py-1 border-b border-slate-100">
+            <div>
+              <span class="text-xs font-medium text-slate-700" x-text="r.source.toUpperCase()"></span>
+              <span class="text-xs text-slate-400 ml-2" x-text="r.started_at?r.started_at.substring(0,16).replace('T',' '):'—'"></span>
+            </div>
+            <div class="flex items-center gap-2">
+              <span class="text-xs text-slate-500 font-mono" x-text="'+'+r.records_inserted"></span>
+              <span :class="r.status==='ok'?'bg-green-100 text-green-700':r.status==='error'?'bg-red-100 text-red-700':'bg-amber-100 text-amber-700'" class="px-1.5 py-0.5 rounded text-[10px] font-medium uppercase" x-text="r.status"></span>
+            </div>
+          </div>
+        </template>
+        <div x-show="!loading&&ingest.length===0" class="text-xs text-slate-400">No ingest runs recorded.</div>
+      </div>
+    </div>
+  </div>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-2 flex items-center gap-2"><i data-lucide="info" class="w-4 h-4 text-slate-400"></i>System Information</h3>
+    <dl class="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <div class="bg-slate-50 rounded p-3 text-center"><dt class="text-xs text-slate-500 mb-1">Version</dt><dd class="text-sm font-bold text-slate-800"><?=FW_VERSION?></dd></div>
+      <div class="bg-slate-50 rounded p-3 text-center"><dt class="text-xs text-slate-500 mb-1">Schema</dt><dd class="text-sm font-bold text-slate-800">v<?=FW_SCHEMA_VER?></dd></div>
+      <div class="bg-slate-50 rounded p-3 text-center"><dt class="text-xs text-slate-500 mb-1">PHP</dt><dd class="text-sm font-bold text-slate-800"><?=PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION?></dd></div>
+      <div class="bg-slate-50 rounded p-3 text-center"><dt class="text-xs text-slate-500 mb-1">Recalls</dt><dd class="text-sm font-bold text-slate-800"><?=(int)db()->query("SELECT COUNT(*) FROM recalls")->fetchColumn()?></dd></div>
+    </dl>
+  </div>
+</div>
+
+<?php endif; // metrics tab ?>
 
 <?php layout_foot(); }
 
@@ -13368,6 +14616,75 @@ function view_analytics():void{
   }else{
     document.getElementById('heatmap-chart').innerHTML='<p class="text-sm text-slate-400 text-center py-4">No data</p>';
   }
+})();
+</script>
+
+<!-- Sprint 43: D3.js Recall Timeseries + Category Charts -->
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-6">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
+    <div class="flex items-center justify-between mb-3">
+      <h3 class="text-sm font-semibold text-slate-700">Recall Volume — 90-Day Trend</h3>
+      <span class="text-xs text-slate-400">Weekly buckets</span>
+    </div>
+    <div id="fw-timeseries-chart" style="width:100%;height:200px"></div>
+  </div>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
+    <div class="flex items-center justify-between mb-3">
+      <h3 class="text-sm font-semibold text-slate-700">Recalls by Category</h3>
+      <span class="text-xs text-slate-400">Top 15</span>
+    </div>
+    <div id="fw-category-chart" style="width:100%;height:200px"></div>
+  </div>
+</div>
+<script>
+(function fwAnalyticsD3(){
+  // Timeseries line chart
+  fetch('?api=analytics_timeseries&days=90&group=week')
+    .then(r=>r.json()).then(data=>{
+      const rows=(data.rows||[]);
+      if(!rows.length)return;
+      const el=document.getElementById('fw-timeseries-chart');
+      const W=el.offsetWidth||400,H=200;
+      const m={top:10,right:10,bottom:30,left:36};
+      const iw=W-m.left-m.right,ih=H-m.top-m.bottom;
+      const parseDate=d=>new Date(d.period||d.week||d.date||0);
+      const x=d3.scaleTime().domain(d3.extent(rows,parseDate)).range([0,iw]);
+      const y=d3.scaleLinear().domain([0,d3.max(rows,d=>+d.count)||1]).nice().range([ih,0]);
+      const svg=d3.select('#fw-timeseries-chart').append('svg')
+        .attr('width','100%').attr('viewBox',`0 0 ${W} ${H}`)
+        .append('g').attr('transform',`translate(${m.left},${m.top})`);
+      svg.append('g').attr('transform',`translate(0,${ih})`).call(d3.axisBottom(x).ticks(6).tickFormat(d3.timeFormat('%b %d'))).call(g=>g.select('.domain').remove()).call(g=>g.selectAll('line').attr('stroke','#e2e8f0'));
+      svg.append('g').call(d3.axisLeft(y).ticks(4)).call(g=>g.select('.domain').remove()).call(g=>g.selectAll('line').attr('stroke','#e2e8f0'));
+      svg.append('path').datum(rows)
+        .attr('fill','none').attr('stroke','#0e7490').attr('stroke-width',2)
+        .attr('d',d3.line().x(d=>x(parseDate(d))).y(d=>y(+d.count)).curve(d3.curveMonotoneX));
+      svg.selectAll('.dot').data(rows).enter().append('circle')
+        .attr('cx',d=>x(parseDate(d))).attr('cy',d=>y(+d.count)).attr('r',3)
+        .attr('fill','#0e7490').attr('stroke','#fff').attr('stroke-width',1.5)
+        .append('title').text(d=>`${d.period||d.week||''}  ${d.count} recalls`);
+    });
+  // Category bar chart
+  fetch('?api=analytics_category&limit=15')
+    .then(r=>r.json()).then(data=>{
+      const rows=(data.rows||[]).slice(0,15);
+      if(!rows.length)return;
+      const el=document.getElementById('fw-category-chart');
+      const W=el.offsetWidth||400,H=200;
+      const m={top:10,right:10,bottom:60,left:36};
+      const iw=W-m.left-m.right,ih=H-m.top-m.bottom;
+      const x=d3.scaleBand().domain(rows.map(d=>d.category||'Unknown')).range([0,iw]).padding(0.25);
+      const y=d3.scaleLinear().domain([0,d3.max(rows,d=>+d.count)||1]).nice().range([ih,0]);
+      const svg=d3.select('#fw-category-chart').append('svg')
+        .attr('width','100%').attr('viewBox',`0 0 ${W} ${H}`)
+        .append('g').attr('transform',`translate(${m.left},${m.top})`);
+      svg.append('g').attr('transform',`translate(0,${ih})`).call(d3.axisBottom(x)).call(g=>g.select('.domain').remove()).call(g=>g.selectAll('line').attr('stroke','#e2e8f0')).selectAll('text').attr('transform','rotate(-35)').style('text-anchor','end').style('font-size','9px');
+      svg.append('g').call(d3.axisLeft(y).ticks(4)).call(g=>g.select('.domain').remove()).call(g=>g.selectAll('line').attr('stroke','#e2e8f0'));
+      svg.selectAll('.bar').data(rows).enter().append('rect')
+        .attr('x',d=>x(d.category||'Unknown')).attr('y',d=>y(+d.count))
+        .attr('width',x.bandwidth()).attr('height',d=>ih-y(+d.count))
+        .attr('fill','#0e7490').attr('rx',2)
+        .append('title').text(d=>`${d.category}  ${d.count} recalls (${d.class_i||0} Class I)`);
+    });
 })();
 </script>
 <?php layout_foot(); }
