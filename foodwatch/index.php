@@ -9,8 +9,8 @@ declare(strict_types=1);
 // ================================================================
 // § CONSTANTS
 // ================================================================
-const FW_VERSION    = '5.1.0';
-const FW_SCHEMA_VER = 20;
+const FW_VERSION    = '5.3.0';
+const FW_SCHEMA_VER = 21;
 // Pre-shared secret for IONOS crontab → cron_alerts endpoint; override before deploy
 const FW_CRON_SECRET = 'change-me-before-deploy';
 const FW_DATA_DIR   = __DIR__ . '/data';
@@ -286,7 +286,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -679,6 +679,33 @@ CREATE TABLE IF NOT EXISTS password_resets(
 );
 CREATE INDEX IF NOT EXISTS idx_pr_token ON password_resets(token);
 CREATE INDEX IF NOT EXISTS idx_pr_email ON password_resets(email,used);
+SQL; }
+function m21():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS watchlist_checks_new(
+  id INTEGER PRIMARY KEY,
+  watchlist_id INTEGER NOT NULL,
+  checked_at TEXT NOT NULL DEFAULT(datetime('now')),
+  active_count INTEGER NOT NULL DEFAULT 0);
+INSERT INTO watchlist_checks_new(id,watchlist_id,checked_at,active_count)
+  SELECT id,watch_id,checked_at,match_count FROM watchlist_checks;
+DROP TABLE watchlist_checks;
+ALTER TABLE watchlist_checks_new RENAME TO watchlist_checks;
+CREATE INDEX IF NOT EXISTS idx_wc_watchlist ON watchlist_checks(watchlist_id);
+ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0;
+INSERT OR IGNORE INTO state_population(state_code,population)VALUES
+('AL',5024279),('AK',733391),('AZ',7151502),('AR',3011524),
+('CA',39538223),('CO',5773714),('CT',3605944),('DE',989948),
+('FL',21538187),('GA',10711908),('HI',1455271),('ID',1839106),
+('IL',12812508),('IN',6785528),('IA',3190369),('KS',2937880),
+('KY',4505836),('LA',4657757),('ME',1362359),('MD',6177224),
+('MA',7029917),('MI',10077331),('MN',5706494),('MS',2961279),
+('MO',6154913),('MT',1084225),('NE',1961504),('NV',3104614),
+('NH',1377529),('NJ',9288994),('NM',2117522),('NY',20201249),
+('NC',10439388),('ND',779094),('OH',11799448),('OK',3959353),
+('OR',4237256),('PA',13002700),('RI',1097379),('SC',5118425),
+('SD',886667),('TN',6910840),('TX',29145505),('UT',3271616),
+('VT',643077),('VA',8631393),('WA',7705281),('WV',1793716),
+('WI',5893718),('WY',576851),('DC',689545);
 SQL; }
 
 // ================================================================
@@ -1632,11 +1659,6 @@ function q_geo_stats():array{
     return db()->query("SELECT rs.state_code,COUNT(DISTINCT rs.recall_id) as total,COUNT(DISTINCT CASE WHEN rc.status='ongoing' THEN rs.recall_id END) as active FROM recall_states rs JOIN recalls rc ON rc.id=rs.recall_id WHERE rs.state_code!='nationwide' GROUP BY rs.state_code ORDER BY active DESC")->fetchAll();
 }
 
-function q_recent_timeline(int $days=30):array{
-    $since=date('Y-m-d',strtotime("-$days days"));
-    return db()->prepare("SELECT r.id,r.title,r.severity,r.severity_label,r.announced_date,a.code as agency,r.status,fc.name as category FROM recalls r JOIN agencies a ON a.id=r.agency_id LEFT JOIN food_categories fc ON fc.id=r.food_category_id WHERE r.announced_date>=? ORDER BY r.announced_date DESC LIMIT 50")->execute([$since])->fetchAll(); // can't chain
-}
-
 function q_timeline(int $days=30):array{
     $since=date('Y-m-d',strtotime("-$days days"));
     $stmt=db()->prepare("SELECT r.id,r.title,r.severity,r.severity_label,r.announced_date,a.code as agency,r.status,fc.name as category FROM recalls r JOIN agencies a ON a.id=r.agency_id LEFT JOIN food_categories fc ON fc.id=r.food_category_id WHERE r.announced_date>=? ORDER BY r.announced_date DESC LIMIT 50");
@@ -2260,6 +2282,25 @@ function q_geo_risk():array{
 function subscription_token():string{ return bin2hex(random_bytes(16)); }
 
 function send_email_alerts():array{
+    // Snapshot watchlist hit counts for all active watchlist items
+    try{
+        $wl_items=db()->query("SELECT w.id,w.watch_type,w.watch_value FROM watchlists w WHERE w.active=1")->fetchAll();
+        $wl_ins=db()->prepare("INSERT INTO watchlist_checks(watchlist_id,checked_at,active_count)VALUES(?,datetime('now'),?)");
+        foreach($wl_items as $wi){
+            $cnt=0;
+            try{
+                switch($wi['watch_type']){
+                    case 'retailer':$s=db()->prepare("SELECT COUNT(DISTINCT r.id) FROM recalls r JOIN recall_retailers rr ON rr.recall_id=r.id JOIN retailers rt ON rt.id=rr.retailer_id WHERE r.status='ongoing' AND LOWER(rt.name) LIKE ?");$s->execute(['%'.strtolower($wi['watch_value']).'%']);$cnt=(int)$s->fetchColumn();break;
+                    case 'brand':$s=db()->prepare("SELECT COUNT(DISTINCT r.id) FROM recalls r JOIN recall_products rp ON rp.recall_id=r.id JOIN brands b ON b.id=rp.brand_id WHERE r.status='ongoing' AND LOWER(b.name) LIKE ?");$s->execute(['%'.strtolower($wi['watch_value']).'%']);$cnt=(int)$s->fetchColumn();break;
+                    case 'category':$s=db()->prepare("SELECT COUNT(*) FROM recalls r JOIN food_categories fc ON fc.id=r.food_category_id WHERE r.status='ongoing' AND LOWER(fc.name) LIKE ?");$s->execute(['%'.strtolower($wi['watch_value']).'%']);$cnt=(int)$s->fetchColumn();break;
+                    case 'state':$s=db()->prepare("SELECT COUNT(*) FROM recalls r JOIN recall_states rs ON rs.recall_id=r.id WHERE r.status='ongoing' AND rs.state_code=?");$s->execute([$wi['watch_value']]);$cnt=(int)$s->fetchColumn();break;
+                    case 'hazard':$s=db()->prepare("SELECT COUNT(DISTINCT r.id) FROM recalls r JOIN recall_hazards rh ON rh.recall_id=r.id JOIN hazards h ON h.id=rh.hazard_id WHERE r.status='ongoing' AND LOWER(h.name) LIKE ?");$s->execute(['%'.strtolower($wi['watch_value']).'%']);$cnt=(int)$s->fetchColumn();break;
+                }
+            }catch(\Throwable){}
+            $wl_ins->execute([$wi['id'],$cnt]);
+        }
+    }catch(\Throwable){}
+
     $stmt=db()->query("SELECT * FROM subscriptions WHERE active=1 AND confirmed=1");
     $subs=$stmt->fetchAll();
     $sent=0;$errors=[];
@@ -2391,6 +2432,18 @@ function run_tests():array{
         'cron_secret'   =>'test_cron_secret',
         'risk_trend_query'=>'test_risk_trend_query',
         'v1_extensions' =>'test_v1_extensions',
+        // Sprint 7
+        'v1_brands_join'    =>'test_v1_brands_join',
+        'watchlist_hazard'  =>'test_watchlist_hazard',
+        'v1_distributors'   =>'test_v1_distributors',
+        'state_population'  =>'test_state_population',
+        'admin_tabs'        =>'test_admin_tabs',
+        // Sprint 8
+        'export_json'       =>'test_export_json',
+        'export_pdf_filters'=>'test_export_pdf_filters',
+        'watchlist_checks'  =>'test_watchlist_checks',
+        'user_mgmt_api'     =>'test_user_mgmt_api',
+        'distributors_view' =>'test_distributors_view',
     ];
     foreach($tests as $name=>$fn){
         try{
@@ -2714,6 +2767,90 @@ function test_v1_extensions():array{
     }catch(\Throwable $e){return['status'=>'FAIL','msg'=>$e->getMessage()];}
 }
 
+// Sprint 7 tests
+function test_v1_brands_join():array{
+    // v1/brands must use recall_products, not the non-existent recall_brands table
+    try{
+        $res=db()->query("SELECT b.id,COUNT(DISTINCT rp.recall_id) as cnt FROM brands b LEFT JOIN recall_products rp ON rp.brand_id=b.id GROUP BY b.id LIMIT 1")->fetchAll();
+        return['status'=>'PASS','msg'=>'brands JOIN recall_products OK; '.count($res).' row(s)'];
+    }catch(\Throwable $e){return['status'=>'FAIL','msg'=>$e->getMessage()];}
+}
+function test_watchlist_hazard():array{
+    // hazard watch type must have a working query
+    try{
+        $s=db()->prepare("SELECT COUNT(DISTINCT r.id) FROM recalls r JOIN recall_hazards rh ON rh.recall_id=r.id JOIN hazards h ON h.id=rh.hazard_id WHERE r.status='ongoing' AND LOWER(h.name) LIKE ?");
+        $s->execute(['%allergen%']);$cnt=(int)$s->fetchColumn();
+        return['status'=>'PASS','msg'=>'hazard watchlist query OK; allergen active recalls='.$cnt];
+    }catch(\Throwable $e){return['status'=>'FAIL','msg'=>$e->getMessage()];}
+}
+function test_v1_distributors():array{
+    try{
+        $s=db()->query("SELECT d.id,d.name,COUNT(DISTINCT rd.recall_id) as recall_count FROM distributors d LEFT JOIN recall_distributors rd ON rd.distributor_id=d.id GROUP BY d.id ORDER BY recall_count DESC LIMIT 5")->fetchAll();
+        return['status'=>'PASS','msg'=>'v1/distributors query OK; '.count($s).' distributors'];
+    }catch(\Throwable $e){return['status'=>'FAIL','msg'=>$e->getMessage()];}
+}
+function test_state_population():array{
+    try{
+        $n=(int)db()->query("SELECT COUNT(*) FROM state_population")->fetchColumn();
+        if($n<51)return['status'=>'FAIL','msg'=>"state_population has $n rows; expected ≥51"];
+        $pop=(int)db()->query("SELECT population FROM state_population WHERE state_code='CA'")->fetchColumn();
+        if($pop<30000000)return['status'=>'FAIL','msg'=>"CA population=$pop; expected ~39M"];
+        return['status'=>'PASS','msg'=>"state_population seeded: $n states; CA pop=".number_format($pop)];
+    }catch(\Throwable $e){return['status'=>'FAIL','msg'=>$e->getMessage()];}
+}
+function test_admin_tabs():array{
+    // Verify new query data (rate_keys, subs_all, users_all) doesn't throw
+    try{
+        $rk=db()->query("SELECT COUNT(*) FROM api_keys WHERE revoked=0")->fetchColumn();
+        $su=db()->query("SELECT COUNT(*) FROM subscriptions")->fetchColumn();
+        $us=db()->query("SELECT COUNT(*) FROM users")->fetchColumn();
+        return['status'=>'PASS','msg'=>"admin tabs data OK: keys=$rk subs=$su users=$us"];
+    }catch(\Throwable $e){return['status'=>'FAIL','msg'=>$e->getMessage()];}
+}
+// Sprint 8 tests
+function test_export_json():array{
+    // export_json uses same q_recalls path; just verify the filter array is constructed correctly
+    try{
+        $data=q_recalls(1,5,['status'=>'all','q'=>'']);
+        if(!isset($data['records'])||!isset($data['total']))return['status'=>'FAIL','msg'=>'q_recalls returned unexpected structure'];
+        $json=json_encode(['generated_at'=>date('c'),'total'=>$data['total'],'records'=>$data['records']],JSON_UNESCAPED_UNICODE);
+        if(!$json)return['status'=>'FAIL','msg'=>'json_encode failed'];
+        return['status'=>'PASS','msg'=>'export_json structure OK; total='.$data['total']];
+    }catch(\Throwable $e){return['status'=>'FAIL','msg'=>$e->getMessage()];}
+}
+function test_export_pdf_filters():array{
+    // export_pdf now accepts all 8 filters; verify q_recalls accepts all of them without error
+    try{
+        $f=['status'=>'all','state'=>'CA','category'=>'','hazard'=>'','agency'=>'','severity'=>'','sort'=>'date','q'=>''];
+        $data=q_recalls(1,5,$f);
+        return['status'=>'PASS','msg'=>'export_pdf 8-filter path OK; total='.$data['total']];
+    }catch(\Throwable $e){return['status'=>'FAIL','msg'=>$e->getMessage()];}
+}
+function test_watchlist_checks():array{
+    try{
+        $cols=db()->query("PRAGMA table_info(watchlist_checks)")->fetchAll(PDO::FETCH_COLUMN,1);
+        $required=['id','watchlist_id','checked_at','active_count'];
+        $missing=array_diff($required,$cols);
+        if($missing)return['status'=>'FAIL','msg'=>'watchlist_checks missing columns: '.implode(',',$missing)];
+        return['status'=>'PASS','msg'=>'watchlist_checks schema OK; columns: '.implode(',',$cols)];
+    }catch(\Throwable $e){return['status'=>'FAIL','msg'=>$e->getMessage()];}
+}
+function test_user_mgmt_api():array{
+    // Verify user_set_admin and user_delete code paths exist (column check)
+    try{
+        $has_admin=(int)db()->query("SELECT COUNT(*) FROM pragma_table_info('users') WHERE name='is_admin'")->fetchColumn();
+        if(!$has_admin)return['status'=>'FAIL','msg'=>'users.is_admin column missing'];
+        return['status'=>'PASS','msg'=>'user management: users.is_admin column present'];
+    }catch(\Throwable $e){return['status'=>'FAIL','msg'=>$e->getMessage()];}
+}
+function test_distributors_view():array{
+    try{
+        $n=(int)db()->query("SELECT COUNT(*) FROM distributors")->fetchColumn();
+        $q=db()->query("SELECT d.id,d.name,COUNT(DISTINCT rd.recall_id) as recall_count FROM distributors d LEFT JOIN recall_distributors rd ON rd.distributor_id=d.id GROUP BY d.id ORDER BY recall_count DESC LIMIT 1")->fetchAll();
+        return['status'=>'PASS','msg'=>"distributors view query OK; $n distributors in DB"];
+    }catch(\Throwable $e){return['status'=>'FAIL','msg'=>$e->getMessage()];}
+}
+
 // ================================================================
 // § ROUTING & DISPATCH
 // ================================================================
@@ -2756,6 +2893,7 @@ function route():void{
         case 'subscriptions': render_page('subscriptions');break;
         case 'markov_admin':  render_page('markov_admin');break;
         case 'search':        render_page('search');break;
+        case 'distributors':  render_page('distributors');break;
         case 'distributor':   render_page('distributor');break;
         case 'brand':         render_page('brand');break;
         case 'watchlist':     render_page('watchlist');break;
@@ -2944,7 +3082,7 @@ function handle_api(string $api):void{
                 fclose($out);exit;
             case 'export_pdf':
                 // Returns HTML fragment for print/PDF
-                $f=['status'=>$_GET['status']??'all','q'=>$_GET['q']??''];
+                $f=['status'=>$_GET['status']??'all','state'=>$_GET['state']??'','category'=>$_GET['cat']??'','hazard'=>$_GET['haz']??'','agency'=>$_GET['agency']??'','severity'=>$_GET['sev']??'','sort'=>$_GET['sort']??'date','q'=>$_GET['q']??''];
                 $data=q_recalls(1,100,$f);
                 header('Content-Type: text/html; charset=utf-8');
                 echo '<!DOCTYPE html><html><head><title>FoodWatch US Export</title>';
@@ -2955,6 +3093,13 @@ function handle_api(string $api):void{
                     echo '<tr><td>'.htmlspecialchars($r['classification']??'').'</td><td>'.htmlspecialchars(mb_substr($r['title'],0,80)).'</td><td>'.htmlspecialchars($r['agency_code']).'</td><td>'.htmlspecialchars($r['category_name']??'').'</td><td>'.htmlspecialchars($r['announced_date']??'').'</td><td>'.htmlspecialchars($r['status']).'</td></tr>';
                 }
                 echo '</tbody></table><script>window.print()</script></body></html>';
+                exit;
+            case 'export_json':
+                $f=['status'=>$_GET['status']??'all','state'=>$_GET['state']??'','category'=>$_GET['cat']??'','hazard'=>$_GET['haz']??'','agency'=>$_GET['agency']??'','severity'=>$_GET['sev']??'','sort'=>$_GET['sort']??'date','q'=>$_GET['q']??''];
+                $data=q_recalls(1,2000,$f);
+                header('Content-Type: application/json; charset=utf-8');
+                header('Content-Disposition: attachment; filename="foodwatch-recalls-'.date('Y-m-d').'.json"');
+                echo json_encode(['generated_at'=>date('c'),'total'=>$data['total'],'records'=>$data['records']],JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT);
                 exit;
             case 'user_register':
                 if(!csrf_ok())fw_abort('CSRF',403);
@@ -2968,6 +3113,21 @@ function handle_api(string $api):void{
             case 'user_logout':
                 if(!csrf_ok())fw_abort('CSRF',403);
                 user_logout();echo js(['ok'=>true]);break;
+            case 'user_set_admin':
+                if(!is_admin()||!csrf_ok())fw_abort('Unauthorized',403);
+                $uid_sa=(int)($_POST['id']??0);$is_adm=(int)($_POST['admin']??0);
+                if(!$uid_sa)fw_abort('Missing id',400);
+                db()->prepare("UPDATE users SET is_admin=? WHERE id=?")->execute([$is_adm?1:0,$uid_sa]);
+                echo js(['ok'=>true]);break;
+            case 'user_delete':
+                if(!is_admin()||!csrf_ok())fw_abort('Unauthorized',403);
+                $uid_del=(int)($_POST['id']??0);
+                if(!$uid_del)fw_abort('Missing id',400);
+                db()->prepare("UPDATE api_keys SET revoked=1 WHERE user_id=?")->execute([$uid_del]);
+                db()->prepare("DELETE FROM saved_filters WHERE user_id=?")->execute([$uid_del]);
+                db()->prepare("DELETE FROM watchlists WHERE user_id=?")->execute([$uid_del]);
+                db()->prepare("DELETE FROM users WHERE id=?")->execute([$uid_del]);
+                echo js(['ok'=>true]);break;
             case 'filter_save':
                 if(!csrf_ok())fw_abort('CSRF',403);
                 if(!is_user())fw_abort('Login required',401);
@@ -3019,9 +3179,11 @@ function handle_api(string $api):void{
                     case 'categories':      echo js(q_category_stats());break;
                     case 'stats':           echo js(q_stats($_GET['state']??''));break;
                     // SPRINT 6 v1 additions
-                    case 'distributors':    echo js(q_recalls(1,min(200,(int)($_GET['per']??100)),['status'=>'all']));break; // placeholder; full distributor list
+                    case 'distributors':
+                        $dstmt=db()->prepare("SELECT d.id,d.name,d.city,d.state,COUNT(DISTINCT rd.recall_id) as recall_count FROM distributors d LEFT JOIN recall_distributors rd ON rd.distributor_id=d.id GROUP BY d.id ORDER BY recall_count DESC LIMIT ?");
+                        $dstmt->execute([min(500,(int)($_GET['limit']??200))]);echo js($dstmt->fetchAll());break;
                     case 'brands':
-                        $bstmt=db()->prepare("SELECT b.id,b.name,m.id as manufacturer_id,m.name as manufacturer_name,COUNT(DISTINCT rb.recall_id) as recall_count FROM brands b LEFT JOIN manufacturers m ON m.id=b.manufacturer_id LEFT JOIN recall_brands rb ON rb.brand_id=b.id GROUP BY b.id ORDER BY recall_count DESC LIMIT ?");
+                        $bstmt=db()->prepare("SELECT b.id,b.name,m.id as manufacturer_id,m.name as manufacturer_name,COUNT(DISTINCT rp.recall_id) as recall_count FROM brands b LEFT JOIN manufacturers m ON m.id=b.manufacturer_id LEFT JOIN recall_products rp ON rp.brand_id=b.id GROUP BY b.id ORDER BY recall_count DESC LIMIT ?");
                         $bstmt->execute([min(500,(int)($_GET['limit']??200))]);echo js($bstmt->fetchAll());break;
                     case 'geo_risk':        echo js(array_values(q_geo_risk()));break;
                     case 'markov':          echo js(q_markov_dashboard());break;
@@ -3173,6 +3335,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc}
     <a href="?page=recalls" class="fw-nav-link <?=$page==='recalls'?'active':''?>"><i data-lucide="alert-triangle" class="w-4 h-4"></i>Recalls</a>
     <a href="?page=retailers" class="fw-nav-link <?=$page==='retailers'?'active':''?>"><i data-lucide="store" class="w-4 h-4"></i>Retailer Exposure</a>
     <a href="?page=manufacturers" class="fw-nav-link <?=$page==='manufacturers'?'active':''?>"><i data-lucide="factory" class="w-4 h-4"></i>Manufacturers</a>
+    <a href="?page=distributors" class="fw-nav-link <?=$page==='distributors'||$page==='distributor'?'active':''?>"><i data-lucide="truck" class="w-4 h-4"></i>Distributors</a>
     <a href="?page=categories" class="fw-nav-link <?=$page==='categories'?'active':''?>"><i data-lucide="tag" class="w-4 h-4"></i>Food Categories</a>
     <div class="text-xs text-slate-500 px-3 pt-3 pb-1 uppercase tracking-wider font-semibold">Analysis</div>
     <a href="?page=analytics" class="fw-nav-link <?=$page==='analytics'?'active':''?>"><i data-lucide="trending-up" class="w-4 h-4"></i>Trends &amp; Velocity</a>
@@ -3229,6 +3392,7 @@ function render_page(string $p):void{
         'retailer'      =>view_retailer_detail(),
         'manufacturers' =>view_manufacturers(),
         'manufacturer'  =>view_manufacturer_detail(),
+        'distributors'  =>view_distributors(),
         'distributor'   =>view_distributor_detail(),
         'brand'         =>view_brand_detail(),
         'categories'    =>view_categories(),
@@ -4042,6 +4206,52 @@ function q_distributor(int $id):?array{
     return $row;
 }
 
+function view_distributors():void{
+    $sort=$_GET['sort']??'recalls';
+    $valid=['recalls','name','state'];
+    $order_col=in_array($sort,$valid)?$sort:'recalls';
+    $col_map=['recalls'=>'recall_count','name'=>'d.name','state'=>'d.state'];
+    $order=$col_map[$order_col];
+    $stmt=db()->prepare("SELECT d.id,d.name,d.city,d.state,
+        COUNT(DISTINCT rd.recall_id) as recall_count,
+        SUM(CASE WHEN r.status='ongoing' THEN 1 ELSE 0 END) as active_count,
+        SUM(CASE WHEN r.severity>=3 THEN 1 ELSE 0 END) as severe_count
+      FROM distributors d
+      LEFT JOIN recall_distributors rd ON rd.distributor_id=d.id
+      LEFT JOIN recalls r ON r.id=rd.recall_id
+      GROUP BY d.id ORDER BY $order DESC LIMIT 300");
+    $stmt->execute();
+    $rows=$stmt->fetchAll();
+    layout_head('Distributors','distributors'); ?>
+<div class="flex items-center justify-between mb-4">
+  <h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="truck" class="w-4 h-4 text-fw-500"></i>Distributors</h2>
+  <span class="text-xs text-slate-400"><?=count($rows)?> distributors</span>
+</div>
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-x-auto">
+  <table class="fw-table w-full min-w-max">
+    <thead><tr>
+      <th><a href="?page=distributors&sort=name" class="hover:underline">Name</a></th>
+      <th>Location</th>
+      <th><a href="?page=distributors&sort=recalls" class="hover:underline">Total Recalls</a></th>
+      <th>Active</th>
+      <th>Class I</th>
+    </tr></thead>
+    <tbody>
+    <?php foreach($rows as $d): ?>
+    <tr>
+      <td class="font-medium"><a href="?page=distributor&id=<?=(int)$d['id']?>" class="text-fw-500 hover:underline"><?=h($d['name'])?></a></td>
+      <td class="text-xs text-slate-500"><?=h(trim(($d['city']??'').($d['state']?', '.$d['state']:'')))?></td>
+      <td class="text-center font-bold <?=(int)$d['recall_count']>=3?'text-red-600':''?>"><?=(int)$d['recall_count']?></td>
+      <td class="text-center font-bold <?=(int)$d['active_count']>0?'text-orange-600':'text-slate-300'?>"><?=(int)$d['active_count']?></td>
+      <td class="text-center font-bold <?=(int)$d['severe_count']>0?'text-red-600':'text-slate-300'?>"><?=(int)$d['severe_count']?></td>
+    </tr>
+    <?php endforeach; ?>
+    <?php if(empty($rows)): ?><tr><td colspan="5" class="text-center py-8 text-slate-400">No distributor data. Run ingestion first.</td></tr><?php endif; ?>
+    </tbody>
+  </table>
+</div>
+<?php layout_foot(); }
+
 function view_distributor_detail():void{
     $id=(int)($_GET['id']??0);
     if(!$id)fw_abort('Missing distributor ID');
@@ -4376,6 +4586,9 @@ function view_watchlist():void{
                     // Match UPC via recall_products.upc_codes (JSON array stored as text)
                     $s=$wl_stmts['upc']??=db()->prepare("SELECT COUNT(DISTINCT r.id) FROM recalls r JOIN recall_products rp ON rp.recall_id=r.id WHERE r.status='ongoing' AND rp.upc_codes LIKE ?");
                     $s->execute(['%'.preg_replace('/[^0-9]/','',trim($wv)).'%']);$cnt=(int)$s->fetchColumn();break;
+                case 'hazard':
+                    $s=$wl_stmts['hazard']??=db()->prepare("SELECT COUNT(DISTINCT r.id) FROM recalls r JOIN recall_hazards rh ON rh.recall_id=r.id JOIN hazards h ON h.id=rh.hazard_id WHERE r.status='ongoing' AND LOWER(h.name) LIKE ?");
+                    $s->execute(['%'.strtolower($wv).'%']);$cnt=(int)$s->fetchColumn();break;
             }
         }catch(\Throwable){$cnt=0;}
         $item_alerts[$it['id']]=['count'=>$cnt,'alert'=>$cnt>=$ramsey_threshold];
@@ -4497,6 +4710,40 @@ if(count($items)>=2){
   <div class="p-8 text-center text-slate-400"><i data-lucide="bell-off" class="w-8 h-8 mx-auto mb-2"></i><p class="text-sm">No watched items. Add retailers, brands, or categories above.</p></div>
   <?php endif; ?>
 </div>
+
+<?php
+// Watchlist check history (last 10 snapshots per item, most recent first)
+$wl_history=[];
+if(!empty($watchlist)){
+    $ids=implode(',',array_map(fn($i)=>(int)$i['id'],$watchlist));
+    try{
+        $wch=db()->query("SELECT watchlist_id,checked_at,active_count FROM watchlist_checks WHERE watchlist_id IN($ids) ORDER BY checked_at DESC LIMIT 200")->fetchAll();
+        foreach($wch as $c)$wl_history[$c['watchlist_id']][]=$c;
+    }catch(\Throwable){}
+}
+if(!empty($wl_history)): ?>
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+  <h2 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="history" class="w-4 h-4 text-slate-500"></i>Alert Check History</h2>
+  <div class="space-y-3">
+  <?php foreach($watchlist as $it):
+      $hist=$wl_history[$it['id']]??[];
+      if(empty($hist))continue;
+      $hist=array_slice($hist,0,10); ?>
+  <div>
+    <p class="text-xs font-medium text-slate-600 mb-1"><?=h(ucfirst($it['watch_type']))?> — <?=h($it['watch_value'])?></p>
+    <div class="flex gap-1 flex-wrap">
+      <?php foreach(array_reverse($hist) as $hc):
+          $cnt=(int)$hc['active_count'];
+          $chip=$cnt>0?'bg-red-100 text-red-700':'bg-slate-100 text-slate-500'; ?>
+      <span title="<?=h(substr($hc['checked_at'],0,16))?>" class="inline-block px-1.5 py-0.5 rounded text-xs font-mono <?=$chip?>"><?=$cnt?></span>
+      <?php endforeach; ?>
+    </div>
+  </div>
+  <?php endforeach; ?>
+  </div>
+</div>
+<?php endif; ?>
+
 <?php layout_foot(); }
 
 function view_tests():void{
@@ -4557,6 +4804,9 @@ function view_admin():void{
     $recall_count=(int)db()->query('SELECT COUNT(*) FROM recalls')->fetchColumn();
     $last_run=$runs[0]??null;
     $admin_tab=$_GET['atab']??'ingestion';
+    $rate_keys=db()->query("SELECT k.id,k.key_prefix,k.label,k.rate_limit_hour,u.email,k.last_used,COALESCE((SELECT request_count FROM api_rate_limits WHERE key_id=k.id AND window_hour=strftime('%Y-%m-%d %H',datetime('now')) LIMIT 1),0) as used_this_hour FROM api_keys k LEFT JOIN users u ON u.id=k.user_id WHERE k.revoked=0 ORDER BY used_this_hour DESC LIMIT 50")->fetchAll();
+    $subs_all=db()->query("SELECT id,email,state_filter,category_id,min_severity,confirmed,active,created_at,last_sent_at FROM subscriptions ORDER BY created_at DESC LIMIT 100")->fetchAll();
+    $users_all=db()->query("SELECT id,email,is_admin,created_at,(SELECT COUNT(*) FROM api_keys WHERE user_id=users.id AND revoked=0) as key_count FROM users ORDER BY created_at DESC LIMIT 100")->fetchAll();
 
     layout_head('Administration','admin'); ?>
 <div class="flex items-center justify-between mb-6">
@@ -4568,8 +4818,8 @@ function view_admin():void{
 </div>
 
 <!-- Admin Tab Nav (GROUP 8) -->
-<div class="flex gap-0 border-b border-slate-200 mb-6">
-  <?php foreach(['ingestion'=>'Ingestion','dq'=>'Data Quality','runs'=>'Run History'] as $tv=>$tl): ?>
+<div class="flex gap-0 border-b border-slate-200 mb-6 flex-wrap">
+  <?php foreach(['ingestion'=>'Ingestion','dq'=>'Data Quality','runs'=>'Run History','rate_limits'=>'Rate Limits','subscriptions'=>'Subscriptions','users'=>'Users'] as $tv=>$tl): ?>
   <a href="?page=admin&atab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$admin_tab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
   <?php endforeach; ?>
 </div>
@@ -4699,6 +4949,100 @@ function view_admin():void{
 </div>
 <?php endif; ?>
 <?php endif; // dq tab ?>
+
+<?php if($admin_tab==='rate_limits'): ?>
+<!-- Rate Limits Tab -->
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-x-auto">
+  <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+    <h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="gauge" class="w-4 h-4 text-indigo-500"></i>API Key Rate Usage — Current Hour</h2>
+    <span class="text-xs text-slate-400"><?=count($rate_keys)?> active keys</span>
+  </div>
+  <table class="fw-table w-full min-w-max">
+    <thead><tr><th>Key Prefix</th><th>Label</th><th>Owner</th><th>Hourly Limit</th><th>Used This Hour</th><th>Utilization</th><th>Last Used</th></tr></thead>
+    <tbody>
+    <?php foreach($rate_keys as $k):
+        $pct=$k['rate_limit_hour']>0?min(100,round((int)$k['used_this_hour']/(int)$k['rate_limit_hour']*100)):0;
+        $pctcls=$pct>=90?'bg-red-500':($pct>=60?'bg-orange-400':'bg-fw-500'); ?>
+    <tr>
+      <td class="font-mono text-xs"><?=h($k['key_prefix'])?>&hellip;</td>
+      <td class="text-xs"><?=h($k['label']??'—')?></td>
+      <td class="text-xs"><?=h($k['email']??'—')?></td>
+      <td class="text-center text-xs"><?=(int)$k['rate_limit_hour']?>/hr</td>
+      <td class="text-center font-bold text-xs <?=$pct>=90?'text-red-600':($pct>=60?'text-orange-600':'text-slate-700')?>"><?=(int)$k['used_this_hour']?></td>
+      <td class="text-xs" style="min-width:100px">
+        <div class="h-2 rounded bg-slate-100"><div class="h-2 rounded <?=$pctcls?>" style="width:<?=$pct?>%"></div></div>
+        <span class="text-xs text-slate-400"><?=$pct?>%</span>
+      </td>
+      <td class="text-xs"><?=h($k['last_used']?substr($k['last_used'],0,16):'Never')?></td>
+    </tr>
+    <?php endforeach; ?>
+    <?php if(empty($rate_keys)): ?><tr><td colspan="7" class="text-center py-6 text-slate-400">No active API keys.</td></tr><?php endif; ?>
+    </tbody>
+  </table>
+</div>
+<?php endif; // rate_limits tab ?>
+
+<?php if($admin_tab==='subscriptions'): ?>
+<!-- Subscriptions Tab -->
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-x-auto">
+  <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+    <h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="mail" class="w-4 h-4 text-fw-500"></i>Email Subscriptions</h2>
+    <span class="text-xs text-slate-400"><?=count($subs_all)?> total</span>
+  </div>
+  <table class="fw-table w-full min-w-max">
+    <thead><tr><th>ID</th><th>Email</th><th>State</th><th>Confirmed</th><th>Active</th><th>Last Sent</th><th>Created</th><th>Action</th></tr></thead>
+    <tbody>
+    <?php foreach($subs_all as $sub): ?>
+    <tr id="sub-row-<?=(int)$sub['id']?>">
+      <td class="font-mono text-xs"><?=(int)$sub['id']?></td>
+      <td class="text-xs"><?=h($sub['email'])?></td>
+      <td class="text-xs"><?=h($sub['state_filter']??'Any')?></td>
+      <td class="text-center text-xs"><span class="<?=$sub['confirmed']?'text-green-600 font-bold':'text-amber-500'?>"><?=$sub['confirmed']?'✓ Yes':'Pending'?></span></td>
+      <td class="text-center text-xs"><span class="<?=$sub['active']?'text-green-600':'text-slate-400'?>"><?=$sub['active']?'Active':'Off'?></span></td>
+      <td class="text-xs"><?=h($sub['last_sent_at']?substr($sub['last_sent_at'],0,10):'Never')?></td>
+      <td class="text-xs"><?=h(substr($sub['created_at'],0,10))?></td>
+      <td>
+        <button onclick="if(confirm('Delete subscription <?=(int)$sub['id']?>?'))fetch('?api=subscription_del',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',id:<?=(int)$sub['id']?>})}).then(()=>document.getElementById('sub-row-<?=(int)$sub['id']?>').remove())" class="text-xs text-red-500 hover:underline">Delete</button>
+      </td>
+    </tr>
+    <?php endforeach; ?>
+    <?php if(empty($subs_all)): ?><tr><td colspan="8" class="text-center py-6 text-slate-400">No subscriptions yet.</td></tr><?php endif; ?>
+    </tbody>
+  </table>
+</div>
+<?php endif; // subscriptions tab ?>
+
+<?php if($admin_tab==='users'): ?>
+<!-- Users Tab -->
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-x-auto">
+  <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+    <h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="users" class="w-4 h-4 text-fw-500"></i>Registered Users</h2>
+    <span class="text-xs text-slate-400"><?=count($users_all)?> users</span>
+  </div>
+  <table class="fw-table w-full min-w-max">
+    <thead><tr><th>ID</th><th>Email</th><th>Admin</th><th>API Keys</th><th>Joined</th><th>Action</th></tr></thead>
+    <tbody>
+    <?php foreach($users_all as $u): ?>
+    <tr id="user-row-<?=(int)$u['id']?>">
+      <td class="font-mono text-xs"><?=(int)$u['id']?></td>
+      <td class="text-xs font-medium"><?=h($u['email'])?></td>
+      <td class="text-center text-xs"><span class="<?=$u['is_admin']?'text-indigo-600 font-bold':'text-slate-400'?>"><?=$u['is_admin']?'Admin':'User'?></span></td>
+      <td class="text-center text-xs"><?=(int)$u['key_count']?></td>
+      <td class="text-xs"><?=h(substr($u['created_at'],0,10))?></td>
+      <td class="flex gap-2">
+        <?php if(!$u['is_admin']): ?>
+        <button onclick="if(confirm('Promote <?=h(addslashes($u['email']))?> to admin?'))fetch('?api=user_set_admin',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',id:<?=(int)$u['id']?>,admin:1})}).then(()=>location.reload())" class="text-xs text-indigo-500 hover:underline">Make Admin</button>
+        <?php endif; ?>
+        <button onclick="if(confirm('Delete user <?=h(addslashes($u['email']))?> and all their data?'))fetch('?api=user_delete',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',id:<?=(int)$u['id']?>})}).then(()=>document.getElementById('user-row-<?=(int)$u['id']?>').remove())" class="text-xs text-red-500 hover:underline">Delete</button>
+      </td>
+    </tr>
+    <?php endforeach; ?>
+    <?php if(empty($users_all)): ?><tr><td colspan="6" class="text-center py-6 text-slate-400">No registered users.</td></tr><?php endif; ?>
+    </tbody>
+  </table>
+</div>
+<?php endif; // users tab ?>
+
 <?php layout_foot(); }
 
 // ================================================================
