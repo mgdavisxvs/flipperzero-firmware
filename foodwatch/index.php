@@ -9,8 +9,8 @@ declare(strict_types=1);
 // ================================================================
 // § CONSTANTS
 // ================================================================
-const FW_VERSION    = '7.0.0';
-const FW_SCHEMA_VER = 38;
+const FW_VERSION    = '8.0.0';
+const FW_SCHEMA_VER = 43;
 // Pre-shared secret for IONOS crontab → cron_alerts endpoint; override before deploy
 const FW_CRON_SECRET = 'change-me-before-deploy';
 const FW_DATA_DIR   = __DIR__ . '/data';
@@ -310,7 +310,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26(),27=>m27(),28=>m28(),29=>m29(),30=>m30(),31=>m31(),32=>m32(),33=>m33(),34=>m34(),35=>m35(),36=>m36(),37=>m37(),38=>m38()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26(),27=>m27(),28=>m28(),29=>m29(),30=>m30(),31=>m31(),32=>m32(),33=>m33(),34=>m34(),35=>m35(),36=>m36(),37=>m37(),38=>m38(),39=>m39(),40=>m40(),41=>m41(),42=>m42(),43=>m43()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -799,6 +799,58 @@ CREATE TABLE IF NOT EXISTS notification_prefs(
   digest_freq TEXT NOT NULL DEFAULT 'immediate' CHECK(digest_freq IN ('immediate','daily','weekly')),
   updated_at TEXT NOT NULL DEFAULT(datetime('now')));
 CREATE INDEX IF NOT EXISTS idx_np_user ON notification_prefs(user_id);
+SQL; }
+
+function m43():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS system_settings(
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT '',
+  updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TEXT NOT NULL DEFAULT(datetime('now')));
+SQL; }
+
+function m42():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS archived_recalls(
+  id INTEGER PRIMARY KEY,
+  original_id INTEGER NOT NULL,
+  snapshot_json TEXT NOT NULL DEFAULT '{}',
+  archived_at TEXT NOT NULL DEFAULT(datetime('now')),
+  reason TEXT NOT NULL DEFAULT 'retention_policy');
+CREATE INDEX IF NOT EXISTS idx_ar_orig ON archived_recalls(original_id);
+SQL; }
+
+function m41():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS user_events(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL DEFAULT 'action',
+  entity_type TEXT NOT NULL DEFAULT '',
+  entity_id INTEGER,
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_ue_user ON user_events(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_ue_type ON user_events(event_type, created_at);
+SQL; }
+
+function m40():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS email_queue(
+  id INTEGER PRIMARY KEY,
+  to_address TEXT NOT NULL,
+  subject TEXT NOT NULL DEFAULT '',
+  body_html TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sent','failed')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  error_msg TEXT NOT NULL DEFAULT '',
+  queued_at TEXT NOT NULL DEFAULT(datetime('now')),
+  sent_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_eq_status ON email_queue(status, queued_at);
+SQL; }
+
+function m39():string{ return <<<'SQL'
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_recalls USING fts5(
+  title, reason, description, manufacturer_name,
+  tokenize='unicode61'
+);
 SQL; }
 
 function m38():string{ return <<<'SQL'
@@ -2628,6 +2680,68 @@ function send_email_alerts():array{
     return['sent'=>$sent,'errors'=>$errors];
 }
 
+// ================================================================
+// § SPRINT 21-25 HELPERS
+// ================================================================
+
+function fts_rebuild():int{
+    $db=db();
+    try{$db->exec("DELETE FROM fts_recalls");}catch(\Throwable){}
+    $rows=$db->query("SELECT r.id,COALESCE(r.title,''),COALESCE(r.reason,''),COALESCE(r.description,''),COALESCE(m.name,'') FROM recalls r LEFT JOIN manufacturers m ON m.id=r.manufacturer_id LIMIT 50000")->fetchAll(\PDO::FETCH_NUM);
+    $ins=$db->prepare("INSERT INTO fts_recalls(rowid,title,reason,description,manufacturer_name)VALUES(?,?,?,?,?)");
+    $db->beginTransaction();$n=0;
+    foreach($rows as $row){try{$ins->execute($row);$n++;}catch(\Throwable){}}
+    $db->commit();return $n;
+}
+
+function queue_email(string $to, string $subject, string $body_html):int{
+    $s=db()->prepare("INSERT INTO email_queue(to_address,subject,body_html)VALUES(?,?,?)");
+    $s->execute([mb_substr($to,0,320),mb_substr($subject,0,500),$body_html]);
+    return (int)db()->lastInsertId();
+}
+
+function send_queued_emails(int $batch=10):array{
+    $rows=db()->query("SELECT id,to_address,subject,body_html,attempts FROM email_queue WHERE status='pending' AND attempts<3 ORDER BY queued_at LIMIT $batch")->fetchAll(\PDO::FETCH_ASSOC);
+    $sent=0;$failed=0;
+    foreach($rows as $r){
+        $headers="MIME-Version: 1.0\r\nContent-Type: text/html; charset=UTF-8\r\nFrom: FoodWatch <noreply@foodwatch.local>\r\n";
+        $ok=@mail($r['to_address'],$r['subject'],$r['body_html'],$headers);
+        if($ok){
+            db()->prepare("UPDATE email_queue SET status='sent',sent_at=datetime('now'),attempts=attempts+1 WHERE id=?")->execute([$r['id']]);$sent++;
+        }else{
+            db()->prepare("UPDATE email_queue SET attempts=attempts+1,status=CASE WHEN attempts+1>=3 THEN 'failed' ELSE 'pending' END WHERE id=?")->execute([$r['id']]);$failed++;
+        }
+    }
+    return['sent'=>$sent,'failed'=>$failed,'processed'=>count($rows)];
+}
+
+function log_event(int $user_id, string $event_type, string $entity_type='', ?int $entity_id=null, array $detail=[]):void{
+    try{
+        db()->prepare("INSERT INTO user_events(user_id,event_type,entity_type,entity_id,detail_json)VALUES(?,?,?,?,?)")
+            ->execute([$user_id,$event_type,$entity_type,$entity_id,json_encode($detail,JSON_UNESCAPED_UNICODE)]);
+    }catch(\Throwable){}
+}
+
+function archive_old_recalls(int $days=730):array{
+    $db=db();
+    $cutoff=date('Y-m-d',strtotime("-{$days} days"));
+    $rows=$db->prepare("SELECT r.*,m.name AS manufacturer_name,a.name AS agency_name FROM recalls r LEFT JOIN manufacturers m ON m.id=r.manufacturer_id LEFT JOIN agencies a ON a.id=r.agency_id WHERE r.status IN ('completed','closed','resolved') AND r.announced_date<?");
+    $rows->execute([$cutoff]);$list=$rows->fetchAll(\PDO::FETCH_ASSOC);
+    $ins=$db->prepare("INSERT OR IGNORE INTO archived_recalls(original_id,snapshot_json,reason)VALUES(?,?,'retention_policy')");
+    $del=$db->prepare("DELETE FROM recalls WHERE id=?");
+    $archived=0;$skipped=0;
+    $db->beginTransaction();
+    foreach($list as $row){
+        // Skip if already archived
+        $exists=(int)$db->prepare("SELECT COUNT(*) FROM archived_recalls WHERE original_id=?")->execute([$row['id']]) ? (int)$db->query("SELECT COUNT(*) FROM archived_recalls WHERE original_id={$row['id']}")->fetchColumn() : 0;
+        if($exists){$skipped++;continue;}
+        $ins->execute([$row['id'],json_encode($row,JSON_UNESCAPED_UNICODE)]);
+        $del->execute([$row['id']]);$archived++;
+    }
+    $db->commit();
+    return['archived'=>$archived,'skipped'=>$skipped,'cutoff'=>$cutoff,'days'=>$days];
+}
+
 // Sprint 13: dispatch outbound webhooks for a user
 function compute_risk_score(int $recall_id):array{
     $db=db();
@@ -2998,6 +3112,71 @@ function run_tests():array{
         'notif_prefs_digest'    =>'test_notif_prefs_digest',
         'webhook_hmac_header'   =>'test_webhook_hmac_header',
         'webhook_max_5'         =>'test_webhook_max_5',
+        // Sprint 25
+        'view_playground_fn'        =>'test_view_playground_fn',
+        'playground_route'          =>'test_playground_route',
+        'playground_nav_link'       =>'test_playground_nav_link',
+        'playground_endpoints_list' =>'test_playground_endpoints_list',
+        'playground_curl_preview'   =>'test_playground_curl_preview',
+        'playground_fts_support'    =>'test_playground_fts_support',
+        'playground_params_builder' =>'test_playground_params_builder',
+        'playground_response_area'  =>'test_playground_response_area',
+        'playground_status_badge'   =>'test_playground_status_badge',
+        'playground_apikey_field'   =>'test_playground_apikey_field',
+        'playground_elapsed_ms'     =>'test_playground_elapsed_ms',
+        'playground_execute_btn'    =>'test_playground_execute_btn',
+        // Sprint 24
+        'm_archived_recalls_cols'   =>'test_m_archived_recalls_cols',
+        'archive_old_recalls_fn'    =>'test_archive_old_recalls_fn',
+        'archive_run_api'           =>'test_archive_run_api',
+        'archive_list_api'          =>'test_archive_list_api',
+        'archive_admin_tab'         =>'test_archive_admin_tab',
+        'archive_retention_days'    =>'test_archive_retention_days',
+        'archive_snapshot_json'     =>'test_archive_snapshot_json',
+        'archive_reason_field'      =>'test_archive_reason_field',
+        'archive_original_id'       =>'test_archive_original_id',
+        'archive_index'             =>'test_archive_index',
+        'archive_status_filter'     =>'test_archive_status_filter',
+        'archive_dedup'             =>'test_archive_dedup',
+        // Sprint 23
+        'm_user_events_cols'        =>'test_m_user_events_cols',
+        'log_event_fn'              =>'test_log_event_fn',
+        'event_log_user_api'        =>'test_event_log_user_api',
+        'event_log_admin_api'       =>'test_event_log_admin_api',
+        'user_events_admin_tab'     =>'test_user_events_admin_tab',
+        'user_events_idx_user'      =>'test_user_events_idx_user',
+        'user_events_idx_type'      =>'test_user_events_idx_type',
+        'user_events_entity_type'   =>'test_user_events_entity_type',
+        'user_events_detail_json'   =>'test_user_events_detail_json',
+        'user_events_cascade'       =>'test_user_events_cascade',
+        'event_log_user_limit'      =>'test_event_log_user_limit',
+        'event_log_admin_limit'     =>'test_event_log_admin_limit',
+        // Sprint 22
+        'm_email_queue_cols'        =>'test_m_email_queue_cols',
+        'queue_email_fn'            =>'test_queue_email_fn',
+        'send_queued_emails_fn'     =>'test_send_queued_emails_fn',
+        'email_queue_list_api'      =>'test_email_queue_list_api',
+        'email_queue_flush_api'     =>'test_email_queue_flush_api',
+        'email_queue_admin_tab'     =>'test_email_queue_admin_tab',
+        'email_status_values'       =>'test_email_status_values',
+        'email_queue_batch_limit'   =>'test_email_queue_batch_limit',
+        'email_retry_limit'         =>'test_email_retry_limit',
+        'email_sent_at_field'       =>'test_email_sent_at_field',
+        'email_body_html_field'     =>'test_email_body_html_field',
+        'queue_email_subject'       =>'test_queue_email_subject',
+        // Sprint 21
+        'm_fts_recalls_tbl'         =>'test_m_fts_recalls_tbl',
+        'fts_rebuild_fn'            =>'test_fts_rebuild_fn',
+        'fts_rebuild_api'           =>'test_fts_rebuild_api',
+        'search_fts_api'            =>'test_search_fts_api',
+        'fts_public_access'         =>'test_fts_public_access',
+        'fts_limit_50'              =>'test_fts_limit_50',
+        'fts_match_query'           =>'test_fts_match_query',
+        'fts_snippet_col'           =>'test_fts_snippet_col',
+        'fts_title_col'             =>'test_fts_title_col',
+        'fts_reason_col'            =>'test_fts_reason_col',
+        'fts_rebuild_admin_guard'   =>'test_fts_rebuild_admin_guard',
+        'fts_empty_q'               =>'test_fts_empty_q',
         // Sprint 20
         'm_webhook_deliveries_cols' =>'test_m_webhook_deliveries_cols',
         'm_api_usage_log_cols'      =>'test_m_api_usage_log_cols',
@@ -4526,6 +4705,491 @@ function test_history_list_empty():array{
 }
 
 // ================================================================
+// § SPRINT 21 TESTS — FTS5 Full-Text Search
+// ================================================================
+function test_m_fts_recalls_tbl():array{
+    try{
+        db()->query("SELECT COUNT(*) FROM fts_recalls")->fetchColumn();
+        return['status'=>'PASS','msg'=>'fts_recalls virtual table exists and is queryable'];
+    }catch(\Throwable $e){
+        return['status'=>'FAIL','msg'=>'fts_recalls table missing or not queryable: '.$e->getMessage()];
+    }
+}
+function test_fts_rebuild_fn():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,'function fts_rebuild():int');
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'fts_rebuild() function defined':'fts_rebuild() function missing'];
+}
+function test_fts_rebuild_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,"case 'fts_rebuild':");
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'fts_rebuild API case present':'fts_rebuild API case missing'];
+}
+function test_search_fts_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,"case 'search_fts':");
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'search_fts API case present':'search_fts API case missing'];
+}
+function test_fts_public_access():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'search_fts':",$off))!==false){
+        $block=substr($src,$p,200);
+        if(!str_contains($block,'is_admin()')&&!str_contains($block,'is_user()')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'search_fts is public (no auth guard)':'search_fts should be public'];
+}
+function test_fts_limit_50():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'search_fts':",$off))!==false){
+        if(str_contains(substr($src,$p,400),'50')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'search_fts enforces max 50 results':'search_fts missing 50-result limit'];
+}
+function test_fts_match_query():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'search_fts':",$off))!==false){
+        if(str_contains(substr($src,$p,500),'MATCH')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'search_fts uses FTS5 MATCH operator':'search_fts missing MATCH operator'];
+}
+function test_fts_snippet_col():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'search_fts':",$off))!==false){
+        if(str_contains(substr($src,$p,500),'snippet')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'search_fts returns snippet column':'search_fts missing snippet() call'];
+}
+function test_fts_title_col():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function fts_rebuild()',$off))!==false){
+        if(str_contains(substr($src,$p,400),'title')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'fts_rebuild() indexes title column':'fts_rebuild() missing title column'];
+}
+function test_fts_reason_col():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function fts_rebuild()',$off))!==false){
+        if(str_contains(substr($src,$p,400),'reason')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'fts_rebuild() indexes reason column':'fts_rebuild() missing reason column'];
+}
+function test_fts_rebuild_admin_guard():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'fts_rebuild':",$off))!==false){
+        if(str_contains(substr($src,$p,200),'is_admin()')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'fts_rebuild guarded by is_admin()':'fts_rebuild missing is_admin() guard'];
+}
+function test_fts_empty_q():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'search_fts':",$off))!==false){
+        if(str_contains(substr($src,$p,300),"===''")||str_contains(substr($src,$p,300),'==""')||str_contains(substr($src,$p,300),"===''")|| str_contains(substr($src,$p,300),"q_fts===''") || str_contains(substr($src,$p,300),'empty') || str_contains(substr($src,$p,300),'json_encode([])')||str_contains(substr($src,$p,300),'js([])') ){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'search_fts returns empty array for empty q':'search_fts missing empty-q guard'];
+}
+
+// ================================================================
+// § SPRINT 22 TESTS — Email Queue
+// ================================================================
+function test_m_email_queue_cols():array{
+    $cols=db()->query("PRAGMA table_info(email_queue)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','to_address','subject','body_html','status','attempts','error_msg','queued_at','sent_at'];
+    $missing=array_diff($need,$cols);
+    return['status'=>$missing?'FAIL':'PASS','msg'=>$missing?'email_queue missing: '.implode(',',$missing):'email_queue schema OK'];
+}
+function test_queue_email_fn():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,'function queue_email(string $to');
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'queue_email() function defined':'queue_email() function missing'];
+}
+function test_send_queued_emails_fn():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,'function send_queued_emails(');
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'send_queued_emails() function defined':'send_queued_emails() function missing'];
+}
+function test_email_queue_list_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'email_queue_list':",$off))!==false){
+        if(str_contains(substr($src,$p,200),'is_admin()')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'email_queue_list guarded by is_admin()':'email_queue_list missing is_admin() guard'];
+}
+function test_email_queue_flush_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'email_queue_flush':",$off))!==false){
+        if(str_contains(substr($src,$p,200),'is_admin()')&&str_contains(substr($src,$p,200),'csrf_ok()')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'email_queue_flush guarded by is_admin()+csrf_ok()':'email_queue_flush missing admin+CSRF guard'];
+}
+function test_email_queue_admin_tab():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,"'email_queue'=>'Email Queue'");
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'Admin Email Queue tab present':'Admin Email Queue tab missing'];
+}
+function test_email_status_values():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,"'pending','sent','failed'");
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'email_queue CHECK constraint has pending/sent/failed values':'email_queue status CHECK constraint missing'];
+}
+function test_email_queue_batch_limit():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'email_queue_flush':",$off))!==false){
+        if(str_contains(substr($src,$p,400),'batch')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'email_queue_flush uses batch parameter':'email_queue_flush missing batch parameter'];
+}
+function test_email_retry_limit():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function send_queued_emails(',$off))!==false){
+        if(str_contains(substr($src,$p,400),'3')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'send_queued_emails() enforces max 3 attempts':'send_queued_emails() missing attempt limit'];
+}
+function test_email_sent_at_field():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function send_queued_emails(',$off))!==false){
+        if(str_contains(substr($src,$p,500),'sent_at')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'send_queued_emails() sets sent_at on success':'send_queued_emails() missing sent_at update'];
+}
+function test_email_body_html_field():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function queue_email(',$off))!==false){
+        if(str_contains(substr($src,$p,300),'body_html')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'queue_email() stores body_html column':'queue_email() missing body_html column'];
+}
+function test_queue_email_subject():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function queue_email(',$off))!==false){
+        if(str_contains(substr($src,$p,300),'subject')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'queue_email() accepts subject parameter':'queue_email() missing subject parameter'];
+}
+
+// ================================================================
+// § SPRINT 23 TESTS — User Events
+// ================================================================
+function test_m_user_events_cols():array{
+    $cols=db()->query("PRAGMA table_info(user_events)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','user_id','event_type','entity_type','entity_id','detail_json','created_at'];
+    $missing=array_diff($need,$cols);
+    return['status'=>$missing?'FAIL':'PASS','msg'=>$missing?'user_events missing: '.implode(',',$missing):'user_events schema OK'];
+}
+function test_log_event_fn():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,'function log_event(int $user_id');
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'log_event() function defined':'log_event() function missing'];
+}
+function test_event_log_user_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'event_log_user':",$off))!==false){
+        if(str_contains(substr($src,$p,200),'is_user()')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'event_log_user guarded by is_user()':'event_log_user missing is_user() guard'];
+}
+function test_event_log_admin_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'event_log_admin':",$off))!==false){
+        if(str_contains(substr($src,$p,200),'is_admin()')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'event_log_admin guarded by is_admin()':'event_log_admin missing is_admin() guard'];
+}
+function test_user_events_admin_tab():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,"'user_events'=>'User Events'");
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'Admin User Events tab present':'Admin User Events tab missing'];
+}
+function test_user_events_idx_user():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,'idx_ue_user');
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'user_events has idx_ue_user index':'user_events missing idx_ue_user index'];
+}
+function test_user_events_idx_type():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,'idx_ue_type');
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'user_events has idx_ue_type index':'user_events missing idx_ue_type index'];
+}
+function test_user_events_entity_type():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function log_event(',$off))!==false){
+        if(str_contains(substr($src,$p,300),'entity_type')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'log_event() accepts entity_type param':'log_event() missing entity_type param'];
+}
+function test_user_events_detail_json():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function log_event(',$off))!==false){
+        if(str_contains(substr($src,$p,400),'detail_json')||str_contains(substr($src,$p,400),'json_encode')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'log_event() stores detail as JSON':'log_event() missing JSON detail storage'];
+}
+function test_user_events_cascade():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,'user_events')&&str_contains($src,'ON DELETE CASCADE');
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'user_events.user_id has ON DELETE CASCADE':'user_events missing ON DELETE CASCADE on user_id'];
+}
+function test_event_log_user_limit():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'event_log_user':",$off))!==false){
+        if(str_contains(substr($src,$p,500),'100')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'event_log_user enforces LIMIT 100':'event_log_user missing LIMIT clause'];
+}
+function test_event_log_admin_limit():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'event_log_admin':",$off))!==false){
+        if(str_contains(substr($src,$p,400),'200')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'event_log_admin enforces LIMIT 200':'event_log_admin missing LIMIT clause'];
+}
+
+// ================================================================
+// § SPRINT 24 TESTS — Data Archival
+// ================================================================
+function test_m_archived_recalls_cols():array{
+    $cols=db()->query("PRAGMA table_info(archived_recalls)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','original_id','snapshot_json','archived_at','reason'];
+    $missing=array_diff($need,$cols);
+    return['status'=>$missing?'FAIL':'PASS','msg'=>$missing?'archived_recalls missing: '.implode(',',$missing):'archived_recalls schema OK'];
+}
+function test_archive_old_recalls_fn():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,'function archive_old_recalls(int $days');
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'archive_old_recalls() function defined':'archive_old_recalls() function missing'];
+}
+function test_archive_run_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'archive_run':",$off))!==false){
+        if(str_contains(substr($src,$p,200),'is_admin()')&&str_contains(substr($src,$p,200),'csrf_ok()')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'archive_run guarded by is_admin()+csrf_ok()':'archive_run missing admin+CSRF guard'];
+}
+function test_archive_list_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'archive_list':",$off))!==false){
+        if(str_contains(substr($src,$p,200),'is_admin()')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'archive_list guarded by is_admin()':'archive_list missing is_admin() guard'];
+}
+function test_archive_admin_tab():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,"'archive'=>'Archive'");
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'Admin Archive tab present':'Admin Archive tab missing'];
+}
+function test_archive_retention_days():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function archive_old_recalls(',$off))!==false){
+        if(str_contains(substr($src,$p,300),'days')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'archive_old_recalls() accepts configurable days param':'archive_old_recalls() missing days parameter'];
+}
+function test_archive_snapshot_json():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function archive_old_recalls(',$off))!==false){
+        if(str_contains(substr($src,$p,600),'snapshot_json')||str_contains(substr($src,$p,600),'json_encode')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'archive_old_recalls() stores full snapshot as JSON':'archive_old_recalls() missing snapshot_json storage'];
+}
+function test_archive_reason_field():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function archive_old_recalls(',$off))!==false){
+        if(str_contains(substr($src,$p,600),'retention_policy')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'archive_old_recalls() stores retention_policy reason':'archive_old_recalls() missing reason field'];
+}
+function test_archive_original_id():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function archive_old_recalls(',$off))!==false){
+        if(str_contains(substr($src,$p,600),'original_id')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'archive_old_recalls() stores original_id':'archive_old_recalls() missing original_id'];
+}
+function test_archive_index():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,'idx_ar_orig');
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'archived_recalls has idx_ar_orig index on original_id':'archived_recalls missing idx_ar_orig index'];
+}
+function test_archive_status_filter():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function archive_old_recalls(',$off))!==false){
+        if(str_contains(substr($src,$p,400),'completed')&&str_contains(substr($src,$p,400),'status')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'archive_old_recalls() filters by completed/closed/resolved status':'archive_old_recalls() missing status filter'];
+}
+function test_archive_dedup():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function archive_old_recalls(',$off))!==false){
+        if(str_contains(substr($src,$p,800),'OR IGNORE')||str_contains(substr($src,$p,800),'EXISTS')||str_contains(substr($src,$p,800),'skipped')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'archive_old_recalls() avoids duplicate archival':'archive_old_recalls() missing dedup logic'];
+}
+
+// ================================================================
+// § SPRINT 25 TESTS — API Playground
+// ================================================================
+function test_view_playground_fn():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,'function view_playground():void');
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'view_playground() function defined':'view_playground() function missing'];
+}
+function test_playground_route():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'playground':",$off))!==false){
+        if(str_contains(substr($src,$p,100),'render_page')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'playground route dispatches via render_page':'playground route missing'];
+}
+function test_playground_nav_link():array{
+    $src=file_get_contents(__FILE__);
+    $found=str_contains($src,"page=playground");
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'Playground nav link present':'Playground nav link missing'];
+}
+function test_playground_endpoints_list():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function view_playground()',$off))!==false){
+        $block=substr($src,$p,2000);
+        if(str_contains($block,'recalls')&&str_contains($block,'health')&&str_contains($block,'stats')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'Playground lists recalls, health, stats endpoints':'Playground missing key endpoint options'];
+}
+function test_playground_curl_preview():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function view_playground()',$off))!==false){
+        if(str_contains(substr($src,$p,3000),'curl')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'Playground shows curl equivalent':'Playground missing curl preview'];
+}
+function test_playground_fts_support():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function view_playground()',$off))!==false){
+        if(str_contains(substr($src,$p,2000),'search_fts')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'Playground includes search_fts endpoint':'Playground missing FTS endpoint'];
+}
+function test_playground_params_builder():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function view_playground()',$off))!==false){
+        if(str_contains(substr($src,$p,3000),'buildUrl')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'Playground has buildUrl() parameter builder':'Playground missing buildUrl() function'];
+}
+function test_playground_response_area():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function view_playground()',$off))!==false){
+        $block=substr($src,$p,4000);
+        if(str_contains($block,'response')&&str_contains($block,'JSON.stringify')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'Playground has JSON response area':'Playground missing JSON response display'];
+}
+function test_playground_status_badge():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function view_playground()',$off))!==false){
+        if(str_contains(substr($src,$p,4000),'statusCode')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'Playground shows HTTP status code badge':'Playground missing status code display'];
+}
+function test_playground_apikey_field():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function view_playground()',$off))!==false){
+        if(str_contains(substr($src,$p,4000),'apiKey')||str_contains(substr($src,$p,4000),'api_key')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'Playground has API key input field':'Playground missing API key field'];
+}
+function test_playground_elapsed_ms():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function view_playground()',$off))!==false){
+        if(str_contains(substr($src,$p,4000),'elapsed')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'Playground shows request elapsed time':'Playground missing elapsed time display'];
+}
+function test_playground_execute_btn():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,'function view_playground()',$off))!==false){
+        if(str_contains(substr($src,$p,5000),'Execute')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'Playground has Execute Request button':'Playground missing Execute button'];
+}
+
+// ================================================================
 // § SPRINT 16 TESTS — Bulk Import
 // ================================================================
 function test_m_import_jobs_cols():array{
@@ -5364,6 +6028,7 @@ function route():void{
         case 'tags':          render_page('tags');break;
         case 'shared':        render_page('shared');break;
         case 'status':        render_page('status');break;
+        case 'playground':    render_page('playground');break;
         case 'tests':         render_page('tests');break;
         case 'admin':         render_page('admin');break;
         default:              render_page('dashboard');
@@ -6120,6 +6785,61 @@ function handle_api(string $api):void{
                 $uid_au=(int)current_user()['id'];
                 $au=db()->prepare("SELECT resource,COUNT(*) as requests,AVG(latency_ms) as avg_ms,SUM(CASE WHEN status_code>=400 THEN 1 ELSE 0 END) as errors FROM api_usage_log WHERE key_id IN (SELECT id FROM api_keys WHERE user_id=? AND revoked=0) GROUP BY resource ORDER BY requests DESC LIMIT 50");
                 $au->execute([$uid_au]);echo js($au->fetchAll());break;
+            // ----------------------------------------------------------------
+            // Sprint 21: FTS Search
+            // ----------------------------------------------------------------
+            case 'fts_rebuild':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                echo js(['rebuilt'=>fts_rebuild(),'ok'=>true]);break;
+            case 'search_fts':
+                $q_fts=trim($_GET['q']??'');
+                if($q_fts===''){echo js([]);break;}
+                $q_fts_safe=str_replace(['"',"'",'*'],'',$q_fts).'*';
+                $lim_fts=min(50,(int)($_GET['limit']??20));
+                try{
+                    $fts_st=db()->prepare("SELECT f.rowid as id,snippet(fts_recalls,-1,'<b>','</b>','…',20) as snippet,r.title,r.status,r.severity,r.announced_date FROM fts_recalls f JOIN recalls r ON r.id=f.rowid WHERE fts_recalls MATCH ? ORDER BY rank LIMIT ?");
+                    $fts_st->execute([$q_fts_safe,$lim_fts]);
+                    echo js($fts_st->fetchAll(\PDO::FETCH_ASSOC));
+                }catch(\Throwable $e){echo js(['error'=>$e->getMessage()]);}
+                break;
+            // ----------------------------------------------------------------
+            // Sprint 22: Email Queue
+            // ----------------------------------------------------------------
+            case 'email_queue_list':
+                if(!is_admin())fw_abort('Forbidden',403);
+                $eq_page=max(1,(int)($_GET['page']??1));$eq_per=min(100,(int)($_GET['per']??50));$eq_off=($eq_page-1)*$eq_per;
+                $eq_q=db()->query("SELECT id,to_address,subject,status,attempts,queued_at,sent_at FROM email_queue ORDER BY queued_at DESC LIMIT $eq_per OFFSET $eq_off")->fetchAll(\PDO::FETCH_ASSOC);
+                echo js($eq_q);break;
+            case 'email_queue_flush':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                $batch_eq=min(50,(int)($_POST['batch']??10));
+                echo js(array_merge(send_queued_emails($batch_eq),['ok'=>true]));break;
+            // ----------------------------------------------------------------
+            // Sprint 23: User Events / Activity
+            // ----------------------------------------------------------------
+            case 'event_log_user':
+                if(!is_user())fw_abort('Not authenticated',401);
+                $uid_ev=(int)current_user()['id'];
+                $ev_page=max(1,(int)($_GET['page']??1));$ev_per=min(100,(int)($_GET['per']??50));$ev_off=($ev_page-1)*$ev_per;
+                $ev_st=db()->prepare("SELECT id,event_type,entity_type,entity_id,detail_json,created_at FROM user_events WHERE user_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?");
+                $ev_st->execute([$uid_ev,$ev_per,$ev_off]);echo js($ev_st->fetchAll(\PDO::FETCH_ASSOC));break;
+            case 'event_log_admin':
+                if(!is_admin())fw_abort('Forbidden',403);
+                $ev_adm=db()->query("SELECT ue.id,ue.user_id,u.email,ue.event_type,ue.entity_type,ue.entity_id,ue.detail_json,ue.created_at FROM user_events ue LEFT JOIN users u ON u.id=ue.user_id ORDER BY ue.created_at DESC LIMIT 200")->fetchAll(\PDO::FETCH_ASSOC);
+                echo js($ev_adm);break;
+            // ----------------------------------------------------------------
+            // Sprint 24: Archival
+            // ----------------------------------------------------------------
+            case 'archive_run':
+                if(!is_admin()||!csrf_ok())fw_abort('Forbidden',403);
+                $arch_days=max(365,min(3650,(int)($_POST['days']??730)));
+                echo js(array_merge(archive_old_recalls($arch_days),['ok'=>true]));break;
+            case 'archive_list':
+                if(!is_admin())fw_abort('Forbidden',403);
+                $ar_page=max(1,(int)($_GET['page']??1));$ar_per=min(100,(int)($_GET['per']??50));$ar_off=($ar_page-1)*$ar_per;
+                $ar_q=db()->query("SELECT id,original_id,reason,archived_at,length(snapshot_json) as snap_bytes FROM archived_recalls ORDER BY archived_at DESC LIMIT $ar_per OFFSET $ar_off")->fetchAll(\PDO::FETCH_ASSOC);
+                $ar_total=(int)db()->query("SELECT COUNT(*) FROM archived_recalls")->fetchColumn();
+                echo js(['total'=>$ar_total,'page'=>$ar_page,'per'=>$ar_per,'rows'=>$ar_q]);break;
             case 'v1':
                 $auth=$_SERVER['HTTP_AUTHORIZATION']??'';
                 $raw_key=str_starts_with($auth,'Bearer ')?trim(substr($auth,7)):trim($_GET['api_key']??'');
@@ -6397,6 +7117,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc}
     <a href="?page=tags" class="fw-nav-link <?=$page==='tags'?'active':''?>"><i data-lucide="tags" class="w-4 h-4"></i>My Tags</a>
     <a href="?page=account" class="fw-nav-link <?=$page==='account'?'active':''?>"><i data-lucide="user" class="w-4 h-4"></i><?=is_user()?h(current_user()['email']):'Account'?></a>
     <div class="border-t border-slate-700 my-2 pt-2">
+      <a href="?page=playground" class="fw-nav-link <?=$page==='playground'?'active':''?>"><i data-lucide="terminal" class="w-4 h-4"></i>API Playground</a>
       <a href="?page=status" class="fw-nav-link <?=$page==='status'?'active':''?>"><i data-lucide="activity" class="w-4 h-4"></i>System Status</a>
       <a href="?page=tests" class="fw-nav-link <?=$page==='tests'?'active':''?>"><i data-lucide="check-circle" class="w-4 h-4"></i>Self-Tests</a>
       <a href="?page=admin" class="fw-nav-link <?=$page==='admin'?'active':''?>"><i data-lucide="settings" class="w-4 h-4"></i>Admin</a>
@@ -6459,6 +7180,7 @@ function render_page(string $p):void{
         'tags'          =>view_tags(),
         'shared'        =>view_shared(),
         'status'        =>view_status(),
+        'playground'    =>view_playground(),
         'tests'         =>view_tests(),
         'admin'         =>view_admin(),
         default         =>view_dashboard(),
@@ -8340,7 +9062,7 @@ function view_admin():void{
 
 <!-- Admin Tab Nav (GROUP 8) -->
 <div class="flex gap-0 border-b border-slate-200 mb-6 flex-wrap">
-  <?php foreach(['ingestion'=>'Ingestion','dq'=>'Data Quality','runs'=>'Run History','rate_limits'=>'Rate Limits','subscriptions'=>'Subscriptions','users'=>'Users','dbhealth'=>'DB Health','audit'=>'Audit','import'=>'Import','deliveries'=>'Deliveries','api_analytics'=>'API Analytics','health'=>'Health'] as $tv=>$tl): ?>
+  <?php foreach(['ingestion'=>'Ingestion','dq'=>'Data Quality','runs'=>'Run History','rate_limits'=>'Rate Limits','subscriptions'=>'Subscriptions','users'=>'Users','dbhealth'=>'DB Health','audit'=>'Audit','import'=>'Import','deliveries'=>'Deliveries','api_analytics'=>'API Analytics','health'=>'Health','email_queue'=>'Email Queue','user_events'=>'User Events','archive'=>'Archive'] as $tv=>$tl): ?>
   <a href="?page=admin&atab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$admin_tab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
   <?php endforeach; ?>
 </div>
@@ -8820,6 +9542,106 @@ $overall='ok';foreach($health_rows as $h){if($h['status']==='fail'){$overall='fa
   <?php endforeach; ?>
 </div>
 <?php endif; // health tab ?>
+
+<?php if($admin_tab==='email_queue'): ?>
+<!-- Email Queue tab (Sprint 22) -->
+<div x-data="{rows:[],loading:true,flushing:false,msg:''}"
+  x-init="fetch('?api=email_queue_list').then(r=>r.json()).then(d=>{rows=d;loading=false})">
+  <div class="flex items-center justify-between mb-4">
+    <h3 class="font-semibold text-slate-700">Outbound Email Queue</h3>
+    <button @click="flushing=true;fetch('?api=email_queue_flush',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',batch:'10'})}).then(r=>r.json()).then(d=>{msg='Flushed: '+d.sent+' sent, '+d.failed+' failed';flushing=false;fetch('?api=email_queue_list').then(r=>r.json()).then(dd=>rows=dd)})" :disabled="flushing" class="px-3 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700 disabled:opacity-50">
+      <span x-show="!flushing">Flush 10 Pending</span><span x-show="flushing">Sending…</span>
+    </button>
+  </div>
+  <div x-show="msg" class="mb-3 text-sm text-green-700 bg-green-50 border border-green-200 rounded px-3 py-2" x-text="msg"></div>
+  <div x-show="loading" class="text-sm text-slate-400 py-4 text-center animate-pulse">Loading…</div>
+  <div x-show="!loading&&rows.length===0" class="text-center py-8 text-slate-400 text-sm bg-white rounded-lg border border-slate-200">Queue is empty.</div>
+  <div x-show="!loading&&rows.length>0" class="bg-white border border-slate-200 rounded-lg overflow-hidden">
+    <table class="fw-table w-full">
+      <thead><tr><th>ID</th><th>To</th><th>Subject</th><th>Status</th><th>Attempts</th><th>Queued</th><th>Sent</th></tr></thead>
+      <tbody>
+        <template x-for="r in rows" :key="r.id">
+          <tr>
+            <td class="font-mono text-xs" x-text="r.id"></td>
+            <td class="text-xs" x-text="r.to_address"></td>
+            <td class="text-xs max-w-xs truncate" x-text="r.subject"></td>
+            <td><span :class="{'bg-green-100 text-green-700':r.status==='sent','bg-red-100 text-red-700':r.status==='failed','bg-amber-100 text-amber-700':r.status==='pending'}" class="px-2 py-0.5 rounded text-xs font-medium" x-text="r.status"></span></td>
+            <td class="text-xs text-center" x-text="r.attempts"></td>
+            <td class="text-xs whitespace-nowrap" x-text="r.queued_at?.substring(0,16)"></td>
+            <td class="text-xs whitespace-nowrap" x-text="r.sent_at?.substring(0,16)||'—'"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+<?php endif; // email_queue tab ?>
+
+<?php if($admin_tab==='user_events'): ?>
+<!-- User Events tab (Sprint 23) -->
+<div x-data="{rows:[],loading:true}" x-init="fetch('?api=event_log_admin').then(r=>r.json()).then(d=>{rows=d;loading=false})">
+  <h3 class="font-semibold text-slate-700 mb-4">Recent User Events</h3>
+  <div x-show="loading" class="text-sm text-slate-400 py-4 text-center animate-pulse">Loading…</div>
+  <div x-show="!loading&&rows.length===0" class="text-center py-8 text-slate-400 text-sm bg-white rounded-lg border border-slate-200">No events recorded.</div>
+  <div x-show="!loading&&rows.length>0" class="bg-white border border-slate-200 rounded-lg overflow-hidden">
+    <table class="fw-table w-full">
+      <thead><tr><th>ID</th><th>User</th><th>Event</th><th>Entity</th><th>Detail</th><th>When</th></tr></thead>
+      <tbody>
+        <template x-for="r in rows" :key="r.id">
+          <tr>
+            <td class="font-mono text-xs" x-text="r.id"></td>
+            <td class="text-xs" x-text="r.email||r.user_id"></td>
+            <td><span class="px-2 py-0.5 rounded text-xs font-medium bg-indigo-100 text-indigo-700" x-text="r.event_type"></span></td>
+            <td class="text-xs" x-text="r.entity_type+(r.entity_id?' #'+r.entity_id:'')"></td>
+            <td class="text-xs max-w-xs truncate text-slate-500" x-text="(()=>{try{const m=JSON.parse(r.detail_json||'{}');return Object.entries(m).map(([k,v])=>k+': '+v).join(' · ')||'—'}catch{return r.detail_json||'—'}})()" :title="r.detail_json"></td>
+            <td class="text-xs whitespace-nowrap" x-text="r.created_at?.substring(0,16)"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+<?php endif; // user_events tab ?>
+
+<?php if($admin_tab==='archive'): ?>
+<!-- Archive tab (Sprint 24) -->
+<div x-data="{rows:[],total:0,loading:true,running:false,days:730,msg:''}"
+  x-init="fetch('?api=archive_list').then(r=>r.json()).then(d=>{rows=d.rows;total=d.total;loading=false})">
+  <div class="flex items-center justify-between mb-4">
+    <div>
+      <h3 class="font-semibold text-slate-700">Recall Archive</h3>
+      <p class="text-xs text-slate-500 mt-0.5">Moves resolved recalls older than N days into the archive snapshot table.</p>
+    </div>
+    <div class="flex items-center gap-2">
+      <input type="number" x-model="days" min="365" max="3650" class="w-24 text-sm border border-slate-300 rounded px-2 py-1" placeholder="730">
+      <span class="text-xs text-slate-500">days retention</span>
+      <button @click="running=true;fetch('?api=archive_run',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',days:days})}).then(r=>r.json()).then(d=>{msg='Archived '+d.archived+' recalls (skipped '+d.skipped+', cutoff: '+d.cutoff+')';running=false;fetch('?api=archive_list').then(r=>r.json()).then(dd=>{rows=dd.rows;total=dd.total})})" :disabled="running" class="px-3 py-1.5 bg-red-600 text-white text-sm rounded hover:bg-red-700 disabled:opacity-50">
+        <span x-show="!running">Run Archive</span><span x-show="running">Running…</span>
+      </button>
+    </div>
+  </div>
+  <div x-show="msg" class="mb-3 text-sm text-green-700 bg-green-50 border border-green-200 rounded px-3 py-2" x-text="msg"></div>
+  <div class="mb-3 text-sm text-slate-600">Total archived recalls: <strong x-text="total"></strong></div>
+  <div x-show="loading" class="text-sm text-slate-400 py-4 text-center animate-pulse">Loading…</div>
+  <div x-show="!loading&&rows.length===0" class="text-center py-8 text-slate-400 text-sm bg-white rounded-lg border border-slate-200">No archived recalls yet.</div>
+  <div x-show="!loading&&rows.length>0" class="bg-white border border-slate-200 rounded-lg overflow-hidden">
+    <table class="fw-table w-full">
+      <thead><tr><th>Archive ID</th><th>Original ID</th><th>Reason</th><th>Snapshot Size</th><th>Archived At</th></tr></thead>
+      <tbody>
+        <template x-for="r in rows" :key="r.id">
+          <tr>
+            <td class="font-mono text-xs" x-text="r.id"></td>
+            <td class="font-mono text-xs" x-text="r.original_id"></td>
+            <td class="text-xs" x-text="r.reason"></td>
+            <td class="text-xs" x-text="Math.round(r.snap_bytes/1024)+' KB'"></td>
+            <td class="text-xs whitespace-nowrap" x-text="r.archived_at?.substring(0,16)"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+<?php endif; // archive tab ?>
 
 <?php layout_foot(); }
 
@@ -9570,6 +10392,149 @@ function view_status():void{
       <div><dt class="text-slate-500">SQLite</dt><dd class="font-mono font-medium"><?=\SQLite3::version()['versionString']??'n/a'?></dd></div>
     </dl>
   </div>
+</div>
+<?php layout_foot();
+}
+
+// ================================================================
+// § SPRINT 25 VIEW — API Playground
+// ================================================================
+
+function view_playground():void{
+    layout_head('API Playground','playground'); ?>
+<div class="mb-4">
+  <h1 class="text-lg font-bold text-slate-800 flex items-center gap-2"><i data-lucide="terminal" class="w-5 h-5 text-indigo-500"></i>API Playground</h1>
+  <p class="text-sm text-slate-500 mt-0.5">Explore the FoodWatch API interactively. Select an endpoint, set parameters, and execute requests.</p>
+</div>
+<div x-data="{
+  endpoint:'recalls',
+  params:{q:'',status:'all',state:'',category:'',severity:'',page:'1',per:'10'},
+  apiKey:'',
+  response:'',
+  loading:false,
+  elapsed:0,
+  statusCode:0,
+  curl:'',
+  endpoints:{
+    'recalls':'?api=recalls',
+    'stats':'?api=stats',
+    'search_fts':'?api=search_fts',
+    'health':'?api=health',
+    'risk_by_recall':'?api=risk_by_recall',
+    'rss':'?api=rss'
+  },
+  buildUrl(){
+    let base=this.endpoints[this.endpoint]||('?api='+this.endpoint);
+    const p=this.params;
+    if(this.endpoint==='recalls'||this.endpoint==='search_fts'){
+      if(p.q)base+='&q='+encodeURIComponent(p.q);
+      if(p.status&&p.status!=='all')base+='&status='+p.status;
+      if(p.state)base+='&state='+p.state;
+      if(p.severity)base+='&severity='+p.severity;
+      base+='&page='+(p.page||1)+'&per='+(p.per||10);
+    }
+    if(p.page&&this.endpoint==='archive_list')base+='&page='+(p.page||1);
+    return base;
+  },
+  async run(){
+    this.loading=true;this.response='';this.elapsed=0;this.statusCode=0;
+    const url=this.buildUrl();
+    const hdrs={'Accept':'application/json'};
+    if(this.apiKey)hdrs['Authorization']='Bearer '+this.apiKey;
+    this.curl='curl -s '+JSON.stringify(window.location.origin+url)+(this.apiKey?\" \\\n  -H 'Authorization: Bearer \"+this.apiKey+\"'\":'');
+    const t=performance.now();
+    try{
+      const r=await fetch(url,{headers:hdrs});
+      this.statusCode=r.status;this.elapsed=Math.round(performance.now()-t);
+      const txt=await r.text();
+      try{this.response=JSON.stringify(JSON.parse(txt),null,2);}catch{this.response=txt;}
+    }catch(e){this.response='Network error: '+e.message;}
+    this.loading=false;
+  }
+}" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+
+  <!-- Left: Controls -->
+  <div class="space-y-4">
+    <div class="bg-white border border-slate-200 rounded-lg p-4">
+      <label class="block text-xs font-semibold text-slate-600 mb-1.5 uppercase tracking-wide">Endpoint</label>
+      <select x-model="endpoint" class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:ring-2 focus:ring-indigo-300 focus:border-indigo-400">
+        <option value="recalls">GET ?api=recalls — Paginated recalls</option>
+        <option value="search_fts">GET ?api=search_fts — Full-text search</option>
+        <option value="stats">GET ?api=stats — Aggregate stats</option>
+        <option value="health">GET ?api=health — System health</option>
+        <option value="risk_by_recall">GET ?api=risk_by_recall — Risk score</option>
+        <option value="rss">GET ?api=rss — RSS 2.0 feed</option>
+      </select>
+    </div>
+
+    <div class="bg-white border border-slate-200 rounded-lg p-4 space-y-3">
+      <div class="text-xs font-semibold text-slate-600 uppercase tracking-wide">Parameters</div>
+      <template x-if="endpoint==='recalls'||endpoint==='search_fts'">
+        <div class="space-y-2">
+          <div>
+            <label class="block text-xs text-slate-500 mb-0.5">q (search term)</label>
+            <input type="text" x-model="params.q" class="w-full text-sm border border-slate-300 rounded px-2 py-1.5" placeholder="e.g. listeria, peanut">
+          </div>
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="block text-xs text-slate-500 mb-0.5">status</label>
+              <select x-model="params.status" class="w-full text-sm border border-slate-300 rounded px-2 py-1.5">
+                <option>all</option><option>ongoing</option><option>completed</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-xs text-slate-500 mb-0.5">severity</label>
+              <select x-model="params.severity" class="w-full text-sm border border-slate-300 rounded px-2 py-1.5">
+                <option value="">any</option><option>Class I</option><option>Class II</option><option>Class III</option>
+              </select>
+            </div>
+          </div>
+          <div class="grid grid-cols-2 gap-2">
+            <div><label class="block text-xs text-slate-500 mb-0.5">page</label><input type="number" x-model="params.page" min="1" class="w-full text-sm border border-slate-300 rounded px-2 py-1.5"></div>
+            <div><label class="block text-xs text-slate-500 mb-0.5">per</label><input type="number" x-model="params.per" min="1" max="100" class="w-full text-sm border border-slate-300 rounded px-2 py-1.5"></div>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <div class="bg-white border border-slate-200 rounded-lg p-4">
+      <label class="block text-xs font-semibold text-slate-600 mb-1.5 uppercase tracking-wide">API Key <span class="font-normal text-slate-400">(optional — for v1 resources)</span></label>
+      <input type="text" x-model="apiKey" placeholder="fw_..." class="w-full text-sm border border-slate-300 rounded px-2 py-1.5 font-mono">
+    </div>
+
+    <div class="flex items-center gap-3">
+      <button @click="run()" :disabled="loading" class="flex-1 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 disabled:opacity-50 flex items-center justify-center gap-2">
+        <i data-lucide="play" class="w-4 h-4"></i>
+        <span x-show="!loading">Execute Request</span><span x-show="loading">Loading…</span>
+      </button>
+    </div>
+
+    <!-- URL preview -->
+    <div class="bg-slate-800 text-slate-100 rounded-lg p-3 text-xs font-mono break-all" x-text="buildUrl()"></div>
+  </div>
+
+  <!-- Right: Response -->
+  <div class="space-y-4">
+    <div class="bg-white border border-slate-200 rounded-lg p-4 flex items-center gap-4 text-sm">
+      <div x-show="statusCode>0">
+        <span :class="{'text-green-700 bg-green-100':statusCode<300,'text-amber-700 bg-amber-100':statusCode>=300&&statusCode<500,'text-red-700 bg-red-100':statusCode>=500}" class="px-2 py-0.5 rounded font-mono font-bold text-xs" x-text="statusCode"></span>
+      </div>
+      <div x-show="elapsed>0" class="text-xs text-slate-500"><span x-text="elapsed"></span>ms</div>
+      <div x-show="!statusCode&&!loading" class="text-xs text-slate-400">Hit Execute to send a request</div>
+    </div>
+    <!-- curl snippet -->
+    <div x-show="curl" class="bg-slate-900 text-emerald-300 rounded-lg p-3 text-xs font-mono whitespace-pre-wrap break-all">
+      <div class="text-slate-500 mb-1 text-xs">curl equivalent:</div>
+      <span x-text="curl"></span>
+    </div>
+    <!-- JSON response -->
+    <div class="bg-slate-900 text-slate-100 rounded-lg p-4 text-xs font-mono overflow-auto max-h-[460px] whitespace-pre-wrap min-h-[120px]">
+      <div x-show="!response&&!loading" class="text-slate-500">// Response will appear here</div>
+      <div x-show="loading" class="text-slate-400 animate-pulse">// Fetching…</div>
+      <span x-show="response" x-text="response"></span>
+    </div>
+  </div>
+
 </div>
 <?php layout_foot();
 }
