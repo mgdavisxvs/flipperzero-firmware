@@ -9,8 +9,8 @@ declare(strict_types=1);
 // ================================================================
 // § CONSTANTS
 // ================================================================
-const FW_VERSION    = '4.0.1';
-const FW_SCHEMA_VER = 13;
+const FW_VERSION    = '4.1.0';
+const FW_SCHEMA_VER = 15;
 const FW_DATA_DIR   = __DIR__ . '/data';
 const FW_DB_PATH    = __DIR__ . '/data/foodwatch.db';
 const FW_LAMBDA     = 0.01;   // global daily decay fallback; per-category λ_c overrides via food_categories.lambda_decay
@@ -150,6 +150,68 @@ function admin_login(string $u,string $p):bool{
     if(hash_equals($eu,$u)&&hash_equals($ep,$p)){$_SESSION['fw_admin']=true;return true;}
     return false;
 }
+function current_user():?array{
+    $uid=(int)($_SESSION['fw_user_id']??0);
+    if(!$uid)return null;
+    static $cache=[];
+    if(isset($cache[$uid]))return $cache[$uid];
+    $s=db()->prepare('SELECT id,email,display_name,created_at FROM users WHERE id=?');
+    $s->execute([$uid]);
+    $cache[$uid]=$s->fetch()?:null;
+    return $cache[$uid];
+}
+function is_user():bool{ return current_user()!==null; }
+function user_register(string $email,string $pass):int|string{
+    $email=strtolower(trim($email));
+    if(!filter_var($email,FILTER_VALIDATE_EMAIL))return 'Invalid email address.';
+    if(strlen($pass)<8)return 'Password must be at least 8 characters.';
+    try{
+        $hash=password_hash($pass,PASSWORD_BCRYPT,['cost'=>12]);
+        db()->prepare('INSERT INTO users(email,password_hash)VALUES(?,?)')->execute([$email,$hash]);
+        return(int)db()->lastInsertId();
+    }catch(\Throwable){return 'An account with that email already exists.';}
+}
+function user_login(string $email,string $pass):bool{
+    $email=strtolower(trim($email));
+    $s=db()->prepare('SELECT id,password_hash FROM users WHERE email=?');
+    $s->execute([$email]);$row=$s->fetch();
+    if(!$row||!password_verify($pass,$row['password_hash']))return false;
+    $sid_old=session_id();
+    session_regenerate_id(true);
+    $_SESSION['fw_user_id']=(int)$row['id'];
+    db()->prepare("UPDATE users SET last_login=datetime('now') WHERE id=?")->execute([$row['id']]);
+    // Migrate anonymous watchlist entries to this account
+    db()->prepare("UPDATE watchlists SET user_id=? WHERE session_id=? AND user_id IS NULL")->execute([$row['id'],$sid_old]);
+    return true;
+}
+function user_logout():void{
+    unset($_SESSION['fw_user_id']);
+    session_regenerate_id(true);
+}
+function api_key_generate(int $user_id,string $label):array{
+    $raw='fw_'.bin2hex(random_bytes(24));
+    $prefix=substr($raw,0,10);
+    $hash=hash('sha256',$raw);
+    db()->prepare('INSERT INTO api_keys(user_id,key_prefix,key_hash,label)VALUES(?,?,?,?)')->execute([$user_id,$prefix,$hash,$label]);
+    return['id'=>(int)db()->lastInsertId(),'key'=>$raw,'prefix'=>$prefix];
+}
+function api_key_verify(string $raw):?array{
+    if(!str_starts_with($raw,'fw_'))return null;
+    $hash=hash('sha256',$raw);
+    $s=db()->prepare('SELECT id,user_id,rate_limit_hour FROM api_keys WHERE key_hash=? AND revoked=0');
+    $s->execute([$hash]);$row=$s->fetch();
+    if(!$row)return null;
+    db()->prepare("UPDATE api_keys SET last_used=datetime('now') WHERE id=?")->execute([$row['id']]);
+    return $row;
+}
+function api_key_rate_check(int $key_id,int $limit):bool{
+    $window=date('Y-m-d H');
+    db()->prepare("INSERT INTO api_rate_limits(key_id,window_hour,request_count)VALUES(?,?,1) ON CONFLICT(key_id,window_hour) DO UPDATE SET request_count=request_count+1")->execute([$key_id,$window]);
+    $s=db()->prepare('SELECT request_count FROM api_rate_limits WHERE key_id=? AND window_hour=?');
+    $s->execute([$key_id,$window]);
+    return(int)$s->fetchColumn()<=$limit;
+}
+
 function is_ajax():bool{
     return ($_SERVER['HTTP_X_REQUESTED_WITH']??'')==='XMLHttpRequest'
         || str_contains($_SERVER['HTTP_ACCEPT']??'','application/json');
@@ -207,7 +269,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -489,6 +551,50 @@ SQL; }
 
 function m13():string{ return <<<'SQL'
 ALTER TABLE subscriptions ADD COLUMN confirm_sent_at TEXT;
+SQL; }
+
+function m14():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS users(
+  id INTEGER PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  display_name TEXT,
+  created_at TEXT NOT NULL DEFAULT(datetime('now')),
+  last_login TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
+CREATE TABLE IF NOT EXISTS api_keys(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  key_prefix TEXT NOT NULL,
+  key_hash TEXT NOT NULL UNIQUE,
+  label TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT(datetime('now')),
+  last_used TEXT,
+  rate_limit_hour INTEGER NOT NULL DEFAULT 100,
+  revoked INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS idx_apikeys_user ON api_keys(user_id);
+CREATE INDEX IF NOT EXISTS idx_apikeys_hash ON api_keys(key_hash);
+
+CREATE TABLE IF NOT EXISTS api_rate_limits(
+  key_id INTEGER NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+  window_hour TEXT NOT NULL,
+  request_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(key_id,window_hour));
+
+CREATE TABLE IF NOT EXISTS saved_filters(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  filter_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_sf_user ON saved_filters(user_id);
+SQL; }
+
+function m15():string{ return <<<'SQL'
+ALTER TABLE watchlists ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_wl_user ON watchlists(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wl_user_unique ON watchlists(user_id,watch_type,watch_value) WHERE user_id IS NOT NULL;
 SQL; }
 
 // ================================================================
@@ -1915,6 +2021,7 @@ function route():void{
         case 'markov_admin':  render_page('markov_admin');break;
         case 'search':        render_page('search');break;
         case 'watchlist':     render_page('watchlist');break;
+        case 'account':       render_page('account');break;
         case 'tests':         render_page('tests');break;
         case 'admin':         render_page('admin');break;
         default:              render_page('dashboard');
@@ -1948,16 +2055,32 @@ function handle_api(string $api):void{
                 rescore_all();echo js(['ok'=>true]);break;
             case 'watchlist_add':
                 if(!csrf_ok())fw_abort('CSRF',403);
-                $sid=session_id();
-                db()->prepare('INSERT OR IGNORE INTO watchlists(session_id,watch_type,watch_value,watch_label)VALUES(?,?,?,?)')->execute([$sid,$_POST['type']??'',$_POST['value']??'',$_POST['label']??'']);
+                $wt=$_POST['type']??'';$wv=$_POST['value']??'';$wl=$_POST['label']??'';
+                if(is_user()){
+                    $uid=current_user()['id'];
+                    db()->prepare('INSERT OR IGNORE INTO watchlists(user_id,session_id,watch_type,watch_value,watch_label)VALUES(?,?,?,?,?)')->execute([$uid,session_id(),$wt,$wv,$wl]);
+                }else{
+                    db()->prepare('INSERT OR IGNORE INTO watchlists(session_id,watch_type,watch_value,watch_label)VALUES(?,?,?,?)')->execute([session_id(),$wt,$wv,$wl]);
+                }
                 echo js(['ok'=>true]);break;
             case 'watchlist_del':
                 if(!csrf_ok())fw_abort('CSRF',403);
-                db()->prepare('DELETE FROM watchlists WHERE session_id=? AND watch_type=? AND watch_value=?')->execute([session_id(),$_POST['type']??'',$_POST['value']??'']);
+                $wt=$_POST['type']??'';$wv=$_POST['value']??'';
+                if(is_user()){
+                    db()->prepare('DELETE FROM watchlists WHERE user_id=? AND watch_type=? AND watch_value=?')->execute([current_user()['id'],$wt,$wv]);
+                }else{
+                    db()->prepare('DELETE FROM watchlists WHERE session_id=? AND watch_type=? AND watch_value=?')->execute([session_id(),$wt,$wv]);
+                }
                 echo js(['ok'=>true]);break;
             case 'watchlist':
-                $stmt=db()->prepare('SELECT * FROM watchlists WHERE session_id=? ORDER BY created_at DESC');
-                $stmt->execute([session_id()]);echo js($stmt->fetchAll());break;
+                if(is_user()){
+                    $stmt=db()->prepare('SELECT * FROM watchlists WHERE user_id=? ORDER BY created_at DESC');
+                    $stmt->execute([current_user()['id']]);
+                }else{
+                    $stmt=db()->prepare('SELECT * FROM watchlists WHERE session_id=? ORDER BY created_at DESC');
+                    $stmt->execute([session_id()]);
+                }
+                echo js($stmt->fetchAll());break;
             case 'runs':     if(!is_admin())fw_abort('Unauthorized',403);echo js(q_runs(20));break;
             case 'dq':       if(!is_admin())fw_abort('Unauthorized',403);
                 $stmt=db()->query('SELECT flag_type,severity,COUNT(*) as cnt FROM data_quality_flags WHERE resolved=0 GROUP BY flag_type,severity ORDER BY cnt DESC');
@@ -2060,6 +2183,70 @@ function handle_api(string $api):void{
                 }
                 echo '</tbody></table><script>window.print()</script></body></html>';
                 exit;
+            case 'user_register':
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $res=user_register($_POST['email']??'',$_POST['password']??'');
+                if(is_int($res)){$_SESSION['fw_user_id']=$res;echo js(['ok'=>true]);}
+                else echo js(['ok'=>false,'error'=>$res]);break;
+            case 'user_login':
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $ok=user_login($_POST['email']??'',$_POST['password']??'');
+                echo js(['ok'=>$ok,'error'=>$ok?null:'Invalid email or password.']);break;
+            case 'user_logout':
+                if(!csrf_ok())fw_abort('CSRF',403);
+                user_logout();echo js(['ok'=>true]);break;
+            case 'filter_save':
+                if(!csrf_ok())fw_abort('CSRF',403);
+                if(!is_user())fw_abort('Login required',401);
+                $fj=trim($_POST['filter_json']??'{}');
+                json_decode($fj);if(json_last_error())fw_abort('Invalid filter JSON',400);
+                db()->prepare('INSERT INTO saved_filters(user_id,name,filter_json)VALUES(?,?,?)')->execute([current_user()['id'],trim($_POST['name']??'Saved filter'),$fj]);
+                echo js(['ok'=>true,'id'=>(int)db()->lastInsertId()]);break;
+            case 'filter_del':
+                if(!csrf_ok())fw_abort('CSRF',403);
+                if(!is_user())fw_abort('Login required',401);
+                db()->prepare('DELETE FROM saved_filters WHERE id=? AND user_id=?')->execute([(int)($_POST['id']??0),current_user()['id']]);
+                echo js(['ok'=>true]);break;
+            case 'filters_list':
+                if(!is_user())fw_abort('Login required',401);
+                $s=db()->prepare('SELECT id,name,filter_json,created_at FROM saved_filters WHERE user_id=? ORDER BY created_at DESC');
+                $s->execute([current_user()['id']]);echo js($s->fetchAll());break;
+            case 'key_create':
+                if(!csrf_ok())fw_abort('CSRF',403);
+                if(!is_user())fw_abort('Login required',401);
+                $uid_kc=current_user()['id'];
+                $sc=db()->prepare('SELECT COUNT(*) FROM api_keys WHERE user_id=? AND revoked=0');
+                $sc->execute([$uid_kc]);
+                if((int)$sc->fetchColumn()>=5)fw_abort('Maximum 5 active API keys per account',400);
+                $kresult=api_key_generate($uid_kc,trim($_POST['label']??'My key'));
+                echo js(['ok'=>true,'key'=>$kresult['key'],'prefix'=>$kresult['prefix'],'id'=>$kresult['id']]);break;
+            case 'key_del':
+                if(!csrf_ok())fw_abort('CSRF',403);
+                if(!is_user())fw_abort('Login required',401);
+                db()->prepare('UPDATE api_keys SET revoked=1 WHERE id=? AND user_id=?')->execute([(int)($_POST['id']??0),current_user()['id']]);
+                echo js(['ok'=>true]);break;
+            case 'keys_list':
+                if(!is_user())fw_abort('Login required',401);
+                $s=db()->prepare('SELECT id,key_prefix,label,created_at,last_used,rate_limit_hour FROM api_keys WHERE user_id=? AND revoked=0 ORDER BY created_at DESC');
+                $s->execute([current_user()['id']]);echo js($s->fetchAll());break;
+            case 'v1':
+                $auth=$_SERVER['HTTP_AUTHORIZATION']??'';
+                $raw_key=str_starts_with($auth,'Bearer ')?trim(substr($auth,7)):trim($_GET['api_key']??'');
+                if(!$raw_key)fw_abort('API key required. Pass ?api_key=fw_... or Authorization: Bearer fw_...',401);
+                $krow=api_key_verify($raw_key);
+                if(!$krow)fw_abort('Invalid or revoked API key.',401);
+                if(!api_key_rate_check((int)$krow['id'],(int)$krow['rate_limit_hour']))
+                    fw_abort('Rate limit exceeded — '.(int)$krow['rate_limit_hour'].' req/hour',429);
+                $res_v1=$_GET['resource']??'';$id_v1=(int)($_GET['id']??0);
+                switch($res_v1){
+                    case 'recalls':
+                        echo js($id_v1?q_recall($id_v1):q_recalls((int)($_GET['page']??1),(int)($_GET['per']??25),['status'=>$_GET['status']??'all','q'=>$_GET['q']??'','category'=>$_GET['category']??'','state'=>$_GET['state']??'']));break;
+                    case 'retailers': echo js(q_retailers($_GET['sort']??'risk',$_GET['state']??''));break;
+                    case 'categories':echo js(q_category_stats());break;
+                    case 'stats':     echo js(q_stats($_GET['state']??''));break;
+                    default: fw_abort('Unknown v1 resource',404);
+                }
+                exit;
             default:         fw_abort('Unknown API endpoint',404);
         }
     }catch(\Throwable $e){
@@ -2143,12 +2330,16 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc}
     <a href="?page=markov_admin" class="fw-nav-link <?=$page==='markov_admin'?'active':''?>"><i data-lucide="activity" class="w-4 h-4"></i>Model Diagnostics</a>
     <a href="?page=search" class="fw-nav-link <?=$page==='search'?'active':''?>"><i data-lucide="search" class="w-4 h-4"></i>Search</a>
     <a href="?page=watchlist" class="fw-nav-link <?=$page==='watchlist'?'active':''?>"><i data-lucide="bell" class="w-4 h-4"></i>Watchlist</a>
+    <a href="?page=account" class="fw-nav-link <?=$page==='account'?'active':''?>"><i data-lucide="user" class="w-4 h-4"></i><?=is_user()?h(current_user()['email']):'Account'?></a>
     <div class="border-t border-slate-700 my-2 pt-2">
       <a href="?page=tests" class="fw-nav-link <?=$page==='tests'?'active':''?>"><i data-lucide="check-circle" class="w-4 h-4"></i>Self-Tests</a>
       <a href="?page=admin" class="fw-nav-link <?=$page==='admin'?'active':''?>"><i data-lucide="settings" class="w-4 h-4"></i>Admin</a>
     </div>
   </div>
-  <div class="p-3 border-t border-slate-700 text-xs text-slate-500">v<?=FW_VERSION?></div>
+  <div class="p-3 border-t border-slate-700 text-xs text-slate-500 flex items-center justify-between">
+    <span>v<?=FW_VERSION?></span>
+    <?php if(is_user()):?><span class="text-green-400 flex items-center gap-1"><i data-lucide="circle" class="w-2 h-2"></i>Signed in</span><?php endif;?>
+  </div>
 </nav>
 <!-- Main content -->
 <main class="md:ml-56 flex-1 min-h-full">
@@ -2192,6 +2383,7 @@ function render_page(string $p):void{
         'markov_admin'  =>view_markov_admin(),
         'search'        =>view_search(),
         'watchlist'     =>view_watchlist(),
+        'account'       =>view_account(),
         'tests'         =>view_tests(),
         'admin'         =>view_admin(),
         default         =>view_dashboard(),
@@ -2989,8 +3181,14 @@ function view_search():void{
 
 function view_watchlist():void{
     $sid=session_id();
-    $stmt=db()->prepare('SELECT * FROM watchlists WHERE session_id=? ORDER BY created_at DESC');
-    $stmt->execute([$sid]);$items=$stmt->fetchAll();
+    if(is_user()){
+        $stmt=db()->prepare('SELECT * FROM watchlists WHERE user_id=? ORDER BY created_at DESC');
+        $stmt->execute([current_user()['id']]);
+    }else{
+        $stmt=db()->prepare('SELECT * FROM watchlists WHERE session_id=? ORDER BY created_at DESC');
+        $stmt->execute([$sid]);
+    }
+    $items=$stmt->fetchAll();
 
     // Markov system outlook for watchlist context
     $markov_est=markov_estimate_matrix();
@@ -3246,6 +3444,217 @@ function view_admin():void{
     </tbody>
   </table>
 </div>
+<?php endif; ?>
+<?php layout_foot(); }
+
+// ================================================================
+// § ACCOUNT (Sprint 4)
+// ================================================================
+function view_account():void{
+    // Handle logout
+    if(($_GET['logout']??'')&&csrf_ok()){user_logout();header('Location: ?page=account');exit;}
+
+    $user=current_user();
+    $tab=$_GET['tab']??($user?'overview':'login');
+
+    layout_head($user?'My Account':'Sign In','account'); ?>
+
+<?php if(!$user): ?>
+<!-- Auth panel — login / register tabs -->
+<div class="max-w-md mx-auto mt-6" x-data="{tab:'<?=h($tab==='register'?'register':'login')?>',err:'',loading:false}">
+  <div class="flex border border-slate-200 rounded-lg overflow-hidden mb-6">
+    <button @click="tab='login'" :class="tab==='login'?'bg-fw-500 text-white':'bg-white text-slate-600 hover:bg-slate-50'" class="flex-1 py-2.5 text-sm font-medium transition-colors">Sign In</button>
+    <button @click="tab='register'" :class="tab==='register'?'bg-fw-500 text-white':'bg-white text-slate-600 hover:bg-slate-50'" class="flex-1 py-2.5 text-sm font-medium transition-colors">Create Account</button>
+  </div>
+
+  <!-- Login form -->
+  <div x-show="tab==='login'" class="bg-white rounded-lg border border-slate-200 shadow-sm p-6">
+    <h2 class="text-base font-semibold text-slate-800 mb-4">Sign in to FoodWatch</h2>
+    <form @submit.prevent="loading=true;err='';fetch('?api=user_login',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',email:$el.email.value,password:$el.password.value})}).then(r=>r.json()).then(d=>{loading=false;if(d.ok)location.href='?page=account';else err=d.error||'Login failed.'}).catch(()=>{loading=false;err='Network error.'})">
+      <div class="space-y-4">
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Email</label>
+          <input name="email" type="email" required autocomplete="email" class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500">
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Password</label>
+          <input name="password" type="password" required autocomplete="current-password" class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500">
+        </div>
+        <p x-show="err" x-text="err" class="text-xs text-red-600"></p>
+        <button type="submit" :disabled="loading" class="w-full bg-fw-500 text-white text-sm py-2.5 rounded font-medium hover:bg-fw-700 disabled:opacity-50 flex items-center justify-center gap-2">
+          <span x-show="!loading">Sign In</span><span x-show="loading">Signing in…</span>
+        </button>
+      </div>
+    </form>
+  </div>
+
+  <!-- Register form -->
+  <div x-show="tab==='register'" class="bg-white rounded-lg border border-slate-200 shadow-sm p-6">
+    <h2 class="text-base font-semibold text-slate-800 mb-4">Create a free account</h2>
+    <p class="text-xs text-slate-500 mb-4">Save watchlists, create API keys, and store search filters across sessions.</p>
+    <form @submit.prevent="loading=true;err='';fetch('?api=user_register',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',email:$el.email.value,password:$el.password.value})}).then(r=>r.json()).then(d=>{loading=false;if(d.ok)location.href='?page=account';else err=d.error||'Registration failed.'}).catch(()=>{loading=false;err='Network error.'})">
+      <div class="space-y-4">
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Email</label>
+          <input name="email" type="email" required autocomplete="email" class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500">
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">Password <span class="text-slate-400 font-normal">(min 8 chars)</span></label>
+          <input name="password" type="password" required minlength="8" autocomplete="new-password" class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500">
+        </div>
+        <p x-show="err" x-text="err" class="text-xs text-red-600"></p>
+        <button type="submit" :disabled="loading" class="w-full bg-fw-500 text-white text-sm py-2.5 rounded font-medium hover:bg-fw-700 disabled:opacity-50 flex items-center justify-center gap-2">
+          <span x-show="!loading">Create Account</span><span x-show="loading">Creating…</span>
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<?php else: ?>
+<!-- Logged-in account dashboard -->
+<div class="flex items-center justify-between mb-6">
+  <div>
+    <h2 class="text-base font-semibold text-slate-800"><?=h($user['email'])?></h2>
+    <p class="text-xs text-slate-500">Member since <?=h(substr($user['created_at'],0,10))?></p>
+  </div>
+  <form method="post" action="?page=account&logout=1">
+    <input type="hidden" name="csrf" value="<?=csrf()?>">
+    <button type="submit" onclick="return fetch('?api=user_logout',{method:'POST',body:new URLSearchParams({csrf:'<?=csrf()?>'}),headers:{'X-CSRF-Token':'<?=csrf()?>'}}).then(()=>location.href='?page=account'),false" class="text-xs text-slate-500 hover:text-red-600 flex items-center gap-1"><i data-lucide="log-out" class="w-3 h-3"></i>Sign out</button>
+  </form>
+</div>
+
+<!-- Tab nav -->
+<?php $atab=$_GET['tab']??'overview'; ?>
+<div class="flex gap-0 border-b border-slate-200 mb-6">
+  <?php foreach(['overview'=>'Overview','filters'=>'Saved Filters','keys'=>'API Keys'] as $tv=>$tl): ?>
+  <a href="?page=account&tab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$atab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
+  <?php endforeach; ?>
+</div>
+
+<?php if($atab==='overview'): ?>
+<!-- Overview tab -->
+<div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="bell" class="w-4 h-4"></i>Watchlist</h3>
+    <?php
+      $s=db()->prepare('SELECT COUNT(*) FROM watchlists WHERE user_id=?');$s->execute([$user['id']]);$wc=(int)$s->fetchColumn();
+    ?>
+    <p class="text-2xl font-bold text-slate-800"><?=$wc?></p>
+    <p class="text-xs text-slate-500 mb-3">items tracked</p>
+    <a href="?page=watchlist" class="text-xs text-fw-500 hover:underline">Manage watchlist →</a>
+  </div>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="filter" class="w-4 h-4"></i>Saved Filters</h3>
+    <?php
+      $s=db()->prepare('SELECT COUNT(*) FROM saved_filters WHERE user_id=?');$s->execute([$user['id']]);$fc=(int)$s->fetchColumn();
+    ?>
+    <p class="text-2xl font-bold text-slate-800"><?=$fc?></p>
+    <p class="text-xs text-slate-500 mb-3">search presets</p>
+    <a href="?page=account&tab=filters" class="text-xs text-fw-500 hover:underline">Manage filters →</a>
+  </div>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="key" class="w-4 h-4"></i>API Keys</h3>
+    <?php
+      $s=db()->prepare('SELECT COUNT(*) FROM api_keys WHERE user_id=? AND revoked=0');$s->execute([$user['id']]);$kc=(int)$s->fetchColumn();
+    ?>
+    <p class="text-2xl font-bold text-slate-800"><?=$kc?></p>
+    <p class="text-xs text-slate-500 mb-3">active keys (max 5)</p>
+    <a href="?page=account&tab=keys" class="text-xs text-fw-500 hover:underline">Manage keys →</a>
+  </div>
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="code" class="w-4 h-4"></i>REST API v1</h3>
+    <p class="text-xs text-slate-600 mb-2">Base: <code class="font-mono bg-slate-100 px-1 rounded">?api=v1&resource=recalls</code></p>
+    <p class="text-xs text-slate-500">Auth: <code class="font-mono">Authorization: Bearer fw_…</code><br>or <code class="font-mono">?api_key=fw_…</code></p>
+    <p class="text-xs text-slate-500 mt-1">Resources: <code class="font-mono">recalls</code> · <code class="font-mono">retailers</code> · <code class="font-mono">categories</code> · <code class="font-mono">stats</code></p>
+  </div>
+</div>
+
+<?php elseif($atab==='filters'): ?>
+<!-- Saved Filters tab -->
+<div x-data="{filters:[],loading:true,name:'',q:'',status:'all',state:'',cat:''}" x-init="fetch('?api=filters_list').then(r=>r.json()).then(d=>{filters=d;loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3">Save Current Filter</h3>
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+      <div><label class="text-xs text-slate-600 mb-1 block">Filter name</label><input x-model="name" type="text" placeholder="e.g. Class I in California" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500"></div>
+      <div><label class="text-xs text-slate-600 mb-1 block">Status</label>
+        <select x-model="status" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+          <option value="all">All</option><option value="ongoing">Ongoing</option><option value="terminated">Completed</option>
+        </select>
+      </div>
+      <div><label class="text-xs text-slate-600 mb-1 block">State</label><input x-model="state" type="text" placeholder="e.g. CA" maxlength="2" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500"></div>
+      <div><label class="text-xs text-slate-600 mb-1 block">Search query</label><input x-model="q" type="text" placeholder="e.g. listeria" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500"></div>
+    </div>
+    <button @click="if(!name.trim()){alert('Enter a filter name.');return;}fetch('?api=filter_save',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',name:name,filter_json:JSON.stringify({status,state,q,cat})})}).then(r=>r.json()).then(d=>{if(d.ok){filters.unshift({id:d.id,name,filter_json:JSON.stringify({status,state,q,cat}),created_at:new Date().toISOString()});name=''}else alert(d.error||'Error')})" class="bg-fw-500 text-white text-sm px-4 py-2 rounded font-medium hover:bg-fw-700 flex items-center gap-2"><i data-lucide="save" class="w-4 h-4"></i>Save Filter</button>
+  </div>
+  <div x-show="loading" class="text-sm text-slate-400 text-center py-6 animate-pulse">Loading…</div>
+  <div x-show="!loading&&filters.length===0" class="text-sm text-slate-400 text-center py-6">No saved filters yet.</div>
+  <div x-show="!loading&&filters.length>0" class="space-y-2">
+    <template x-for="f in filters" :key="f.id">
+      <div class="bg-white rounded-lg border border-slate-200 p-4 flex items-center justify-between gap-4">
+        <div>
+          <p class="text-sm font-medium text-slate-800" x-text="f.name"></p>
+          <p class="text-xs text-slate-500 mt-0.5" x-text="JSON.stringify(JSON.parse(f.filter_json))"></p>
+        </div>
+        <div class="flex gap-2 shrink-0">
+          <a :href="'?page=recalls&'+new URLSearchParams(JSON.parse(f.filter_json)).toString()" class="text-xs text-fw-500 hover:underline">Apply</a>
+          <button @click="fetch('?api=filter_del',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',id:f.id})}).then(()=>{filters=filters.filter(x=>x.id!==f.id)})" class="text-xs text-red-500 hover:underline">Delete</button>
+        </div>
+      </div>
+    </template>
+  </div>
+</div>
+
+<?php elseif($atab==='keys'): ?>
+<!-- API Keys tab -->
+<div x-data="{keys:[],loading:true,newLabel:'',newKey:'',creating:false,msg:''}" x-init="fetch('?api=keys_list').then(r=>r.json()).then(d=>{keys=d;loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="plus-circle" class="w-4 h-4"></i>Generate New API Key</h3>
+    <p class="text-xs text-slate-500 mb-3">Keys carry the <code class="font-mono bg-slate-100 px-1 rounded">fw_</code> prefix and are shown only once. Rate limit: 100 requests/hour per key.</p>
+    <div class="flex gap-3 mb-3">
+      <input x-model="newLabel" type="text" placeholder="Label (e.g. My App)" class="flex-1 text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+      <button @click="creating=true;msg='';fetch('?api=key_create',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',label:newLabel||'My key'})}).then(r=>r.json()).then(d=>{creating=false;if(d.ok){newKey=d.key;keys.unshift({id:d.id,key_prefix:d.prefix,label:newLabel||'My key',created_at:new Date().toISOString(),last_used:null,rate_limit_hour:100});newLabel=''}else msg=d.error||'Error'}).catch(()=>{creating=false;msg='Network error'})" :disabled="creating||keys.length>=5" class="bg-fw-500 text-white text-sm px-4 py-2 rounded font-medium hover:bg-fw-700 disabled:opacity-50 flex items-center gap-2 shrink-0"><i data-lucide="key" class="w-4 h-4"></i><span x-show="!creating">Generate</span><span x-show="creating">Generating…</span></button>
+    </div>
+    <p x-show="msg" x-text="msg" class="text-xs text-red-600 mb-2"></p>
+    <!-- New key display — shown once -->
+    <div x-show="newKey" class="bg-green-50 border border-green-300 rounded p-3">
+      <p class="text-xs font-semibold text-green-800 mb-1 flex items-center gap-1"><i data-lucide="check-circle" class="w-3 h-3"></i>Key generated — copy it now, it won't be shown again.</p>
+      <code class="block font-mono text-xs text-green-900 break-all select-all bg-green-100 rounded p-2" x-text="newKey"></code>
+      <button @click="newKey=''" class="text-xs text-green-700 hover:underline mt-1">Dismiss</button>
+    </div>
+  </div>
+  <div x-show="loading" class="text-sm text-slate-400 text-center py-6 animate-pulse">Loading…</div>
+  <div x-show="!loading&&keys.length===0" class="text-sm text-slate-400 text-center py-6">No API keys yet.</div>
+  <div x-show="!loading&&keys.length>0" class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <table class="fw-table w-full">
+      <thead><tr><th>Prefix</th><th>Label</th><th>Created</th><th>Last used</th><th>Rate limit</th><th></th></tr></thead>
+      <tbody>
+        <template x-for="k in keys" :key="k.id">
+          <tr>
+            <td class="font-mono text-xs" x-text="k.key_prefix+'…'"></td>
+            <td class="text-sm" x-text="k.label"></td>
+            <td class="text-xs" x-text="k.created_at?.substring(0,10)"></td>
+            <td class="text-xs" x-text="k.last_used?.substring(0,10)||'Never'"></td>
+            <td class="text-xs" x-text="k.rate_limit_hour+' req/hr'"></td>
+            <td><button @click="if(confirm('Revoke this key?'))fetch('?api=key_del',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',id:k.id})}).then(()=>{keys=keys.filter(x=>x.id!==k.id)})" class="text-xs text-red-500 hover:underline">Revoke</button></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+  <div class="mt-5 bg-slate-50 border border-slate-200 rounded-lg p-4">
+    <h4 class="text-xs font-semibold text-slate-700 mb-2">REST API v1 — Quick Reference</h4>
+    <pre class="text-xs font-mono text-slate-600 overflow-x-auto whitespace-pre-wrap">GET ?api=v1&resource=recalls&api_key=fw_...
+GET ?api=v1&resource=recalls&id=42&api_key=fw_...
+GET ?api=v1&resource=retailers&sort=risk&api_key=fw_...
+GET ?api=v1&resource=categories&api_key=fw_...
+GET ?api=v1&resource=stats&api_key=fw_...
+
+# Or via header:
+Authorization: Bearer fw_...</pre>
+  </div>
+</div>
+<?php endif; ?>
 <?php endif; ?>
 <?php layout_foot(); }
 
