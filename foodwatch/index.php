@@ -1799,7 +1799,7 @@ function q_markov_dashboard():array{
     }
     $P=json_decode($params['p_matrix_json'],true)??[];
     $N_d=json_decode($params['n_matrix_json'],true)??[];
-    $cycle=14;
+    $cycle=(float)($params['cycle_days']??14);if($cycle<1)$cycle=14;
     $k30=max(1,(int)round(30/$cycle));$k60=max(1,(int)round(60/$cycle));
     $p30=markov_p_resolved_in_k($P,$N_d,1,$k30);
     $p60=markov_p_resolved_in_k($P,$N_d,1,$k60);
@@ -2001,8 +2001,6 @@ function markov_ci_band(array $P,array $N,int $s,int $k,float $eps=0.05):array{
     try{
         $smap=['announced','active','resolved','archived'];
         $from_status=$smap[$s]??'active';
-        $rows=db()->query("SELECT to_status,SUM(cnt) as total FROM(SELECT to_status,COUNT(*) as cnt FROM recall_transitions WHERE from_status=? GROUP BY to_status) GROUP BY to_status",$from_status??null);
-        // parameterized
         $stmt=db()->prepare("SELECT to_status,COUNT(*) as cnt FROM recall_transitions WHERE from_status=? GROUP BY to_status");
         $stmt->execute([$from_status]);$counts=$stmt->fetchAll();
         if($counts&&array_sum(array_column($counts,'cnt'))>=5){
@@ -2609,6 +2607,8 @@ function route():void{
         case 'subscriptions': render_page('subscriptions');break;
         case 'markov_admin':  render_page('markov_admin');break;
         case 'search':        render_page('search');break;
+        case 'distributor':   render_page('distributor');break;
+        case 'brand':         render_page('brand');break;
         case 'watchlist':     render_page('watchlist');break;
         case 'account':       render_page('account');break;
         case 'tests':         render_page('tests');break;
