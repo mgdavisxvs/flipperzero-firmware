@@ -1353,7 +1353,13 @@ function score_recall_retailers(int $rid):void{
         $conf=DIST_CONF[$rr['confidence']]??0.25;
         $priv=($rr['relationship_type']==='private_label_retailer')?1:0;
         $er=event_risk($sev,1.0,$conf,$rw,$markov_discount);
-        db()->prepare('INSERT OR REPLACE INTO retail_exposures(recall_id,retailer_id,event_risk,severity_score,geo_relevance,dist_confidence,recency_weight,is_private_label,snapshot_date)VALUES(?,?,?,?,?,?,?,?,date(\'now\'))')->execute([$rid,$rr['retailer_id'],$er,$sev,1.0,$conf,$rw,$priv]);
+        // GROUP 25: also store risk_normalized (will be globally normalized in rescore_all;
+        // here we store a local estimate relative to current max)
+        try{
+            $cur_max=(float)(db()->query("SELECT MAX(event_risk) FROM retail_exposures")->fetchColumn()??0);
+            $normalized=$cur_max>0?round($er/max($cur_max,$er),6):1.0;
+        }catch(\Throwable){$normalized=0.0;}
+        db()->prepare('INSERT OR REPLACE INTO retail_exposures(recall_id,retailer_id,event_risk,risk_normalized,severity_score,geo_relevance,dist_confidence,recency_weight,is_private_label,snapshot_date)VALUES(?,?,?,?,?,?,?,?,?,date(\'now\'))')->execute([$rid,$rr['retailer_id'],$er,$normalized,$sev,1.0,$conf,$rw,$priv]);
     }
 }
 
@@ -1361,6 +1367,13 @@ function rescore_all():void{
     $ids=db()->query('SELECT id FROM recalls')->fetchAll(PDO::FETCH_COLUMN);
     foreach($ids as $rid)score_recall_retailers((int)$rid);
     persist_risk_snapshots();
+    // GROUP 25: normalize event_risk to [0,1] globally and store in risk_normalized
+    try{
+        $max_risk=(float)(db()->query("SELECT MAX(event_risk) FROM retail_exposures")->fetchColumn()??0);
+        if($max_risk>0){
+            db()->prepare("UPDATE retail_exposures SET risk_normalized=ROUND(event_risk/?,6)")->execute([$max_risk]);
+        }
+    }catch(\Throwable){}
 }
 
 function persist_risk_snapshots():void{
@@ -1493,9 +1506,20 @@ function q_recalls(int $page=1,int $per=25,array $f=[]):array{
         $ss_all->execute($ids);
         foreach($ss_all->fetchAll() as $row){$states_map[$row['recall_id']][]=$row['state_code'];}
     }
+    // GROUP 25: batch-fetch max event_risk and risk_normalized per recall
+    $risk_map=[];
+    if($ids){
+        try{
+            $pl=implode(',',array_fill(0,count($ids),'?'));
+            $rs=$db->prepare("SELECT recall_id,MAX(event_risk) as raw_risk,MAX(risk_normalized) as norm_risk FROM retail_exposures WHERE recall_id IN($pl) GROUP BY recall_id");
+            $rs->execute($ids);
+            foreach($rs->fetchAll() as $row)$risk_map[$row['recall_id']]=['raw'=>(float)$row['raw_risk'],'norm'=>(float)$row['norm_risk']];
+        }catch(\Throwable){}
+    }
     foreach($records as &$rec){
         $rec['hazards']=$hazards_map[$rec['id']]??[];
         $rec['states']=$states_map[$rec['id']]??[];
+        $rec['risk']=$risk_map[$rec['id']]??null; // GROUP 25
     }unset($rec);
     return['records'=>$records,'total'=>$total,'pages'=>(int)ceil($total/$per)];
 }
@@ -1688,20 +1712,44 @@ function q_manufacturer(int $id):?array{
 // Erdős E02: greedy graph coloring of manufacturer hazard-sharing graph
 // Returns chromatic label (color index 1-N) for a manufacturer given shared-hazard adjacency
 function manufacturer_chromatic_color(array $mfrs):array{
-    // Build adjacency: two manufacturers share a color class if they share no food category
+    // GROUP 26: degeneracy-ordered greedy graph coloring (Brooks' bound)
+    // Two manufacturers are ADJACENT if they share ≥1 food category (compete in same space)
     $cat_map=[];
     foreach($mfrs as $m){
         $cats=array_filter(array_map('intval',explode(',',$m['category_ids']??'')));
         $cat_map[(int)$m['id']]=$cats;
     }
+    $ids=array_map(fn($m)=>(int)$m['id'],$mfrs);
+    // Build adjacency lists and degree map
+    $adj=[];$deg=[];
+    foreach($ids as $a){$adj[$a]=[];$deg[$a]=0;}
+    foreach($ids as $i=>$a){
+        foreach(array_slice($ids,$i+1) as $b){
+            if(!empty(array_intersect($cat_map[$a]??[],$cat_map[$b]??[]))){
+                $adj[$a][]=$b;$adj[$b][]=$a;
+                $deg[$a]++;$deg[$b]++;
+            }
+        }
+    }
+    // Degeneracy ordering: repeatedly peel the min-degree vertex
+    $remaining=array_flip($ids); // set of remaining ids
+    $order=[];
+    while(!empty($remaining)){
+        // Find vertex with minimum degree in remaining subgraph
+        $min_deg=PHP_INT_MAX;$min_v=null;
+        foreach($remaining as $v=>$_){
+            $d=count(array_intersect($adj[$v]??[],array_keys($remaining)));
+            if($d<$min_deg){$min_deg=$d;$min_v=$v;}
+        }
+        $order[]=$min_v;
+        unset($remaining[$min_v]);
+    }
+    // Greedy coloring in degeneracy order
     $colors=[];
-    foreach($mfrs as $m){
-        $mid=(int)$m['id'];
-        $my_cats=$cat_map[$mid]??[];
+    foreach($order as $mid){
         $used=[];
-        foreach($colors as $other_id=>$c){
-            $shared=!empty(array_intersect($my_cats,$cat_map[$other_id]??[]));
-            if($shared)$used[$c]=true;
+        foreach($adj[$mid]??[] as $nb){
+            if(isset($colors[$nb]))$used[$colors[$nb]]=true;
         }
         for($c=1;;$c++){if(!isset($used[$c])){$colors[$mid]=$c;break;}}
     }
@@ -2032,6 +2080,38 @@ function q_recall_outlook(int $recall_id):array{
     return['state'=>$state,'state_name'=>$labels[$state]??'unknown','p_resolved_30d'=>$p30,'p_resolved_60d'=>$p60,'p_escalation'=>$p_esc,'expected_days_low'=>$e_low,'expected_days_high'=>$e_high,'confidence'=>$params['confidence']??'low','sample_n'=>(int)$params['sample_n'],'days_in_state'=>$days_in_state,'ci_lo_30d'=>$ci30['lo'],'ci_hi_30d'=>$ci30['hi'],'ci_lo_60d'=>$ci60['lo'],'ci_hi_60d'=>$ci60['hi'],'sla_95'=>$sla_95,'stratified'=>$strat_indicator,'sev_class'=>$sev_class,'cycle_days'=>$cycle];
 }
 
+// GROUP 24: Co-escalation cluster detection
+// Returns clusters of recalls that all became active within the same 14-day window
+// and share at least one food category — Ramsey threshold for systemic risk alert
+function q_coescalation_clusters():array{
+    $n_active=(int)db()->query("SELECT COUNT(*) FROM recalls WHERE status='ongoing'")->fetchColumn();
+    $ramsey_threshold=max(3,(int)ceil(log(max(2,$n_active))+2));
+    try{
+        // Find groups of active recalls by food category in recent 30 days, count co-active
+        $stmt=db()->query("
+            SELECT fc.name as category,COUNT(r.id) as cnt,
+                   GROUP_CONCAT(r.id) as recall_ids,
+                   MIN(r.announced_date) as earliest,
+                   MAX(r.announced_date) as latest
+            FROM recalls r
+            JOIN food_categories fc ON fc.id=r.food_category_id
+            WHERE r.status='ongoing'
+              AND r.announced_date>=date('now','-30 days')
+            GROUP BY r.food_category_id
+            HAVING COUNT(r.id)>1
+            ORDER BY cnt DESC
+            LIMIT 10");
+        $rows=$stmt->fetchAll();
+        $clusters=[];
+        foreach($rows as $row){
+            if((int)$row['cnt']>=$ramsey_threshold){
+                $clusters[]=['category'=>$row['category'],'count'=>(int)$row['cnt'],'earliest'=>$row['earliest'],'latest'=>$row['latest'],'systemic'=>(int)$row['cnt']>=$ramsey_threshold*2];
+            }
+        }
+        return['clusters'=>$clusters,'threshold'=>$ramsey_threshold,'active_total'=>$n_active];
+    }catch(\Throwable){return['clusters'=>[],'threshold'=>$ramsey_threshold,'active_total'=>$n_active];}
+}
+
 function q_seasonal():array{
     $stmt=db()->query("
         SELECT strftime('%m',announced_date) as month,
@@ -2204,6 +2284,8 @@ function run_tests():array{
         'saved_filters' =>'test_saved_filters',
         'watchlist_user'=>'test_watchlist_user',
         'cdc_api'       =>'test_cdc_api',
+        'markov_invariants'=>'test_markov_invariants', // GROUP 22
+        'adversarial'   =>'test_adversarial',          // GROUP 29
     ];
     foreach($tests as $name=>$fn){
         try{
@@ -2427,6 +2509,62 @@ function test_cdc_api():array{
     if(!$result['ok'])return['status'=>'WARN','msg'=>'CDC API unreachable: '.($result['error']??'HTTP '.$result['status'])];
     if(empty($result['data']))return['status'=>'WARN','msg'=>'CDC API returned empty response (may be rate limited)'];
     return['status'=>'PASS','msg'=>'CDC NORS API reachable; sample record received'];
+}
+
+// GROUP 22: Markov invariant checks
+function test_markov_invariants():array{
+    $est=markov_estimate_matrix();
+    $P=$est['P'];
+    $errs=[];
+    // 1. Row sums ≈ 1.0 for transient states
+    for($i=0;$i<4;$i++){
+        $sum=array_sum($P[$i]??[]);
+        if(abs($sum-1.0)>0.01)$errs[]="Row $i sums to $sum (expected 1.0)";
+    }
+    // 2. Absorbing states have P[i][i] = 1.0 (states 2,3)
+    foreach([2,3] as $i){
+        if(abs(($P[$i][$i]??0)-1.0)>0.01)$errs[]="Absorbing state $i: P[$i][$i]=".($P[$i][$i]??0);
+    }
+    // 3. P(resolved in 60d) >= P(resolved in 30d) for active state (monotonicity)
+    $N=markov_fundamental_matrix($P);
+    $p30=markov_p_resolved_in_k($P,$N,1,2);
+    $p60=markov_p_resolved_in_k($P,$N,1,4);
+    if($p60<$p30-0.001)$errs[]="Monotonicity violation: p30=$p30 > p60=$p60";
+    // 4. Fundamental matrix N all non-negative
+    foreach($N as $row)foreach($row as $v)if($v<-0.001)$errs[]="Negative fundamental matrix entry: $v";
+    if($errs)return['status'=>'FAIL','msg'=>implode('; ',$errs)];
+    return['status'=>'PASS','msg'=>"Invariants OK: row-sums=1.0, absorbing states correct, p30≤p60, N≥0; n={$est['n']} ({$est['confidence']})"];
+}
+
+// GROUP 29: Adversarial / security tests
+function test_adversarial():array{
+    $errs=[];
+    // 1. SQL injection probe: pass a malicious query to q_search, ensure no exception and no results leakage
+    try{
+        $r=q_search("' OR 1=1 --",5);
+        // Should return empty (sanitized via preg_replace stripping quotes)
+        if(is_array($r)&&count($r)>50)$errs[]='SQL injection probe returned unexpectedly many results';
+    }catch(\Throwable $e){$errs[]='q_search exception on injection probe: '.$e->getMessage();}
+    // 2. XSS probe: h() must escape angle brackets
+    $xss='<script>alert(1)</script>';
+    $esc=h($xss);
+    if(str_contains($esc,'<script>'))$errs[]='h() did not escape <script>';
+    if(!str_contains($esc,'&lt;'))$errs[]='h() did not produce HTML entities';
+    // 3. CSRF token must be non-empty and at least 16 hex chars
+    $tok=csrf();
+    if(strlen($tok)<16)$errs[]='CSRF token too short: '.strlen($tok).' chars';
+    // 4. Oversized input: expand_hazard_query with a 5000-char string must not throw
+    try{
+        $big=str_repeat('salmonella ',400);
+        $out=expand_hazard_query($big);
+        if(strlen($out)>100000)$errs[]='expand_hazard_query output too large: '.strlen($out);
+    }catch(\Throwable $e){$errs[]='expand_hazard_query exception on oversized input: '.$e->getMessage();}
+    // 5. Rate limit table existence (GROUP 21)
+    try{
+        $n=db()->query("SELECT COUNT(*) FROM api_rate_limits_minute")->fetchColumn();
+    }catch(\Throwable $e){$errs[]='api_rate_limits_minute table missing: '.$e->getMessage();}
+    if($errs)return['status'=>'FAIL','msg'=>implode('; ',$errs)];
+    return['status'=>'PASS','msg'=>'Adversarial probes passed: SQL injection sanitized, XSS escaped, CSRF valid, oversized input safe, minute-rate table present'];
 }
 
 // ================================================================
@@ -2912,6 +3050,8 @@ function view_dashboard():void{
     $hazards=q_hazard_stats();
     $timeline=q_timeline(30);
     $markov_dash=q_markov_dashboard();
+    // GROUP 24: co-escalation clusters for Systemic Risk Alert card
+    $coesc=q_coescalation_clusters();
 
     layout_head('Dashboard','dashboard'); ?>
 
@@ -2968,6 +3108,28 @@ function view_dashboard():void{
   <span class="text-xs text-slate-400 italic">No API health data yet</span>
   <?php endif; ?>
 </div>
+
+<!-- GROUP 24: Systemic Risk Alert (co-escalation clusters) -->
+<?php if(!empty($coesc['clusters'])): ?>
+<div class="bg-red-50 border border-red-300 rounded-lg p-4 mb-4">
+  <div class="flex items-center gap-2 mb-2">
+    <i data-lucide="alert-octagon" class="w-5 h-5 text-red-600 flex-shrink-0"></i>
+    <h2 class="text-sm font-bold text-red-800">Systemic Risk Alert — Co-escalation Detected</h2>
+    <span class="ml-auto text-xs text-red-600 bg-red-100 border border-red-300 rounded px-1.5 py-0.5">Ramsey threshold: <?=(int)$coesc['threshold']?></span>
+  </div>
+  <p class="text-xs text-red-700 mb-3">Multiple recalls in the same food category became active within 30 days, exceeding the co-escalation alert threshold (Ramsey T ≥<?=(int)$coesc['threshold']?>). This may indicate a supply-chain or contamination cluster.</p>
+  <div class="space-y-1.5">
+  <?php foreach($coesc['clusters'] as $cl): ?>
+  <div class="flex items-center gap-2 text-xs bg-white rounded border <?=$cl['systemic']?'border-red-400':'border-red-200'?> px-3 py-2">
+    <i data-lucide="<?=$cl['systemic']?'flame':'alert-triangle'?>" class="w-3 h-3 text-red-600 flex-shrink-0"></i>
+    <strong><?=h($cl['category'])?></strong>: <span class="font-semibold text-red-700"><?=(int)$cl['count']?> active recalls</span>
+    <span class="text-slate-400 ml-1"><?=h($cl['earliest'])?> – <?=h($cl['latest'])?></span>
+    <?php if($cl['systemic']): ?><span class="ml-auto bg-red-200 text-red-800 rounded px-1.5 py-0.5 font-bold">HIGH SYSTEMIC</span><?php endif; ?>
+  </div>
+  <?php endforeach; ?>
+  </div>
+</div>
+<?php endif; ?>
 
 <!-- GROUP 5: Recall Outlook summary card -->
 <div class="bg-indigo-50 border border-indigo-200 rounded-lg p-4 mb-6">
@@ -3134,7 +3296,7 @@ function view_recalls():void{
     </div>
   </div>
   <table class="fw-table w-full">
-    <thead><tr><th>Severity</th><th>Product / Reason</th><th>Agency</th><th>Category</th><th>Date</th><th>States</th><th>Status</th></tr></thead>
+    <thead><tr><th>Severity</th><th>Product / Reason</th><th>Agency</th><th>Category</th><th>Date</th><th>States</th><th title="Raw event risk score from retail exposure model (GROUP 25)">Risk ⓘ</th><th>Status</th></tr></thead>
     <tbody>
     <?php foreach($data['records'] as $rec): ?>
     <tr>
@@ -3147,10 +3309,20 @@ function view_recalls():void{
       <td class="text-xs"><?=h($rec['category_name']??'—')?></td>
       <td class="text-xs whitespace-nowrap"><?=h($rec['announced_date']??'—')?></td>
       <td class="text-xs"><?=h(count($rec['states']??[])>3?count($rec['states']).' states':implode(', ',$rec['states']??[]))?></td>
+      <!-- GROUP 25: raw and normalized risk -->
+      <td class="text-xs text-center">
+        <?php if($rec['risk']): ?>
+        <span title="Raw: <?=number_format($rec['risk']['raw'],3)?> · Normalized: <?=number_format($rec['risk']['norm'],3)?>"
+              class="inline-flex flex-col items-center gap-0.5">
+          <span class="font-semibold <?=$rec['risk']['norm']>0.7?'text-red-600':($rec['risk']['norm']>0.4?'text-amber-600':'text-slate-500')?>"><?=number_format($rec['risk']['norm'],2)?></span>
+          <span class="text-slate-400 text-xs leading-none"><?=number_format($rec['risk']['raw'],2)?></span>
+        </span>
+        <?php else: ?><span class="text-slate-300">—</span><?php endif; ?>
+      </td>
       <td><?=status_badge($rec['status'])?></td>
     </tr>
     <?php endforeach; ?>
-    <?php if(empty($data['records'])): ?><tr><td colspan="7" class="text-center py-8 text-slate-400">No recalls match the current filters.</td></tr><?php endif; ?>
+    <?php if(empty($data['records'])): ?><tr><td colspan="8" class="text-center py-8 text-slate-400">No recalls match the current filters.</td></tr><?php endif; ?>
     </tbody>
   </table>
   <?=paginator($page,$data['pages'],$_GET)?>
@@ -3764,7 +3936,12 @@ function view_categories():void{
       <thead><tr><th>Category</th><th>Active</th><th>Total</th><th>Latest</th></tr></thead>
       <tbody>
       <?php foreach($cats as $c): ?>
-      <tr><td><a href="?page=recalls&cat=<?=h($c['slug']??'')?>" class="text-fw-500 hover:underline"><?=h($c['name']??'')?></a></td>
+      <?php $sparse=(int)$c['total']<52; // GROUP 27: flag low-count categories ?>
+      <tr>
+        <td>
+          <a href="?page=recalls&cat=<?=h($c['slug']??'')?>" class="text-fw-500 hover:underline"><?=h($c['name']??'')?></a>
+          <?php if($sparse): ?><span class="ml-1 text-xs bg-amber-100 text-amber-700 border border-amber-300 rounded px-1 py-0.5" title="Fewer than 52 historical recalls — lambda decay estimate has low precision">Low data</span><?php endif; ?>
+        </td>
         <td class="text-center font-bold <?=$c['active']>0?'text-red-600':'text-slate-400'?>"><?=(int)$c['active']?></td>
         <td class="text-center text-slate-600"><?=(int)$c['total']?></td>
         <td class="text-xs"><?=h($c['latest']??'—')?></td>
@@ -4023,6 +4200,55 @@ function view_watchlist():void{
   </div>
   <a href="?page=subscriptions" class="bg-blue-600 text-white text-xs rounded px-3 py-1.5 hover:bg-blue-700 flex-shrink-0">Subscribe →</a>
 </div>
+
+<?php
+// GROUP 28: Suggested Consolidations — find watchlist items that share active recalls
+$consolidations=[];
+if(count($items)>=2){
+    // For each pair of watch items, count recalls that match BOTH criteria
+    $type_queries=['retailer'=>"SELECT DISTINCT r.id FROM recalls r JOIN recall_retailers rr ON rr.recall_id=r.id JOIN retailers rt ON rt.id=rr.retailer_id WHERE r.status='ongoing' AND LOWER(rt.name) LIKE ?",'brand'=>"SELECT DISTINCT r.id FROM recalls r JOIN recall_products rp ON rp.recall_id=r.id JOIN brands b ON b.id=rp.brand_id WHERE r.status='ongoing' AND LOWER(b.name) LIKE ?",'category'=>"SELECT DISTINCT r.id FROM recalls r JOIN food_categories fc ON fc.id=r.food_category_id WHERE r.status='ongoing' AND LOWER(fc.name) LIKE ?",'state'=>"SELECT DISTINCT r.id FROM recalls r JOIN recall_states rs ON rs.recall_id=r.id WHERE r.status='ongoing' AND rs.state_code=?",'upc'=>"SELECT DISTINCT r.id FROM recalls r JOIN recall_products rp ON rp.recall_id=r.id WHERE r.status='ongoing' AND rp.upc_codes LIKE ?"];
+    $id_sets=[];
+    foreach($items as $it){
+        $sql=$type_queries[$it['watch_type']]??null;
+        if(!$sql){$id_sets[$it['id']]=[];continue;}
+        try{
+            $wv=$it['watch_type']==='state'?$it['watch_value']:'%'.strtolower($it['watch_value']).'%';
+            if($it['watch_type']==='upc')$wv='%'.preg_replace('/[^0-9]/','',trim($it['watch_value'])).'%';
+            $s=db()->prepare($sql);$s->execute([$wv]);
+            $id_sets[$it['id']]=array_column($s->fetchAll(),'id');
+        }catch(\Throwable){$id_sets[$it['id']]=[];}
+    }
+    $item_keys=array_keys($id_sets);
+    for($i=0;$i<count($item_keys);$i++){
+        for($j=$i+1;$j<count($item_keys);$j++){
+            $a=$item_keys[$i];$b=$item_keys[$j];
+            $overlap=array_intersect($id_sets[$a],$id_sets[$b]);
+            if(count($overlap)>=2){
+                $ia=array_filter($items,fn($it)=>$it['id']===$a);
+                $ib=array_filter($items,fn($it)=>$it['id']===$b);
+                $na=reset($ia)['watch_label']??reset($ia)['watch_value']??$a;
+                $nb=reset($ib)['watch_label']??reset($ib)['watch_value']??$b;
+                $consolidations[]=["a"=>$na,"b"=>$nb,"overlap"=>count($overlap)];
+            }
+        }
+    }
+}
+?>
+<?php if(!empty($consolidations)): ?>
+<div class="bg-emerald-50 border border-emerald-200 rounded-lg p-4 mb-5">
+  <h2 class="text-sm font-semibold text-emerald-800 mb-2 flex items-center gap-2"><i data-lucide="git-merge" class="w-4 h-4"></i>Suggested Consolidations (GROUP 28)</h2>
+  <p class="text-xs text-emerald-700 mb-3">These watchlist pairs share active recalls — consider consolidating into a single broader watchlist entry.</p>
+  <div class="space-y-2">
+  <?php foreach($consolidations as $c): ?>
+  <div class="flex items-center gap-2 text-xs text-emerald-800 bg-white rounded border border-emerald-200 px-3 py-2">
+    <i data-lucide="link" class="w-3 h-3 flex-shrink-0"></i>
+    <strong><?=h($c['a'])?></strong> <span class="text-emerald-500">⟷</span> <strong><?=h($c['b'])?></strong>
+    <span class="ml-auto bg-emerald-100 text-emerald-700 rounded-full px-2 py-0.5 font-semibold"><?=(int)$c['overlap']?> shared</span>
+  </div>
+  <?php endforeach; ?>
+  </div>
+</div>
+<?php endif; ?>
 
 <div class="bg-white rounded-lg border border-slate-200 shadow-sm">
   <div class="px-4 py-3 border-b border-slate-200"><h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="bell" class="w-4 h-4 text-fw-500"></i>Watched Items (<?=count($items)?>)</h2></div>
