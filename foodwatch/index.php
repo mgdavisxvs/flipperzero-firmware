@@ -1664,6 +1664,58 @@ function q_velocity():array{
     return $result;
 }
 
+// GROUP 5: System-wide Markov dashboard summary for the "Recall Outlook" card
+function q_markov_dashboard():array{
+    try{
+        $params=db()->query("SELECT p_matrix_json,n_matrix_json,e_steps_json,sample_n,confidence FROM markov_params ORDER BY id DESC LIMIT 1")->fetch();
+    }catch(\Throwable){$params=null;}
+    if(!$params){
+        $est=markov_estimate_matrix();
+        $N_d=markov_fundamental_matrix($est['P']);
+        $params=['p_matrix_json'=>json_encode($est['P']),'n_matrix_json'=>json_encode($N_d),'e_steps_json'=>json_encode(markov_expected_steps($N_d)),'sample_n'=>$est['n'],'confidence'=>$est['confidence']];
+    }
+    $P=json_decode($params['p_matrix_json'],true)??[];
+    $N_d=json_decode($params['n_matrix_json'],true)??[];
+    $cycle=14;
+    $k30=max(1,(int)round(30/$cycle));$k60=max(1,(int)round(60/$cycle));
+    $p30=markov_p_resolved_in_k($P,$N_d,1,$k30);
+    $p60=markov_p_resolved_in_k($P,$N_d,1,$k60);
+    $esc=markov_escalation_prob($P,1);
+    $e_steps=json_decode($params['e_steps_json'],true)??[4.0,3.0];
+    $e_days=round(($e_steps[1]??4.0)*$cycle);
+    return[
+        'p30'=>round($p30*100),'p60'=>round($p60*100),
+        'escalation'=>round($esc*100),'e_days'=>$e_days,
+        'sample_n'=>(int)$params['sample_n'],'confidence'=>$params['confidence'],
+    ];
+}
+
+// GROUP 6: 14-day risk-delta per retailer for sparkline trend indicators
+function q_risk_trend(int $days=14):array{
+    try{
+        $stmt=db()->prepare("
+            SELECT s.retailer_id,
+                   rt.name AS retailer_name,
+                   MAX(CASE WHEN s.snapshot_date>=date('now','-'||?||' days') THEN s.total_risk END) AS recent_risk,
+                   MAX(CASE WHEN s.snapshot_date<date('now','-'||?||' days') AND s.snapshot_date>=date('now','-'||(?*2)||' days') THEN s.total_risk END) AS prior_risk
+            FROM risk_snapshots s
+            JOIN retailers rt ON rt.id=s.retailer_id
+            GROUP BY s.retailer_id
+            HAVING recent_risk IS NOT NULL OR prior_risk IS NOT NULL
+        ");
+        $stmt->execute([$days,$days,$days]);
+        $rows=$stmt->fetchAll();
+        $result=[];
+        foreach($rows as $r){
+            $recent=(float)($r['recent_risk']??0);
+            $prior=(float)($r['prior_risk']??0);
+            $delta=round($recent-$prior,3);
+            $result[(int)$r['retailer_id']]=['retailer_id'=>(int)$r['retailer_id'],'name'=>$r['retailer_name'],'recent_risk'=>$recent,'prior_risk'=>$prior,'delta'=>$delta,'trend'=>$delta>0.05?'up':($delta<-0.05?'down':'flat')];
+        }
+        return $result;
+    }catch(\Throwable){return[];}
+}
+
 // ================================================================
 // § MARKOV TRANSITION ENGINE
 // ================================================================
@@ -2279,6 +2331,12 @@ function handle_api(string $api):void{
             case 'dq':       if(!is_admin())fw_abort('Unauthorized',403);
                 $stmt=db()->query('SELECT flag_type,severity,COUNT(*) as cnt FROM data_quality_flags WHERE resolved=0 GROUP BY flag_type,severity ORDER BY cnt DESC');
                 echo js($stmt->fetchAll());break;
+            case 'dq_resolve':
+                if(!is_admin())fw_abort('Unauthorized',403);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $dq_id=(int)($_POST['id']??0);
+                if($dq_id)db()->prepare("UPDATE data_quality_flags SET resolved=1 WHERE id=?")->execute([$dq_id]);
+                echo js(['ok'=>true]);break;
             case 'manufacturers':echo js(q_manufacturers((int)($_GET['limit']??100)));break;
             case 'trend':    echo js(q_recall_trend((int)($_GET['weeks']??52)));break;
             case 'velocity': echo js(q_velocity());break;
@@ -2646,6 +2704,7 @@ function view_dashboard():void{
     $cats=q_category_stats();
     $hazards=q_hazard_stats();
     $timeline=q_timeline(30);
+    $markov_dash=q_markov_dashboard();
 
     layout_head('Dashboard','dashboard'); ?>
 
@@ -2685,6 +2744,45 @@ function view_dashboard():void{
   <div class="fw-stat"><div class="text-2xl font-bold text-slate-800"><?=number_format($stats['total_cats'])?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="tag" class="w-3 h-3"></i>Food Categories</div></div>
   <div class="fw-stat"><div class="text-2xl font-bold text-slate-800"><?=number_format($stats['total'])?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="database" class="w-3 h-3"></i>Total Records</div></div>
   <div class="fw-stat"><div class="text-sm font-semibold text-slate-700 truncate"><?=h(mb_substr($stats['newest']['title']??'—',0,30))?></div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i data-lucide="clock" class="w-3 h-3"></i>Newest Recall</div></div>
+</div>
+
+<!-- GROUP 9: API Sources status row -->
+<div class="flex flex-wrap gap-2 mb-4 items-center">
+  <span class="text-xs font-semibold text-slate-500 uppercase tracking-wide">API Sources:</span>
+  <?php foreach(($stats['api_health']??[]) as $code=>$ah): ?>
+  <?php $ok=(int)($ah['consecutive_failures']??0)===0&&($ah['last_status']??0)===200; ?>
+  <span class="flex items-center gap-1 text-xs px-2 py-1 rounded-full border <?=$ok?'bg-green-50 border-green-300 text-green-700':'bg-red-50 border-red-300 text-red-700'?>">
+    <span class="w-2 h-2 rounded-full <?=$ok?'bg-green-500':'bg-red-500'?> inline-block"></span>
+    <?=h($code)?><?=$ok?'':' ('.(int)($ah['consecutive_failures']??0).' failures)'?>
+    <?php if($ah['last_check']??null): ?><span class="text-slate-400 ml-1"><?=h(date('M j H:i',strtotime($ah['last_check'])))?></span><?php endif; ?>
+  </span>
+  <?php endforeach; ?>
+  <?php if(empty($stats['api_health']??[])): ?>
+  <span class="text-xs text-slate-400 italic">No API health data yet</span>
+  <?php endif; ?>
+</div>
+
+<!-- GROUP 5: Recall Outlook summary card -->
+<div class="bg-indigo-50 border border-indigo-200 rounded-lg p-4 mb-6">
+  <h2 class="text-sm font-semibold text-indigo-800 mb-3 flex items-center gap-2"><i data-lucide="activity" class="w-4 h-4"></i>System Recall Outlook <span class="text-xs font-normal text-indigo-500 ml-1">(Markov model · n=<?=(int)$markov_dash['sample_n']?> · <?=h($markov_dash['confidence'])?>)</span></h2>
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+    <div class="bg-white rounded border border-indigo-100 p-3 text-center">
+      <div class="text-xs text-indigo-600 font-medium mb-1">Resolved in 30d</div>
+      <div class="text-2xl font-bold <?=$markov_dash['p30']>50?'text-green-700':'text-amber-700'?>"><?=$markov_dash['p30']?>%</div>
+    </div>
+    <div class="bg-white rounded border border-indigo-100 p-3 text-center">
+      <div class="text-xs text-indigo-600 font-medium mb-1">Resolved in 60d</div>
+      <div class="text-2xl font-bold <?=$markov_dash['p60']>60?'text-green-700':'text-amber-700'?>"><?=$markov_dash['p60']?>%</div>
+    </div>
+    <div class="bg-white rounded border border-indigo-100 p-3 text-center">
+      <div class="text-xs text-indigo-600 font-medium mb-1">Escalation Risk</div>
+      <div class="text-2xl font-bold <?=$markov_dash['escalation']>25?'text-red-700':'text-green-700'?>"><?=$markov_dash['escalation']?>%</div>
+    </div>
+    <div class="bg-white rounded border border-indigo-100 p-3 text-center">
+      <div class="text-xs text-indigo-600 font-medium mb-1">Expected Resolution</div>
+      <div class="text-2xl font-bold text-slate-700"><?=$markov_dash['e_days']?><span class="text-sm font-normal">d</span></div>
+    </div>
+  </div>
 </div>
 
 <?php if($stats['active']===0): ?>
@@ -3263,16 +3361,35 @@ function view_retailer_detail():void{
     </div>
     <?php endif; ?>
 
-    <!-- Latest snapshot -->
+    <!-- Latest snapshot + 14-day trend -->
     <?php if($r['snapshots']): ?>
-    <?php $snap=$r['snapshots'][0]; ?>
+    <?php $snap=$r['snapshots'][0];
+    $snap_prev=count($r['snapshots'])>7?$r['snapshots'][7]:null;
+    $trend_delta=$snap_prev?round((float)$snap['total_risk']-(float)$snap_prev['total_risk'],3):null;
+    ?>
     <div class="bg-blue-50 rounded-lg border border-blue-200 shadow-sm p-4">
       <h3 class="text-sm font-semibold text-blue-800 mb-3 flex items-center gap-2"><i data-lucide="bar-chart-2" class="w-4 h-4"></i>Latest Risk Snapshot</h3>
       <dl class="space-y-1.5 text-sm">
         <div class="flex justify-between"><dt class="text-xs text-blue-700">Date</dt><dd><?=h($snap['snapshot_date'])?></dd></div>
         <div class="flex justify-between"><dt class="text-xs text-blue-700">Active count</dt><dd class="font-semibold"><?=(int)$snap['active_count']?></dd></div>
-        <div class="flex justify-between"><dt class="text-xs text-blue-700">Risk total</dt><dd class="font-semibold"><?=number_format((float)$snap['total_risk'],3)?></dd></div>
+        <div class="flex justify-between"><dt class="text-xs text-blue-700">Risk total</dt>
+          <dd class="font-semibold flex items-center gap-1">
+            <?=number_format((float)$snap['total_risk'],3)?>
+            <?php if($trend_delta!==null): ?>
+            <span class="text-xs <?=$trend_delta>0.05?'text-red-600':($trend_delta<-0.05?'text-green-600':'text-slate-400')?>">
+              <?=$trend_delta>0.05?'↑':($trend_delta<-0.05?'↓':'→')?> <?=abs($trend_delta)>0?number_format(abs($trend_delta),3):''?>
+            </span>
+            <?php endif; ?>
+          </dd>
+        </div>
         <div class="flex justify-between"><dt class="text-xs text-blue-700">Severe</dt><dd class="<?=$snap['severe_count']>0?'text-red-600 font-bold':'text-slate-500'?>"><?=(int)$snap['severe_count']?></dd></div>
+        <?php if($trend_delta!==null): ?>
+        <div class="flex justify-between"><dt class="text-xs text-blue-700">14d Trend</dt>
+          <dd class="text-xs font-semibold <?=$trend_delta>0.05?'text-red-600':($trend_delta<-0.05?'text-green-600':'text-slate-500')?>">
+            <?=$trend_delta>0?'+'.number_format($trend_delta,3):number_format($trend_delta,3)?>
+          </dd>
+        </div>
+        <?php endif; ?>
       </dl>
     </div>
     <?php endif; ?>
@@ -3342,21 +3459,39 @@ function view_categories():void{
 
 function view_geo():void{
     $geo=q_geo_stats();
+    // GROUP 6: Compute 14-day trend: compare active recalls now vs 14 days ago
+    try{
+        $trend_stmt=db()->query("
+            SELECT rs.state_code,
+                   COUNT(DISTINCT CASE WHEN rc.announced_date>=date('now','-14 days') THEN rs.recall_id END) AS recent_active,
+                   COUNT(DISTINCT CASE WHEN rc.announced_date>=date('now','-28 days') AND rc.announced_date<date('now','-14 days') THEN rs.recall_id END) AS prior_active
+            FROM recall_states rs JOIN recalls rc ON rc.id=rs.recall_id
+            WHERE rs.state_code!='nationwide' GROUP BY rs.state_code");
+        $geo_trend=[];
+        foreach($trend_stmt->fetchAll() as $tr){
+            $geo_trend[$tr['state_code']]=['recent'=>(int)$tr['recent_active'],'prior'=>(int)$tr['prior_active']];
+        }
+    }catch(\Throwable){$geo_trend=[];}
     layout_head('Geographic Distribution','geo'); ?>
 <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
   <div class="bg-white rounded-lg border border-slate-200 shadow-sm">
     <div class="px-4 py-3 border-b border-slate-200"><h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="map" class="w-4 h-4 text-green-500"></i>Recalls by State (Active)</h2></div>
     <table class="fw-table w-full max-h-96 overflow-y-auto block">
-      <thead><tr><th>State</th><th>Active Recalls</th><th>Total Recalls</th><th>Action</th></tr></thead>
+      <thead><tr><th>State</th><th>Active Recalls</th><th title="14-day trend">Trend</th><th>Total Recalls</th><th>Action</th></tr></thead>
       <tbody>
       <?php foreach($geo as $row): ?>
+      <?php $gt=$geo_trend[$row['state_code']]??['recent'=>0,'prior'=>0];
+            $tdelta=$gt['recent']-$gt['prior'];
+            $tarrow=$tdelta>0?'↑':($tdelta<0?'↓':'→');
+            $tcls=$tdelta>0?'text-red-600':($tdelta<0?'text-green-600':'text-slate-400'); ?>
       <tr><td><?=h(US_STATES[$row['state_code']]??$row['state_code'])?> (<?=h($row['state_code'])?>)</td>
         <td class="text-center font-bold <?=$row['active']>0?'text-red-600':'text-slate-400'?>"><?=(int)$row['active']?></td>
+        <td class="text-center text-sm font-bold <?=$tcls?>" title="14d delta: <?=$tdelta>=0?'+':''?><?=$tdelta?>"><?=$tarrow?> <?=$tdelta!=0?abs($tdelta):''?></td>
         <td class="text-center"><?=(int)$row['total']?></td>
         <td><a href="?page=recalls&state=<?=h($row['state_code'])?>" class="text-xs text-fw-500 hover:underline">View recalls</a></td>
       </tr>
       <?php endforeach; ?>
-      <?php if(empty($geo)): ?><tr><td colspan="4" class="text-center py-6 text-slate-400">No geographic data. Run ingestion first.</td></tr><?php endif; ?>
+      <?php if(empty($geo)): ?><tr><td colspan="5" class="text-center py-6 text-slate-400">No geographic data. Run ingestion first.</td></tr><?php endif; ?>
       </tbody>
     </table>
   </div>
@@ -3597,9 +3732,11 @@ function view_admin():void{
     $health_stmt=db()->query('SELECT * FROM api_health');
     $health=$health_stmt->fetchAll();
     $dq=db()->query('SELECT flag_type,severity,COUNT(*) as cnt FROM data_quality_flags WHERE resolved=0 GROUP BY flag_type ORDER BY cnt DESC')->fetchAll();
+    $dq_detail=db()->query('SELECT id,flag_type,severity,recall_id,description,created_at FROM data_quality_flags WHERE resolved=0 ORDER BY created_at DESC LIMIT 50')->fetchAll();
     $db_size=file_exists(FW_DB_PATH)?round(filesize(FW_DB_PATH)/1024/1024,2):0;
     $recall_count=(int)db()->query('SELECT COUNT(*) FROM recalls')->fetchColumn();
     $last_run=$runs[0]??null;
+    $admin_tab=$_GET['atab']??'ingestion';
 
     layout_head('Administration','admin'); ?>
 <div class="flex items-center justify-between mb-6">
@@ -3610,6 +3747,13 @@ function view_admin():void{
   <a href="?page=admin&logout=1" class="text-xs text-slate-500 hover:text-red-600">Sign out</a>
 </div>
 
+<!-- Admin Tab Nav (GROUP 8) -->
+<div class="flex gap-0 border-b border-slate-200 mb-6">
+  <?php foreach(['ingestion'=>'Ingestion','dq'=>'Data Quality','runs'=>'Run History'] as $tv=>$tl): ?>
+  <a href="?page=admin&atab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$admin_tab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
+  <?php endforeach; ?>
+</div>
+
 <!-- System Stats -->
 <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
   <div class="fw-stat"><div class="text-xl font-bold"><?=number_format($recall_count)?></div><div class="text-xs text-slate-500">Total Recalls</div></div>
@@ -3618,6 +3762,7 @@ function view_admin():void{
   <div class="fw-stat"><div class="text-xl font-bold"><?=(int)db()->query('SELECT COUNT(*) FROM data_quality_flags WHERE resolved=0')->fetchColumn()?></div><div class="text-xs text-slate-500">Open DQ Flags</div></div>
 </div>
 
+<?php if($admin_tab==='ingestion'||$admin_tab==='runs'): ?>
 <!-- Ingestion controls -->
 <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-6" x-data="{loading:null,msg:''}">
   <h2 class="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><i data-lucide="refresh-cw" class="w-4 h-4"></i>Data Ingestion</h2>
@@ -3681,20 +3826,59 @@ function view_admin():void{
   </table>
 </div>
 
-<!-- Data Quality -->
-<?php if($dq): ?>
-<div class="bg-white rounded-lg border border-slate-200 shadow-sm">
-  <div class="px-4 py-3 border-b border-slate-200"><h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="flag" class="w-4 h-4 text-yellow-500"></i>Open Data Quality Flags</h2></div>
+<?php endif; // ingestion/runs tab ?>
+
+<?php if($admin_tab==='dq'): ?>
+<!-- Data Quality Tab (GROUP 8) -->
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm mb-6">
+  <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+    <h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="flag" class="w-4 h-4 text-yellow-500"></i>Open Data Quality Flags — Summary</h2>
+    <span class="text-xs text-slate-400"><?=count($dq)?> flag type(s)</span>
+  </div>
+  <?php if($dq): ?>
   <table class="fw-table w-full">
     <thead><tr><th>Flag Type</th><th>Severity</th><th>Count</th></tr></thead>
     <tbody>
     <?php foreach($dq as $d): ?>
-    <tr><td class="font-mono text-xs"><?=h($d['flag_type'])?></td><td class="text-xs capitalize"><?=h($d['severity'])?></td><td class="text-center font-bold"><?=(int)$d['cnt']?></td></tr>
+    <tr>
+      <td class="font-mono text-xs"><?=h($d['flag_type'])?></td>
+      <td class="text-xs capitalize"><span class="px-1.5 py-0.5 rounded text-xs <?=$d['severity']==='critical'?'bg-red-100 text-red-700':($d['severity']==='warning'?'bg-yellow-100 text-yellow-700':'bg-blue-100 text-blue-700')?>"><?=h($d['severity'])?></span></td>
+      <td class="text-center font-bold"><?=(int)$d['cnt']?></td>
+    </tr>
     <?php endforeach; ?>
     </tbody>
   </table>
+  <?php else: ?>
+  <div class="p-6 text-center text-green-600 text-sm"><i data-lucide="check-circle" class="w-5 h-5 mx-auto mb-1"></i>No open data quality flags.</div>
+  <?php endif; ?>
+</div>
+
+<?php if($dq_detail): ?>
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm">
+  <div class="px-4 py-3 border-b border-slate-200"><h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="list" class="w-4 h-4"></i>Recent Unresolved DQ Flags (up to 50)</h2></div>
+  <div class="overflow-x-auto">
+  <table class="fw-table w-full min-w-max">
+    <thead><tr><th>ID</th><th>Type</th><th>Severity</th><th>Recall</th><th>Description</th><th>Created</th><th>Action</th></tr></thead>
+    <tbody>
+    <?php foreach($dq_detail as $d): ?>
+    <tr>
+      <td class="font-mono text-xs"><?=(int)$d['id']?></td>
+      <td class="font-mono text-xs"><?=h($d['flag_type'])?></td>
+      <td class="text-xs capitalize"><?=h($d['severity'])?></td>
+      <td class="text-xs"><?=$d['recall_id']?'<a href="?page=recall&id='.(int)$d['recall_id'].'" class="text-fw-500 hover:underline">#'.(int)$d['recall_id'].'</a>':'—'?></td>
+      <td class="text-xs max-w-xs truncate" title="<?=h($d['description']??'')?>"><?=h(mb_substr($d['description']??'',0,60))?></td>
+      <td class="text-xs"><?=h(substr($d['created_at'],0,10))?></td>
+      <td>
+        <button onclick="fetch('?api=dq_resolve',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',id:<?=(int)$d['id']?>})}).then(()=>this.closest('tr').remove())" class="text-xs text-green-600 hover:underline">Resolve</button>
+      </td>
+    </tr>
+    <?php endforeach; ?>
+    </tbody>
+  </table>
+  </div>
 </div>
 <?php endif; ?>
+<?php endif; // dq tab ?>
 <?php layout_foot(); }
 
 // ================================================================
@@ -3985,8 +4169,19 @@ function view_manufacturers():void{
   </div>
 </div>
 
-<div class="mb-4 text-sm text-slate-600">
-  <strong>Repeat-Offender Analysis</strong> — manufacturers ranked by total recall count and severe (Class I) events. Risk score = Σ EventRisk. <strong>Tier</strong> = Erdős chromatic risk group (same tier = shared hazard category).
+<!-- GROUP 7: Chromatic tier badge legend -->
+<div class="mb-3">
+  <div class="text-sm text-slate-600 mb-2"><strong>Repeat-Offender Analysis</strong> — manufacturers ranked by total recall count and severe (Class I) events. Risk score = Σ EventRisk. <strong>Tier</strong> = Erdős chromatic risk group (same tier = shared hazard category).</div>
+  <div class="flex flex-wrap items-center gap-2 text-xs">
+    <span class="text-slate-500 font-semibold">Tier Legend:</span>
+    <?php
+    $tier_legend_palette=['1'=>'bg-red-100 text-red-800','2'=>'bg-orange-100 text-orange-800','3'=>'bg-yellow-100 text-yellow-800','4'=>'bg-blue-100 text-blue-800','5'=>'bg-purple-100 text-purple-800','6'=>'bg-green-100 text-green-800'];
+    $tier_legend_desc=['1'=>'Highest risk (most co-occurrences)','2'=>'High risk','3'=>'Elevated risk','4'=>'Moderate risk','5'=>'Lower risk','6'=>'Lowest risk'];
+    foreach($tier_legend_palette as $t=>$cls): if((int)$t>$max_color)break; ?>
+    <span class="flex items-center gap-1"><span class="px-1.5 py-0.5 rounded font-bold <?=$cls?>"><?=$t?></span><span class="text-slate-500"><?=$tier_legend_desc[$t]??''?></span></span>
+    <?php endforeach; ?>
+    <span class="text-slate-400 ml-1">• <?=$max_color?> groups from <?=count($mfrs)?> manufacturers via degeneracy-ordered graph coloring</span>
+  </div>
 </div>
 <div class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-x-auto mb-4">
   <table class="fw-table w-full min-w-max">
