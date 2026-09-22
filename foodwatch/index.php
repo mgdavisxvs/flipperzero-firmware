@@ -3436,7 +3436,7 @@ function test_m_subscriptions_cols():array{
 }
 function test_m_equivalences_cols():array{
     $cols=db()->query("PRAGMA table_info(recall_equivalences)")->fetchAll(\PDO::FETCH_COLUMN,1);
-    $need=['id','recall_id_a','recall_id_b'];
+    $need=['id','r1_id','r2_id','sim'];
     $miss=array_diff($need,$cols);
     return['status'=>empty($miss)?'PASS':'WARN','msg'=>empty($miss)?'recall_equivalences schema ok':'missing: '.implode(',',$miss)];
 }
@@ -3665,7 +3665,7 @@ function test_q_recall_by_id():array{
 }
 function test_q_stats_keys():array{
     $s=q_stats();
-    $need=['total','by_status','by_agency','by_severity','recent_7d'];
+    $need=['total','active','severe','retailers','cats','newest','last_sync','api_health'];
     $miss=array_diff($need,array_keys($s));
     return['status'=>empty($miss)?'PASS':'WARN','msg'=>empty($miss)?'q_stats() keys complete':'missing: '.implode(',',$miss)];
 }
