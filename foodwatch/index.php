@@ -9,8 +9,8 @@ declare(strict_types=1);
 // ================================================================
 // § CONSTANTS
 // ================================================================
-const FW_VERSION    = '5.9.0';
-const FW_SCHEMA_VER = 29;
+const FW_VERSION    = '6.0.0';
+const FW_SCHEMA_VER = 31;
 // Pre-shared secret for IONOS crontab → cron_alerts endpoint; override before deploy
 const FW_CRON_SECRET = 'change-me-before-deploy';
 const FW_DATA_DIR   = __DIR__ . '/data';
@@ -310,7 +310,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26(),27=>m27(),28=>m28(),29=>m29()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26(),27=>m27(),28=>m28(),29=>m29(),30=>m30(),31=>m31()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -799,6 +799,30 @@ CREATE TABLE IF NOT EXISTS notification_prefs(
   digest_freq TEXT NOT NULL DEFAULT 'immediate' CHECK(digest_freq IN ('immediate','daily','weekly')),
   updated_at TEXT NOT NULL DEFAULT(datetime('now')));
 CREATE INDEX IF NOT EXISTS idx_np_user ON notification_prefs(user_id);
+SQL; }
+
+function m31():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS recall_comments(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  recall_id INTEGER NOT NULL REFERENCES recalls(id) ON DELETE CASCADE,
+  body TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT(datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT(datetime('now')),
+  UNIQUE(user_id, recall_id));
+CREATE INDEX IF NOT EXISTS idx_rc_recall ON recall_comments(recall_id);
+SQL; }
+
+function m30():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS saved_searches(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL DEFAULT '',
+  query_json TEXT NOT NULL DEFAULT '{}',
+  last_run_at TEXT,
+  result_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_ss_user ON saved_searches(user_id);
 SQL; }
 
 function m29():string{ return <<<'SQL'
@@ -2843,6 +2867,19 @@ function run_tests():array{
         'notif_prefs_digest'    =>'test_notif_prefs_digest',
         'webhook_hmac_header'   =>'test_webhook_hmac_header',
         'webhook_max_5'         =>'test_webhook_max_5',
+        // Sprint 15
+        'm_saved_searches_cols'     =>'test_m_saved_searches_cols',
+        'm_recall_comments_cols'    =>'test_m_recall_comments_cols',
+        'saved_search_save_api'     =>'test_saved_search_save_api',
+        'saved_search_del_api'      =>'test_saved_search_del_api',
+        'recall_comment_save_api'   =>'test_recall_comment_save_api',
+        'recall_comment_del_api'    =>'test_recall_comment_del_api',
+        'recalls_export_csv_api'    =>'test_recalls_export_csv_api',
+        'batch_tag_api'             =>'test_batch_tag_api',
+        'account_searches_tab'      =>'test_account_searches_tab',
+        'recall_detail_comments'    =>'test_recall_detail_comments',
+        'v1_comments_resource'      =>'test_v1_comments_resource',
+        'csv_export_headers'        =>'test_csv_export_headers',
         // Sprint 14
         'm_public_feeds_cols'   =>'test_m_public_feeds_cols',
         'rss_api'               =>'test_rss_api',
@@ -4293,6 +4330,107 @@ function test_history_list_empty():array{
 }
 
 // ================================================================
+// § SPRINT 15 TESTS
+// ================================================================
+function test_m_saved_searches_cols():array{
+    $cols=db()->query("PRAGMA table_info(saved_searches)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','user_id','name','query_json','last_run_at','result_count','created_at'];
+    $missing=array_diff($need,$cols);
+    return['status'=>$missing?'FAIL':'PASS','msg'=>$missing?'saved_searches missing: '.implode(',',$missing):'saved_searches schema OK'];
+}
+function test_m_recall_comments_cols():array{
+    $cols=db()->query("PRAGMA table_info(recall_comments)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','user_id','recall_id','body','created_at','updated_at'];
+    $missing=array_diff($need,$cols);
+    return['status'=>$missing?'FAIL':'PASS','msg'=>$missing?'recall_comments missing: '.implode(',',$missing):'recall_comments schema OK'];
+}
+function test_saved_search_save_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'saved_search_save':",$off))!==false){
+        $blk=substr($src,$p,400);
+        if(str_contains($blk,'is_user()')&&str_contains($blk,'csrf_ok()')&&str_contains($blk,'>=20')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'saved_search_save: auth + CSRF + max-20 guard':'saved_search_save missing guards or max-20'];
+}
+function test_saved_search_del_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'saved_search_del':",$off))!==false){
+        $blk=substr($src,$p,300);
+        if(str_contains($blk,'is_user()')&&str_contains($blk,'user_id')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'saved_search_del: is_user + user_id scoping present':'saved_search_del missing user scoping'];
+}
+function test_recall_comment_save_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'recall_comment_save':",$off))!==false){
+        $blk=substr($src,$p,500);
+        if(str_contains($blk,'is_user()')&&str_contains($blk,'csrf_ok()')&&str_contains($blk,'2000')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'recall_comment_save: auth + CSRF + 2000-char limit':'recall_comment_save missing guards or char limit'];
+}
+function test_recall_comment_del_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'recall_comment_del':",$off))!==false){
+        $blk=substr($src,$p,300);
+        if(str_contains($blk,'is_user()')&&str_contains($blk,'user_id')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'recall_comment_del: is_user + user_id scoping':'recall_comment_del missing user scoping'];
+}
+function test_recalls_export_csv_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'recalls_export_csv':",$off))!==false){
+        $blk=substr($src,$p,400);
+        if(str_contains($blk,'text/csv')&&str_contains($blk,'is_user()')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'recalls_export_csv: is_user + text/csv header':'recalls_export_csv missing auth or content-type'];
+}
+function test_batch_tag_api():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'batch_tag':",$off))!==false){
+        $blk=substr($src,$p,400);
+        if(str_contains($blk,'is_user()')&&str_contains($blk,'csrf_ok()')&&str_contains($blk,'100')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'batch_tag: auth + CSRF + max-100 guard':'batch_tag missing guards or max-100'];
+}
+function test_account_searches_tab():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'searches'=>'Saved Searches'")&&str_contains($src,"\$atab==='searches'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'account Saved Searches tab markup present':'account searches tab missing'];
+}
+function test_recall_detail_comments():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"recall_comment_list")&&str_contains($src,"recall_comment_save")&&str_contains($src,'My Comment');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'recall detail comments panel present':'recall detail comments panel missing'];
+}
+function test_v1_comments_resource():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'comments':",$off))!==false){
+        $blk=substr($src,$p,200);
+        if(str_contains($blk,'recall_comments')&&str_contains($blk,'recall_id')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'v1/comments resource present with recall_id filter':'v1/comments resource missing'];
+}
+function test_csv_export_headers():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"recall_id")&&str_contains($src,"Content-Disposition")&&str_contains($src,"text/csv");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'CSV export headers and recall_id column present':'CSV export headers missing'];
+}
+
+// ================================================================
 // § SPRINT 14 TESTS
 // ================================================================
 function test_m_public_feeds_cols():array{
@@ -5098,6 +5236,91 @@ function handle_api(string $api):void{
                     $n_bulk++;
                 }
                 echo js(['ok'=>true,'updated'=>$n_bulk]);break;
+            // SPRINT 15: saved searches
+            case 'saved_search_list':
+                if(!is_user())fw_abort('Not authenticated',401);
+                $uid_ss=(int)current_user()['id'];
+                $ss_rows=db()->prepare("SELECT id,name,query_json,last_run_at,result_count,created_at FROM saved_searches WHERE user_id=? ORDER BY created_at DESC LIMIT 50");
+                $ss_rows->execute([$uid_ss]);echo js($ss_rows->fetchAll());break;
+            case 'saved_search_save':
+                if(!is_user())fw_abort('Not authenticated',401);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $uid_ss2=(int)current_user()['id'];
+                $ss_name=mb_substr(trim($_POST['name']??''),0,120);
+                $ss_qjson=trim($_POST['query_json']??'{}');
+                if(!$ss_name)fw_abort('name required',400);
+                if(!json_decode($ss_qjson))fw_abort('Invalid query_json',400);
+                $ss_cnt=(int)db()->prepare("SELECT COUNT(*) FROM saved_searches WHERE user_id=?")->execute([$uid_ss2])?db()->prepare("SELECT COUNT(*) FROM saved_searches WHERE user_id=?")->execute([$uid_ss2]):0;
+                $ss_c_stmt=db()->prepare("SELECT COUNT(*) FROM saved_searches WHERE user_id=?");$ss_c_stmt->execute([$uid_ss2]);$ss_cnt=(int)$ss_c_stmt->fetchColumn();
+                if($ss_cnt>=20)fw_abort('Maximum 20 saved searches per account',400);
+                $ss_ins=db()->prepare("INSERT INTO saved_searches(user_id,name,query_json)VALUES(?,?,?)");$ss_ins->execute([$uid_ss2,$ss_name,$ss_qjson]);
+                echo js(['ok'=>true,'id'=>(int)db()->lastInsertId()]);break;
+            case 'saved_search_del':
+                if(!is_user())fw_abort('Not authenticated',401);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $uid_ss3=(int)current_user()['id'];$ss_del_id=(int)($_POST['id']??0);
+                if(!$ss_del_id)fw_abort('id required',400);
+                db()->prepare("DELETE FROM saved_searches WHERE id=? AND user_id=?")->execute([$ss_del_id,$uid_ss3]);
+                echo js(['ok'=>true]);break;
+            // SPRINT 15: recall comments
+            case 'recall_comment_list':
+                if(!is_user())fw_abort('Not authenticated',401);
+                $uid_rc=(int)current_user()['id'];$rid_rc=(int)($_GET['recall_id']??0);
+                if(!$rid_rc)fw_abort('recall_id required',400);
+                $rcs=db()->prepare("SELECT id,body,created_at,updated_at FROM recall_comments WHERE user_id=? AND recall_id=? LIMIT 1");
+                $rcs->execute([$uid_rc,$rid_rc]);echo js($rcs->fetchAll());break;
+            case 'recall_comment_save':
+                if(!is_user())fw_abort('Not authenticated',401);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $uid_rc2=(int)current_user()['id'];$rid_rc2=(int)($_POST['recall_id']??0);
+                $rc_body=mb_substr(trim($_POST['body']??''),0,2000);
+                if(!$rid_rc2)fw_abort('recall_id required',400);
+                if($rc_body===''){
+                    db()->prepare("DELETE FROM recall_comments WHERE user_id=? AND recall_id=?")->execute([$uid_rc2,$rid_rc2]);
+                    echo js(['ok'=>true,'deleted'=>true]);break;
+                }
+                db()->prepare("INSERT INTO recall_comments(user_id,recall_id,body)VALUES(?,?,?) ON CONFLICT(user_id,recall_id) DO UPDATE SET body=excluded.body,updated_at=datetime('now')")->execute([$uid_rc2,$rid_rc2,$rc_body]);
+                echo js(['ok'=>true]);break;
+            case 'recall_comment_del':
+                if(!is_user())fw_abort('Not authenticated',401);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $uid_rc3=(int)current_user()['id'];$rid_rc3=(int)($_POST['recall_id']??0);
+                if(!$rid_rc3)fw_abort('recall_id required',400);
+                db()->prepare("DELETE FROM recall_comments WHERE user_id=? AND recall_id=?")->execute([$uid_rc3,$rid_rc3]);
+                echo js(['ok'=>true]);break;
+            // SPRINT 15: CSV export
+            case 'recalls_export_csv':
+                if(!is_user())fw_abort('Not authenticated',401);
+                $csv_data=q_recalls(1,500,['status'=>$_GET['status']??'all','q'=>$_GET['q']??'','category'=>$_GET['category']??'','state'=>$_GET['state']??'','severity'=>$_GET['severity']??'','agency'=>$_GET['agency']??'','hazard'=>$_GET['hazard']??'','sort'=>$_GET['sort']??'date']);
+                header('Content-Type: text/csv; charset=UTF-8');
+                header('Content-Disposition: attachment; filename="foodwatch-recalls-'.date('Ymd').'.csv"');
+                $csv_cols=['recall_id','title','status','severity_label','agency','state','category','date_initiated','manufacturer'];
+                echo implode(',',$csv_cols)."\r\n";
+                foreach($csv_data['records']??[] as $rr){
+                    $vals=[];
+                    foreach($csv_cols as $cc){
+                        $v=$rr[$cc]??'';
+                        $vals[]='"'.str_replace('"','""',(string)$v).'"';
+                    }
+                    echo implode(',',$vals)."\r\n";
+                }
+                exit;
+            // SPRINT 15: batch tag
+            case 'batch_tag':
+                if(!is_user())fw_abort('Not authenticated',401);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $uid_bt=(int)current_user()['id'];
+                $bt_tag=mb_substr(trim($_POST['tag']??''),0,80);
+                $bt_ids_raw=trim($_POST['recall_ids']??'');
+                if(!$bt_tag)fw_abort('tag required',400);
+                if(!$bt_ids_raw)fw_abort('recall_ids required',400);
+                $bt_ids=array_filter(array_map('intval',explode(',',$bt_ids_raw)));
+                if(count($bt_ids)>100)fw_abort('Maximum 100 ids per batch_tag',400);
+                $bt_n=0;
+                foreach($bt_ids as $btrid){
+                    try{db()->prepare("INSERT OR IGNORE INTO recall_tags(user_id,recall_id,tag)VALUES(?,?,?)")->execute([$uid_bt,$btrid,$bt_tag]);$bt_n++;}catch(\Throwable){}
+                }
+                echo js(['ok'=>true,'tagged'=>$bt_n]);break;
             case 'v1':
                 $auth=$_SERVER['HTTP_AUTHORIZATION']??'';
                 $raw_key=str_starts_with($auth,'Bearer ')?trim(substr($auth,7)):trim($_GET['api_key']??'');
@@ -5129,6 +5352,18 @@ function handle_api(string $api):void{
                         if(!$eid)fw_abort('Requires ?resource=equivalences&id=<recall_id>',400);
                         $eq=db()->prepare("SELECT r2_id as id,sim FROM recall_equivalences WHERE r1_id=? UNION SELECT r1_id as id,sim FROM recall_equivalences WHERE r2_id=? ORDER BY sim DESC LIMIT 20");
                         $eq->execute([$eid,$eid]);echo js($eq->fetchAll());break;
+                    // SPRINT 15: public recall comments (read-only, paginated)
+                    case 'comments':
+                        $crid_v1=(int)($_GET['recall_id']??0);
+                        if(!$crid_v1)fw_abort('recall_id required',400);
+                        $cstmt=db()->prepare("SELECT rc.id,rc.recall_id,rc.body,rc.created_at FROM recall_comments rc WHERE rc.recall_id=? ORDER BY rc.created_at DESC LIMIT 50");
+                        $cstmt->execute([$crid_v1]);echo js($cstmt->fetchAll());break;
+                    // SPRINT 15: user saved searches (key must belong to a user)
+                    case 'saved_searches':
+                        $ss_uid_v1=(int)$krow['user_id'];
+                        if(!$ss_uid_v1)fw_abort('API key not linked to a user account',403);
+                        $ssvl=db()->prepare("SELECT id,name,query_json,last_run_at,result_count,created_at FROM saved_searches WHERE user_id=? ORDER BY created_at DESC LIMIT 50");
+                        $ssvl->execute([$ss_uid_v1]);echo js($ssvl->fetchAll());break;
                     // SPRINT 14: public feeds listing
                     case 'feeds':
                         $pfl=db()->query("SELECT id,name,slug,filter_json,hit_count,created_at FROM public_feeds WHERE active=1 ORDER BY hit_count DESC LIMIT 100");
@@ -5169,8 +5404,10 @@ function handle_api(string $api):void{
                             ['resource'=>'webhooks','params'=>[],'desc'=>'List outbound webhooks registered to the API key owner'],
                             ['resource'=>'feeds','params'=>[],'desc'=>'List active public RSS feed presets'],
                             ['resource'=>'docs','params'=>[],'desc'=>'This endpoint listing'],
+                            ['resource'=>'comments','params'=>['recall_id'],'desc'=>'Comments left by users on a recall'],
+                            ['resource'=>'saved_searches','params'=>[],'desc'=>'Saved searches for the API key owner'],
                         ]]);break;
-                    default: fw_abort('Unknown v1 resource. Valid: recalls, retailers, manufacturers, categories, stats, brands, geo_risk, markov, co_escalation, equivalences, flags, webhooks, feeds, docs',404);
+                    default: fw_abort('Unknown v1 resource. Valid: recalls, retailers, manufacturers, categories, stats, brands, geo_risk, markov, co_escalation, equivalences, flags, webhooks, feeds, comments, saved_searches, docs',404);
                 }
                 exit;
             // SPRINT 6: password reset
@@ -6139,6 +6376,35 @@ function view_recall_detail():void{
           <button @click="fetch('?api=tag_del',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',recall_id:'<?=(int)$id?>',tag:t.tag})}).then(()=>{tags=tags.filter(x=>x.tag!==t.tag)})" class="ml-0.5 text-indigo-400 hover:text-indigo-800 font-bold leading-none">&times;</button>
         </span>
       </template>
+    </div>
+  </div>
+</div>
+<!-- Sprint 15: Recall Comments panel -->
+<div class="mt-4 bg-white rounded-lg border border-slate-200 shadow-sm"
+  x-data="{comment:null,loading:true,body:'',saving:false,deleted:false,err:''}"
+  x-init="fetch('?api=recall_comment_list&recall_id=<?=(int)$id?>').then(r=>r.json()).then(d=>{comment=d[0]||null;body=comment?.body||'';loading=false})">
+  <div class="px-4 py-3 border-b border-slate-200 flex items-center gap-2">
+    <i data-lucide="message-square" class="w-4 h-4 text-slate-500"></i>
+    <h3 class="text-sm font-semibold text-slate-700">My Comment</h3>
+    <span class="text-xs text-slate-400 ml-1">Private annotation · one per recall</span>
+  </div>
+  <div class="p-4">
+    <div x-show="loading" class="text-xs text-slate-400 animate-pulse">Loading…</div>
+    <div x-show="!loading">
+      <textarea x-model="body" rows="3" maxlength="2000"
+        class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500 resize-none"
+        placeholder="Write a private comment about this recall… (leave blank to delete)"></textarea>
+      <div class="flex items-center gap-3 mt-2">
+        <button @click="saving=true;err='';fetch('?api=recall_comment_save',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',recall_id:'<?=(int)$id?>',body:body})}).then(r=>r.json()).then(d=>{saving=false;if(!d.ok){err=d.error||'Error';return;}if(d.deleted){comment=null;deleted=true}else{comment={body,updated_at:new Date().toISOString()};deleted=false}}).catch(()=>{saving=false;err='Network error'})"
+          :disabled="saving" class="bg-fw-500 text-white text-xs px-3 py-1.5 rounded font-medium hover:bg-fw-700 disabled:opacity-50">
+          <span x-show="!saving" x-text="body.trim()?'Save Comment':'Delete Comment'">Save Comment</span>
+          <span x-show="saving">Saving…</span>
+        </button>
+        <span x-show="!saving&&comment&&!deleted" class="text-xs text-green-600">✓ Saved</span>
+        <span x-show="deleted" class="text-xs text-slate-400">Comment deleted.</span>
+        <span x-show="err" x-text="err" class="text-xs text-red-600"></span>
+        <span x-show="comment&&comment.updated_at&&!deleted" class="text-xs text-slate-400 ml-auto" x-text="'Last saved '+comment?.updated_at?.substring(0,16).replace('T',' ')"></span>
+      </div>
     </div>
   </div>
 </div>
@@ -7796,7 +8062,7 @@ if(!$user && $reset_tok_param): ?>
 <!-- Tab nav -->
 <?php $atab=$_GET['tab']??'overview'; ?>
 <div class="flex gap-0 border-b border-slate-200 mb-6">
-  <?php foreach(['overview'=>'Overview','filters'=>'Saved Filters','alerts'=>'Alerts','keys'=>'API Keys','activity'=>'Activity','notifications'=>'Notifications','tags'=>'Tags','feeds'=>'RSS Feeds'] as $tv=>$tl): ?>
+  <?php foreach(['overview'=>'Overview','filters'=>'Saved Filters','alerts'=>'Alerts','keys'=>'API Keys','activity'=>'Activity','notifications'=>'Notifications','tags'=>'Tags','feeds'=>'RSS Feeds','searches'=>'Saved Searches'] as $tv=>$tl): ?>
   <a href="?page=account&tab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$atab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
   <?php endforeach; ?>
 </div>
@@ -8131,6 +8397,47 @@ Authorization: Bearer fw_...</pre>
             <td class="text-center text-sm" x-text="f.hit_count"></td>
             <td class="text-xs text-slate-400" x-text="f.created_at?.substring(0,10)||''"></td>
             <td><button @click="if(confirm('Delete feed '+f.name+'?'))fetch('?api=feed_del',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',id:f.id})}).then(r=>r.json()).then(d=>{if(d.ok)feeds=feeds.filter(x=>x.id!==f.id);else alert(d.error||'Error')})" class="text-xs text-red-500 hover:underline">Delete</button></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<?php elseif($atab==='searches'): ?>
+<!-- Saved Searches tab (Sprint 15) -->
+<div x-data="{searches:[],loading:true,sname:'',sqjson:'{}',screating:false,smsg:''}"
+  x-init="fetch('?api=saved_search_list').then(r=>r.json()).then(d=>{searches=d;loading=false})">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="bookmark-plus" class="w-4 h-4 text-fw-500"></i>Save a Search</h3>
+    <p class="text-xs text-slate-500 mb-4">Save recall search parameters for quick re-execution. Maximum 20 per account.</p>
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+      <div><label class="text-xs text-slate-600 mb-1 block">Search Name</label><input x-model="sname" type="text" placeholder="Peanut allergen — CA" maxlength="120" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500"></div>
+      <div><label class="text-xs text-slate-600 mb-1 block">Query JSON</label><input x-model="sqjson" type="text" placeholder='{"q":"peanut","state":"CA"}' class="w-full text-sm font-mono border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500"></div>
+    </div>
+    <button :disabled="screating||!sname.trim()"
+      @click="screating=true;smsg='';fetch('?api=saved_search_save',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',name:sname,query_json:sqjson||'{}'})}).then(r=>r.json()).then(d=>{screating=false;if(d.ok){searches.unshift({id:d.id,name:sname,query_json:sqjson,last_run_at:null,result_count:0,created_at:new Date().toISOString()});sname='';sqjson='{}';smsg='Saved!'}else smsg=d.error||'Error'}).catch(()=>{screating=false;smsg='Network error'})"
+      class="bg-fw-500 text-white text-sm px-4 py-2 rounded font-medium hover:bg-fw-700 disabled:opacity-50 flex items-center gap-2">
+      <i data-lucide="bookmark" class="w-4 h-4"></i><span x-show="!screating">Save Search</span><span x-show="screating">Saving…</span>
+    </button>
+    <p x-show="smsg" x-text="smsg" :class="smsg==='Saved!'?'text-green-600':'text-red-600'" class="text-xs mt-2"></p>
+  </div>
+  <div x-show="loading" class="text-sm text-slate-400 animate-pulse py-4">Loading…</div>
+  <div x-show="!loading&&searches.length===0" class="text-sm text-slate-400 text-center py-6 bg-white rounded-lg border border-slate-200">No saved searches yet.</div>
+  <div x-show="!loading&&searches.length>0" class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <table class="fw-table w-full">
+      <thead><tr><th>Name</th><th>Query</th><th>Last run</th><th>Results</th><th></th></tr></thead>
+      <tbody>
+        <template x-for="s in searches" :key="s.id">
+          <tr>
+            <td class="font-medium text-sm" x-text="s.name"></td>
+            <td class="font-mono text-xs text-slate-500 max-w-xs truncate" x-text="s.query_json" :title="s.query_json"></td>
+            <td class="text-xs text-slate-400" x-text="s.last_run_at?s.last_run_at.substring(0,16).replace('T',' '):'Never'"></td>
+            <td class="text-xs text-center" x-text="s.result_count||'—'"></td>
+            <td class="flex gap-2 whitespace-nowrap">
+              <a :href="'?page=recalls&q='+encodeURIComponent(JSON.parse(s.query_json||'{}')['q']||'')" target="_blank" class="text-xs text-fw-500 hover:underline">Run</a>
+              <button @click="if(confirm('Delete saved search?'))fetch('?api=saved_search_del',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',id:s.id})}).then(r=>r.json()).then(d=>{if(d.ok)searches=searches.filter(x=>x.id!==s.id)})" class="text-xs text-red-500 hover:underline">Delete</button>
+            </td>
           </tr>
         </template>
       </tbody>
