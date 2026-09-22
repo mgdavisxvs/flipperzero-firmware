@@ -10,7 +10,7 @@ declare(strict_types=1);
 // § CONSTANTS
 // ================================================================
 const FW_VERSION    = '4.1.0';
-const FW_SCHEMA_VER = 18;
+const FW_SCHEMA_VER = 19;
 const FW_DATA_DIR   = __DIR__ . '/data';
 const FW_DB_PATH    = __DIR__ . '/data/foodwatch.db';
 const FW_LAMBDA     = 0.01;   // global daily decay fallback; per-category λ_c overrides via food_categories.lambda_decay
@@ -205,10 +205,25 @@ function api_key_verify(string $raw):?array{
     return $row;
 }
 function api_key_rate_check(int $key_id,int $limit):bool{
-    $window=date('Y-m-d H');
-    db()->prepare("INSERT INTO api_rate_limits(key_id,window_hour,request_count)VALUES(?,?,1) ON CONFLICT(key_id,window_hour) DO UPDATE SET request_count=request_count+1")->execute([$key_id,$window]);
-    $s=db()->prepare('SELECT request_count FROM api_rate_limits WHERE key_id=? AND window_hour=?');
-    $s->execute([$key_id,$window]);
+    // GROUP 21: sliding window — per-minute bucket enforced first, then hourly limit
+    $db=db();
+    $window_hour=date('Y-m-d H');
+    $window_min=date('Y-m-d H:i');
+    // Per-minute sliding window (new table)
+    try{
+        $db->prepare("INSERT INTO api_rate_limits_minute(key_id,window_minute,request_count)VALUES(?,?,1) ON CONFLICT(key_id,window_minute) DO UPDATE SET request_count=request_count+1")->execute([$key_id,$window_min]);
+        $sm=$db->prepare('SELECT request_count FROM api_rate_limits_minute WHERE key_id=? AND window_minute=?');
+        $sm->execute([$key_id,$window_min]);
+        $min_cnt=(int)$sm->fetchColumn();
+        // Prune stale buckets (older than 2 h) to keep table small
+        try{$db->prepare("DELETE FROM api_rate_limits_minute WHERE key_id=? AND window_minute<?")->execute([$key_id,date('Y-m-d H:i',time()-7200)]);}catch(\Throwable){}
+        $min_limit=max(1,(int)ceil($limit/60));
+        if($min_cnt>$min_limit)return false;
+    }catch(\Throwable){}
+    // Hourly counter (existing table — preserved for backward compat)
+    $db->prepare("INSERT INTO api_rate_limits(key_id,window_hour,request_count)VALUES(?,?,1) ON CONFLICT(key_id,window_hour) DO UPDATE SET request_count=request_count+1")->execute([$key_id,$window_hour]);
+    $s=$db->prepare('SELECT request_count FROM api_rate_limits WHERE key_id=? AND window_hour=?');
+    $s->execute([$key_id,$window_hour]);
     return(int)$s->fetchColumn()<=$limit;
 }
 
@@ -269,7 +284,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -648,6 +663,10 @@ CREATE TABLE IF NOT EXISTS api_rate_limits_minute(
   PRIMARY KEY(key_id,window_minute));
 SQL; }
 
+function m19():string{ return <<<'SQL'
+ALTER TABLE markov_params ADD COLUMN cycle_days REAL NOT NULL DEFAULT 14;
+SQL; }
+
 // ================================================================
 // § ENTITY RESOLUTION
 // ================================================================
@@ -709,17 +728,44 @@ function category_lambda(int $cat_id):float{
 
 function update_category_lambdas():void{
     // MLE: for each category compute mean resolution time from closed recalls, set λ = 1/mean_days
+    // GROUP 19: apply James-Stein shrinkage estimator to pool lambda estimates toward grand mean
     $stmt=db()->query("
         SELECT r.food_category_id AS cid,
-               AVG(JULIANDAY(COALESCE(rt.transitioned_at,r.updated_at))-JULIANDAY(r.announced_date)) AS mean_days
+               AVG(JULIANDAY(COALESCE(rt.transitioned_at,r.updated_at))-JULIANDAY(r.announced_date)) AS mean_days,
+               COUNT(*) AS n
         FROM recalls r
         LEFT JOIN recall_transitions rt ON rt.recall_id=r.id AND rt.to_status IN('completed','terminated')
         WHERE r.food_category_id IS NOT NULL AND r.announced_date IS NOT NULL
         GROUP BY r.food_category_id
         HAVING AVG(JULIANDAY(COALESCE(rt.transitioned_at,r.updated_at))-JULIANDAY(r.announced_date))>1");
-    foreach($stmt->fetchAll() as $row){
-        $lambda_c=min(0.1,max(0.001,1.0/(float)$row['mean_days']));
-        db()->prepare("UPDATE food_categories SET lambda_decay=? WHERE id=?")->execute([$lambda_c,$row['cid']]);
+    $rows=$stmt->fetchAll();
+    if(!$rows)return;
+    // Compute MLE lambdas
+    $lambdas=[];
+    foreach($rows as $row)$lambdas[$row['cid']]=min(0.1,max(0.001,1.0/(float)$row['mean_days']));
+    $p=count($lambdas);
+    if($p<3){
+        // Not enough categories for JS shrinkage; use plain MLE
+        foreach($lambdas as $cid=>$lam)
+            db()->prepare("UPDATE food_categories SET lambda_decay=? WHERE id=?")->execute([$lam,$cid]);
+        return;
+    }
+    // Grand mean (target vector θ_0) — shrink toward the overall mean lambda
+    $grand_mean=array_sum($lambdas)/$p;
+    // Compute sum of squared deviations from grand mean
+    $ss=array_sum(array_map(fn($l)=>($l-$grand_mean)**2,$lambdas));
+    // Within-estimate variance proxy: assume each λ_i has variance ≈ λ_i²/n_i (MLE dispersion)
+    // For JS, sigma² = pooled variance of lambdas around the grand mean / (p-2)
+    // JS shrinkage factor: B = (p-2)*sigma² / ss; clamp to [0,1]
+    $ns=array_column($rows,'n','cid');
+    $sigma2=max(1e-9,$ss/($p-2));
+    $B_raw=(($p-2)*$sigma2)/$ss;
+    $B=min(1.0,max(0.0,$B_raw));
+    // Shrunk estimate: λ̃_i = grand_mean + (1-B)*(λ_i - grand_mean)
+    foreach($lambdas as $cid=>$lam){
+        $lam_js=$grand_mean+(1.0-$B)*($lam-$grand_mean);
+        $lam_js=min(0.1,max(0.001,$lam_js));
+        db()->prepare("UPDATE food_categories SET lambda_decay=? WHERE id=?")->execute([$lam_js,$cid]);
     }
 }
 
@@ -1534,9 +1580,33 @@ function q_runs(int $limit=10):array{
     $s->execute([$limit]);return $s->fetchAll();
 }
 
+// GROUP 18: expand a user query by appending hazard synonyms for any known hazard slug terms
+function expand_hazard_query(string $q):string{
+    $terms=preg_split('/\s+/',strtolower(trim($q)));
+    $expansions=[];
+    foreach(HAZ_KEYWORDS as $slug=>$syns){
+        // Match if any term is the slug or matches the first synonym keyword
+        $slug_plain=str_replace('_',' ',$slug);
+        foreach($terms as $t){
+            if($t===$slug||$t===$slug_plain||str_contains($slug_plain,$t)){
+                foreach($syns as $s)$expansions[]=preg_replace('/[^a-z0-9 \-]/','',strtolower($s));
+                break;
+            }
+        }
+    }
+    if(!$expansions)return $q;
+    // Deduplicate; strip already-present terms; append unique expansions
+    $existing=array_flip($terms);
+    $new=array_filter(array_unique($expansions),fn($e)=>trim($e)!==''&&!isset($existing[trim($e)]));
+    if(!$new)return $q;
+    return $q.' '.implode(' ',array_slice(array_values($new),0,6)); // cap at 6 extra terms
+}
+
 function q_search(string $q,int $limit=50):array{
     if(!trim($q))return[];
-    $safe=trim(preg_replace('/[^a-z0-9 \-_]/i','',$q));
+    // GROUP 18: expand query with hazard synonyms before FTS MATCH
+    $q_exp=expand_hazard_query($q);
+    $safe=trim(preg_replace('/[^a-z0-9 \-_]/i','',$q_exp));
     if(!$safe)return[];
     $ids_stmt=db()->prepare('SELECT recall_id FROM recalls_fts WHERE recalls_fts MATCH ? LIMIT ?');
     $ids_stmt->execute([$safe.'*',$limit]);
@@ -1750,6 +1820,48 @@ function markov_estimate_matrix():array{
     return['P'=>$P,'n'=>$n_total,'confidence'=>$n_total<10?'low':($n_total<50?'medium':'high')];
 }
 
+// GROUP 15: severity-stratified Markov matrix
+// sev_class: 'high' (severity>=3.0), 'medium' (2-3), 'low' (<2)
+function markov_estimate_matrix_stratified(string $sev_class):array{
+    $successors=[[1,2,3],[2,3],[3],[]];
+    $counts=array_fill(0,4,array_fill(0,4,0));
+    $map=['announced'=>0,'active'=>1,'ongoing'=>1,'resolved'=>2,'completed'=>2,'terminated'=>2,'archived'=>3];
+    $sev_where=match($sev_class){
+        'high'=>'AND r.severity>=3.0',
+        'medium'=>'AND r.severity>=2.0 AND r.severity<3.0',
+        default=>'AND r.severity<2.0',
+    };
+    try{
+        $stmt=db()->prepare("SELECT rt.from_status,rt.to_status,COUNT(*) as cnt
+            FROM recall_transitions rt JOIN recalls r ON r.id=rt.recall_id
+            WHERE 1=1 $sev_where GROUP BY rt.from_status,rt.to_status");
+        $stmt->execute([]);
+        foreach($stmt->fetchAll() as $r){
+            $i=$map[strtolower($r['from_status'])]??-1;
+            $j=$map[strtolower($r['to_status'])]??-1;
+            if($i>=0&&$j>=0&&$i!==$j)$counts[$i][$j]+=$r['cnt'];
+        }
+    }catch(\Throwable){}
+    $P=[];$n_total=0;
+    for($i=0;$i<4;$i++){
+        $succ=$successors[$i];$K=count($succ);
+        if($K===0){$P[$i]=array_fill(0,4,0.0);$P[$i][$i]=1.0;continue;}
+        $N=array_sum(array_map(fn($j)=>$counts[$i][$j],$succ));$n_total+=$N;
+        $row=array_fill(0,4,0.0);
+        foreach($succ as $j)$row[$j]=round(($counts[$i][$j]+1)/($N+$K),6);
+        $P[$i]=$row;
+    }
+    $conf=$n_total<10?'low':($n_total<50?'medium':'high');
+    // Persist to markov_params_strat (upsert by severity_class)
+    try{
+        $N_mat=markov_fundamental_matrix($P);
+        $steps=markov_expected_steps($N_mat);
+        db()->prepare("INSERT INTO markov_params_strat(severity_class,computed_at,state_count,p_matrix_json,n_matrix_json,e_steps_json,sample_n,confidence) VALUES(?,datetime('now'),4,?,?,?,?,?) ON CONFLICT(severity_class) DO UPDATE SET computed_at=excluded.computed_at,p_matrix_json=excluded.p_matrix_json,n_matrix_json=excluded.n_matrix_json,e_steps_json=excluded.e_steps_json,sample_n=excluded.sample_n,confidence=excluded.confidence")
+            ->execute([$sev_class,json_encode($P),json_encode($N_mat),json_encode($steps),$n_total,$conf]);
+    }catch(\Throwable){}
+    return['P'=>$P,'n'=>$n_total,'confidence'=>$conf,'sev_class'=>$sev_class];
+}
+
 function markov_fundamental_matrix(array $P):array{
     // Transient states: 0(announced),1(active) — absorbing: 2,3
     // Q = 2x2 transient submatrix; N = (I-Q)^-1 via 2x2 closed form
@@ -1789,25 +1901,77 @@ function markov_refresh_cache():array{
     $est=markov_estimate_matrix();
     $N=markov_fundamental_matrix($est['P']);
     $steps=markov_expected_steps($N);
+    // GROUP 16: compute empirical median cycle_days from recall_transitions
+    $cycle_days=14.0; // default
+    try{
+        $cd=db()->query("SELECT AVG(CAST((JULIANDAY(transitioned_at)-JULIANDAY(LAG(transitioned_at) OVER(PARTITION BY recall_id ORDER BY transitioned_at))) AS REAL)) as avg_cycle FROM recall_transitions WHERE transitioned_at IS NOT NULL")->fetchColumn();
+        if($cd&&(float)$cd>0)$cycle_days=round((float)$cd,2);
+    }catch(\Throwable){}
     // Also re-calibrate per-category λ while we're refreshing
     try{update_category_lambdas();}catch(\Throwable $ignored){}
+    // GROUP 15: refresh stratified matrices
+    try{markov_estimate_matrix_stratified('high');}catch(\Throwable){}
+    try{markov_estimate_matrix_stratified('medium');}catch(\Throwable){}
+    try{markov_estimate_matrix_stratified('low');}catch(\Throwable){}
     try{
-        db()->prepare("INSERT INTO markov_params(computed_at,state_count,p_matrix_json,n_matrix_json,e_steps_json,sample_n,confidence) VALUES(datetime('now'),4,?,?,?,?,?)")
-            ->execute([json_encode($est['P']),json_encode($N),json_encode($steps),$est['n'],$est['confidence']]);
-        return['ok'=>true,'n'=>$est['n'],'confidence'=>$est['confidence'],'steps'=>$steps];
+        db()->prepare("INSERT INTO markov_params(computed_at,state_count,p_matrix_json,n_matrix_json,e_steps_json,sample_n,confidence,cycle_days) VALUES(datetime('now'),4,?,?,?,?,?,?)")
+            ->execute([json_encode($est['P']),json_encode($N),json_encode($steps),$est['n'],$est['confidence'],$cycle_days]);
+        return['ok'=>true,'n'=>$est['n'],'confidence'=>$est['confidence'],'steps'=>$steps,'cycle_days'=>$cycle_days];
     }catch(\Throwable $e){return['ok'=>false,'error'=>$e->getMessage()];}
 }
 
-// Markov CI bands via ±ε perturbation of transition matrix entries (T02)
-// Returns ['lo'=>float, 'hi'=>float] day-range for state $s at horizon $k cycles
+// GROUP 17: Bayesian credible interval via Dirichlet posterior sampling
+// alpha: row vector of pseudo-counts α_j for state s (Dirichlet concentration)
+// Returns ['lo'=>pct, 'hi'=>pct, 'base'=>pct] at horizon k for state s
+function markov_bayesian_ci(array $alpha,array $P_base,int $s,int $k,int $samples=200):array{
+    $p_samples=[];
+    $K=count($alpha);
+    for($iter=0;$iter<$samples;$iter++){
+        // Sample from Dirichlet(alpha) via Gamma variates
+        $G=[];$sumG=0;
+        foreach($alpha as $a){$g=-log(mt_rand(1,PHP_INT_MAX)/PHP_INT_MAX)*$a;$G[]=$g;$sumG+=$g;}
+        if($sumG<1e-9){$p_samples[]=$P_base;continue;}
+        $row_s=array_map(fn($g)=>$g/$sumG,$G);
+        $P_s=$P_base;$P_s[$s]=$row_s+array_fill(0,4,0.0);
+        // Rebuild 4-element row: only transient entries 0,1 are sampled; absorbing are 0
+        $P_s[$s]=array_replace(array_fill(0,4,0.0),$P_s[$s]);
+        $N_s=markov_fundamental_matrix($P_s);
+        $p_samples[]=markov_p_resolved_in_k($P_s,$N_s,$s,$k);
+    }
+    sort($p_samples);
+    $lo=$p_samples[(int)floor($samples*0.05)]??0.0;
+    $hi=$p_samples[(int)floor($samples*0.95)]??1.0;
+    $base=markov_p_resolved_in_k($P_base,markov_fundamental_matrix($P_base),$s,$k);
+    return['lo'=>round($lo*100),'hi'=>round($hi*100),'base'=>round($base*100)];
+}
+
+// Markov CI bands — GROUP 17: use Bayesian CI when transition counts available, else ±ε perturbation
+// Returns ['lo'=>pct, 'hi'=>pct] for state $s at horizon $k cycles
 function markov_ci_band(array $P,array $N,int $s,int $k,float $eps=0.05):array{
     $p30_base=markov_p_resolved_in_k($P,$N,$s,$k);
-    // Perturb transient self-loop P[s][s] ±ε and recompute
+    // Try Bayesian approach: fetch transition counts for row s from DB
+    try{
+        $smap=['announced','active','resolved','archived'];
+        $from_status=$smap[$s]??'active';
+        $rows=db()->query("SELECT to_status,SUM(cnt) as total FROM(SELECT to_status,COUNT(*) as cnt FROM recall_transitions WHERE from_status=? GROUP BY to_status) GROUP BY to_status",$from_status??null);
+        // parameterized
+        $stmt=db()->prepare("SELECT to_status,COUNT(*) as cnt FROM recall_transitions WHERE from_status=? GROUP BY to_status");
+        $stmt->execute([$from_status]);$counts=$stmt->fetchAll();
+        if($counts&&array_sum(array_column($counts,'cnt'))>=5){
+            // Build Dirichlet alpha vector: α_j = count_j + 0.5 (Jeffreys prior)
+            $tmap=['announced'=>0,'active'=>1,'ongoing'=>1,'resolved'=>2,'completed'=>2,'terminated'=>2,'archived'=>3];
+            $alpha_arr=array_fill(0,2,0.5); // only transient states 0,1 matter for Q
+            foreach($counts as $c){$j=$tmap[strtolower($c['to_status'])]??-1;if($j>=0&&$j<2)$alpha_arr[$j]+=$c['cnt'];}
+            $ci=markov_bayesian_ci($alpha_arr,$P,$s,$k);
+            return['lo'=>$ci['lo'],'hi'=>$ci['hi'],'base'=>$ci['base']];
+        }
+    }catch(\Throwable){}
+    // Fallback: ±ε perturbation
     $P_lo=$P;$P_hi=$P;
     $P_lo[$s][$s]=max(0,$P[$s][$s]-$eps);
-    $P_lo[$s][1-$s]=min(1,$P[$s][1-$s]+$eps);
+    if($s<2)$P_lo[$s][1-$s]=min(1,$P[$s][1-$s]+$eps);
     $P_hi[$s][$s]=min(1,$P[$s][$s]+$eps);
-    $P_hi[$s][1-$s]=max(0,$P[$s][1-$s]-$eps);
+    if($s<2)$P_hi[$s][1-$s]=max(0,$P[$s][1-$s]-$eps);
     $N_lo=markov_fundamental_matrix($P_lo);
     $N_hi=markov_fundamental_matrix($P_hi);
     $p_lo=markov_p_resolved_in_k($P_lo,$N_lo,$s,$k);
@@ -1817,15 +1981,18 @@ function markov_ci_band(array $P,array $N,int $s,int $k,float $eps=0.05):array{
 
 function q_recall_outlook(int $recall_id):array{
     try{
-        $params=db()->query("SELECT p_matrix_json,n_matrix_json,e_steps_json,sample_n,confidence FROM markov_params ORDER BY id DESC LIMIT 1")->fetch();
+        // GROUP 16: load cycle_days from stored params
+        $params=db()->query("SELECT p_matrix_json,n_matrix_json,e_steps_json,sample_n,confidence,cycle_days FROM markov_params ORDER BY id DESC LIMIT 1")->fetch();
     }catch(\Throwable){$params=null;}
     if(!$params){
         // Compute on-demand (first call); cache for next
         $est=markov_estimate_matrix();
         $N_mat=markov_fundamental_matrix($est['P']);
-        $params=['p_matrix_json'=>json_encode($est['P']),'n_matrix_json'=>json_encode($N_mat),'e_steps_json'=>json_encode(markov_expected_steps($N_mat)),'sample_n'=>$est['n'],'confidence'=>$est['confidence']];
-        try{db()->prepare("INSERT INTO markov_params(computed_at,state_count,p_matrix_json,n_matrix_json,e_steps_json,sample_n,confidence) VALUES(datetime('now'),4,?,?,?,?,?)")->execute([$params['p_matrix_json'],$params['n_matrix_json'],$params['e_steps_json'],$params['sample_n'],$params['confidence']]);}catch(\Throwable){}
+        $params=['p_matrix_json'=>json_encode($est['P']),'n_matrix_json'=>json_encode($N_mat),'e_steps_json'=>json_encode(markov_expected_steps($N_mat)),'sample_n'=>$est['n'],'confidence'=>$est['confidence'],'cycle_days'=>14];
+        try{db()->prepare("INSERT INTO markov_params(computed_at,state_count,p_matrix_json,n_matrix_json,e_steps_json,sample_n,confidence,cycle_days) VALUES(datetime('now'),4,?,?,?,?,?,?)")->execute([$params['p_matrix_json'],$params['n_matrix_json'],$params['e_steps_json'],$params['sample_n'],$params['confidence'],14]);}catch(\Throwable){}
     }
+    // GROUP 16: use stored empirical cycle_days
+    $cycle=max(1.0,(float)($params['cycle_days']??14));
     $P=json_decode($params['p_matrix_json'],true)??[];
     $N_mat=json_decode($params['n_matrix_json'],true)??[];
     $e_steps=json_decode($params['e_steps_json'],true)??[4.0,3.0];
@@ -1834,7 +2001,20 @@ function q_recall_outlook(int $recall_id):array{
     if(!$rec)return['error'=>'Not found'];
     $smap=['announced'=>0,'active'=>1,'ongoing'=>1,'resolved'=>2,'completed'=>2,'terminated'=>2,'archived'=>3];
     $state=$smap[strtolower($rec['status']??'active')]??1;
-    $cycle=14; // median days per review cycle
+    // GROUP 15: try to use severity-matched stratified matrix
+    $sev=(float)($rec['severity']??0);
+    $sev_class=$sev>=3.0?'high':($sev>=2.0?'medium':'low');
+    $strat_P=null;$strat_indicator=false;
+    try{
+        $sp=db()->prepare("SELECT p_matrix_json,n_matrix_json,confidence,sample_n FROM markov_params_strat WHERE severity_class=? ORDER BY id DESC LIMIT 1");
+        $sp->execute([$sev_class]);$sp_row=$sp->fetch();
+        if($sp_row&&(int)$sp_row['sample_n']>=5){
+            $strat_P=json_decode($sp_row['p_matrix_json'],true);
+            $N_mat=json_decode($sp_row['n_matrix_json'],true);
+            $strat_indicator=true;
+        }
+    }catch(\Throwable){}
+    if($strat_P)$P=$strat_P;
     $k30=max(1,(int)round(30/$cycle));$k60=max(1,(int)round(60/$cycle));
     $p30=markov_p_resolved_in_k($P,$N_mat,$state,$k30);
     $p60=markov_p_resolved_in_k($P,$N_mat,$state,$k60);
@@ -1844,12 +2024,12 @@ function q_recall_outlook(int $recall_id):array{
     $days_stmt=db()->prepare("SELECT COALESCE(CAST((julianday('now')-julianday(MAX(transitioned_at))) AS INTEGER),0) FROM recall_transitions WHERE recall_id=?");
     $days_stmt->execute([$recall_id]);$days_in_state=(int)$days_stmt->fetchColumn();
     $labels=['announced','active','resolved','archived'];
-    // GROUP 12: Add CI band for 30d horizon
+    // GROUP 12 + 17: CI band (Bayesian when counts sufficient, else perturbation)
     $ci30=markov_ci_band($P,$N_mat,$state,$k30);
     $ci60=markov_ci_band($P,$N_mat,$state,$k60);
     // Worst-case SLA (GROUP 23 – 95th percentile estimate)
     $sla_95=max($e_high,(int)round($e_raw*1.95));
-    return['state'=>$state,'state_name'=>$labels[$state]??'unknown','p_resolved_30d'=>$p30,'p_resolved_60d'=>$p60,'p_escalation'=>$p_esc,'expected_days_low'=>$e_low,'expected_days_high'=>$e_high,'confidence'=>$params['confidence']??'low','sample_n'=>(int)$params['sample_n'],'days_in_state'=>$days_in_state,'ci_lo_30d'=>$ci30['lo'],'ci_hi_30d'=>$ci30['hi'],'ci_lo_60d'=>$ci60['lo'],'ci_hi_60d'=>$ci60['hi'],'sla_95'=>$sla_95];
+    return['state'=>$state,'state_name'=>$labels[$state]??'unknown','p_resolved_30d'=>$p30,'p_resolved_60d'=>$p60,'p_escalation'=>$p_esc,'expected_days_low'=>$e_low,'expected_days_high'=>$e_high,'confidence'=>$params['confidence']??'low','sample_n'=>(int)$params['sample_n'],'days_in_state'=>$days_in_state,'ci_lo_30d'=>$ci30['lo'],'ci_hi_30d'=>$ci30['hi'],'ci_lo_60d'=>$ci60['lo'],'ci_hi_60d'=>$ci60['hi'],'sla_95'=>$sla_95,'stratified'=>$strat_indicator,'sev_class'=>$sev_class,'cycle_days'=>$cycle];
 }
 
 function q_seasonal():array{
@@ -1903,15 +2083,20 @@ function q_timeline_data(int $limit=60):array{
 
 function q_geo_risk():array{
     // L² norm: SQRT(Σ r²) instead of additive SUM — penalises concentration and captures tail risk
+    // GROUP 20: LEFT JOIN state_population for per-capita normalization (per 100k residents)
     $stmt=db()->query("
         SELECT rs.state_code,
           COUNT(DISTINCT rs.recall_id) as total,
           COUNT(DISTINCT CASE WHEN rc.status='ongoing' THEN rs.recall_id END) as active,
           ROUND(SQRT(SUM(POWER(COALESCE(re.event_risk,rc.severity*0.25),2))),3) as risk_score,
-          SUM(CASE WHEN rc.severity>=3.0 THEN 1 ELSE 0 END) as severe
+          SUM(CASE WHEN rc.severity>=3.0 THEN 1 ELSE 0 END) as severe,
+          sp.population as population,
+          CASE WHEN sp.population>0 THEN ROUND(COUNT(DISTINCT rs.recall_id)*100000.0/sp.population,4) ELSE NULL END as total_per_100k,
+          CASE WHEN sp.population>0 THEN ROUND(SQRT(SUM(POWER(COALESCE(re.event_risk,rc.severity*0.25),2)))*100000.0/sp.population,6) ELSE NULL END as risk_per_100k
         FROM recall_states rs
         JOIN recalls rc ON rc.id=rs.recall_id
         LEFT JOIN retail_exposures re ON re.recall_id=rs.recall_id
+        LEFT JOIN state_population sp ON sp.state_code=rs.state_code
         WHERE rs.state_code!='nationwide'
         GROUP BY rs.state_code");
     $rows=$stmt->fetchAll();
@@ -3128,6 +3313,8 @@ function view_recall_detail():void{
          x-init="fetch('?api=recall_outlook&id=<?=(int)$id?>').then(r=>r.json()).then(d=>{outlook=d;loading=false}).catch(()=>{err=true;loading=false})">
       <h3 class="text-sm font-semibold text-indigo-800 mb-3 flex items-center gap-2">
         <i data-lucide="activity" class="w-4 h-4"></i>Recall Outlook
+        <!-- GROUP 15: stratified matrix indicator -->
+        <span x-show="!loading&&outlook&&outlook.stratified" class="text-xs font-normal bg-violet-100 text-violet-700 border border-violet-300 px-1.5 py-0.5 rounded" :title="'Severity-stratified matrix ('+outlook?.sev_class+' class)'">Stratified</span>
         <span x-show="!loading&&outlook&&outlook.confidence==='low'" class="ml-auto text-xs font-normal bg-amber-100 text-amber-700 border border-amber-300 px-1.5 py-0.5 rounded">Low data</span>
       </h3>
       <div x-show="loading" class="text-xs text-indigo-500 animate-pulse">Computing model…</div>
@@ -3166,6 +3353,8 @@ function view_recall_detail():void{
       </dl>
       <p x-show="!loading&&!err&&outlook&&(outlook.sample_n??0)>=10" class="text-xs text-indigo-500 mt-3">
         Markov model · n=<span x-text="outlook?.sample_n??0"></span> transitions · <span x-text="outlook?.confidence??'low'"></span> confidence
+        <!-- GROUP 16: show empirical cycle_days -->
+        <span x-show="outlook?.cycle_days"> · cycle <span x-text="(+(outlook?.cycle_days??14)).toFixed(1)"></span>d</span>
       </p>
     </div>
     <?php endif; ?>
@@ -3639,25 +3828,45 @@ function view_geo():void{
         }
     }catch(\Throwable){$geo_trend=[];}
     layout_head('Geographic Distribution','geo'); ?>
-<div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+<!-- GROUP 20: per-capita toggle -->
+<div class="mb-3 flex items-center gap-3" x-data="{percapita:false}">
+  <label class="flex items-center gap-2 text-sm text-slate-600 cursor-pointer select-none">
+    <input type="checkbox" x-model="percapita" class="rounded text-fw-500 focus:ring-fw-500">
+    <span>Show per 100k residents</span>
+  </label>
+  <span class="text-xs text-slate-400">(requires state population data in state_population table)</span>
+</div>
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-6" x-data="{percapita:false}">
   <div class="bg-white rounded-lg border border-slate-200 shadow-sm">
-    <div class="px-4 py-3 border-b border-slate-200"><h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="map" class="w-4 h-4 text-green-500"></i>Recalls by State (Active)</h2></div>
+    <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+      <h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="map" class="w-4 h-4 text-green-500"></i>Recalls by State (Active)</h2>
+      <label class="flex items-center gap-1.5 text-xs text-slate-500 cursor-pointer">
+        <input type="checkbox" x-model="percapita" class="rounded text-fw-500 focus:ring-fw-500 w-3 h-3">Per 100k
+      </label>
+    </div>
     <table class="fw-table w-full max-h-96 overflow-y-auto block">
-      <thead><tr><th>State</th><th>Active Recalls</th><th title="14-day trend">Trend</th><th>Total Recalls</th><th>Action</th></tr></thead>
+      <thead><tr><th>State</th><th>Active Recalls</th><th title="14-day trend">Trend</th><th x-text="percapita?'Total/100k':'Total'">Total</th><th x-show="percapita">Risk/100k</th><th>Action</th></tr></thead>
       <tbody>
       <?php foreach($geo as $row): ?>
       <?php $gt=$geo_trend[$row['state_code']]??['recent'=>0,'prior'=>0];
             $tdelta=$gt['recent']-$gt['prior'];
             $tarrow=$tdelta>0?'↑':($tdelta<0?'↓':'→');
-            $tcls=$tdelta>0?'text-red-600':($tdelta<0?'text-green-600':'text-slate-400'); ?>
+            $tcls=$tdelta>0?'text-red-600':($tdelta<0?'text-green-600':'text-slate-400');
+            $total_100k=$row['total_per_100k']??null;
+            $risk_100k=$row['risk_per_100k']??null;
+      ?>
       <tr><td><?=h(US_STATES[$row['state_code']]??$row['state_code'])?> (<?=h($row['state_code'])?>)</td>
         <td class="text-center font-bold <?=$row['active']>0?'text-red-600':'text-slate-400'?>"><?=(int)$row['active']?></td>
         <td class="text-center text-sm font-bold <?=$tcls?>" title="14d delta: <?=$tdelta>=0?'+':''?><?=$tdelta?>"><?=$tarrow?> <?=$tdelta!=0?abs($tdelta):''?></td>
-        <td class="text-center"><?=(int)$row['total']?></td>
+        <td class="text-center">
+          <span x-show="!percapita"><?=(int)$row['total']?></span>
+          <span x-show="percapita" title="Per 100k residents"><?=$total_100k!==null?number_format((float)$total_100k,2):'—'?></span>
+        </td>
+        <td class="text-center" x-show="percapita"><?=$risk_100k!==null?number_format((float)$risk_100k,4):'—'?></td>
         <td><a href="?page=recalls&state=<?=h($row['state_code'])?>" class="text-xs text-fw-500 hover:underline">View recalls</a></td>
       </tr>
       <?php endforeach; ?>
-      <?php if(empty($geo)): ?><tr><td colspan="5" class="text-center py-6 text-slate-400">No geographic data. Run ingestion first.</td></tr><?php endif; ?>
+      <?php if(empty($geo)): ?><tr><td colspan="6" class="text-center py-6 text-slate-400">No geographic data. Run ingestion first.</td></tr><?php endif; ?>
       </tbody>
     </table>
   </div>
@@ -4767,19 +4976,25 @@ function view_analytics():void{
 function view_map():void{
     $geo_risk=q_geo_risk();
     layout_head('Choropleth Map','map'); ?>
-<div class="mb-3 text-sm text-slate-600">US states colored by total recall count. Hover for details; click to filter recalls by state.</div>
+<!-- GROUP 20: per-capita toggle for choropleth -->
+<div class="mb-3 flex items-center gap-4 flex-wrap" x-data="{}" id="map-controls">
+  <span class="text-sm text-slate-600">US states colored by recall count. Hover for details; click to filter.</span>
+  <label class="flex items-center gap-2 text-sm text-slate-600 cursor-pointer">
+    <input type="checkbox" id="map-percapita" class="rounded text-fw-500 focus:ring-fw-500"> Per 100k residents
+  </label>
+</div>
 <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
   <div class="lg:col-span-2 bg-white rounded-lg border border-slate-200 shadow-sm p-3">
     <div id="us-map" style="width:100%;min-height:380px"></div>
   </div>
   <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
-    <h3 class="text-sm font-semibold text-slate-700 mb-3">Top States by Recall Count</h3>
+    <h3 class="text-sm font-semibold text-slate-700 mb-3" id="state-list-heading">Top States by Recall Count</h3>
     <div id="state-list" class="space-y-1 max-h-80 overflow-y-auto text-sm"></div>
     <div id="map-tooltip" class="hidden mt-3 p-3 bg-slate-50 rounded border border-slate-200 text-xs"></div>
   </div>
 </div>
 <div class="mt-2 text-xs text-slate-500 flex items-center gap-4">
-  <span>Color scale: light = fewer recalls → dark blue = most recalls</span>
+  <span>Color scale: light = fewer → dark blue = most</span>
   <span>Includes nationwide recalls in all states</span>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/topojson-client@3/dist/topojson.min.js"></script>
@@ -4789,41 +5004,72 @@ function view_map():void{
   const byState={};
   geoRisk.forEach(d=>{byState[d.state_code]=d;});
 
-  // State list
-  const sorted=[...geoRisk].sort((a,b)=>+b.total-+a.total).slice(0,20);
-  const maxT=sorted[0]?+sorted[0].total:1;
-  const listEl=document.getElementById('state-list');
-  sorted.forEach(d=>{
-    const pct=Math.round(+d.total/maxT*100);
-    listEl.innerHTML+=`<div class="flex items-center gap-2 cursor-pointer hover:bg-slate-50 rounded px-1" onclick="location='?page=recalls&state=${d.state_code}'">
-      <span class="text-xs font-mono text-slate-500 w-6">${d.state_code}</span>
-      <div class="flex-1 h-2 bg-slate-100 rounded"><div class="h-2 bg-blue-600 rounded" style="width:${pct}%"></div></div>
-      <span class="text-xs font-semibold text-slate-700 w-6 text-right">${d.total}</span>
-    </div>`;
-  });
+  // GROUP 20: toggle state — default false
+  let perCapita=false;
+  const pcToggle=document.getElementById('map-percapita');
+  if(pcToggle)pcToggle.addEventListener('change',()=>{perCapita=pcToggle.checked;renderList();renderMap();});
+
+  function getVal(d){
+    if(perCapita&&d.total_per_100k!=null)return +d.total_per_100k;
+    return +d.total;
+  }
+
+  function renderList(){
+    const listEl=document.getElementById('state-list');
+    const heading=document.getElementById('state-list-heading');
+    if(!listEl)return;
+    if(heading)heading.textContent=perCapita?'Top States (per 100k)':'Top States by Recall Count';
+    const sorted=[...geoRisk].sort((a,b)=>getVal(b)-getVal(a)).slice(0,20);
+    const maxT=sorted[0]?getVal(sorted[0]):1;
+    listEl.innerHTML='';
+    sorted.forEach(d=>{
+      const v=getVal(d);
+      const pct=Math.round(v/maxT*100);
+      const label=perCapita?v.toFixed(2):Math.round(v);
+      listEl.innerHTML+=`<div class="flex items-center gap-2 cursor-pointer hover:bg-slate-50 rounded px-1" onclick="location='?page=recalls&state=${d.state_code}'">
+        <span class="text-xs font-mono text-slate-500 w-6">${d.state_code}</span>
+        <div class="flex-1 h-2 bg-slate-100 rounded"><div class="h-2 bg-blue-600 rounded" style="width:${pct}%"></div></div>
+        <span class="text-xs font-semibold text-slate-700 w-8 text-right">${label}</span>
+      </div>`;
+    });
+  }
+  renderList();
 
   // Load TopoJSON and render map
+  let svgEl=null;let colorFn=null;let pathFn=null;let fips={
+    '01':'AL','02':'AK','04':'AZ','05':'AR','06':'CA','08':'CO','09':'CT','10':'DE','11':'DC',
+    '12':'FL','13':'GA','15':'HI','16':'ID','17':'IL','18':'IN','19':'IA','20':'KS','21':'KY',
+    '22':'LA','23':'ME','24':'MD','25':'MA','26':'MI','27':'MN','28':'MS','29':'MO','30':'MT',
+    '31':'NE','32':'NV','33':'NH','34':'NJ','35':'NM','36':'NY','37':'NC','38':'ND','39':'OH',
+    '40':'OK','41':'OR','42':'PA','44':'RI','45':'SC','46':'SD','47':'TN','48':'TX','49':'UT',
+    '50':'VT','51':'VA','53':'WA','54':'WV','55':'WI','56':'WY','72':'PR','78':'VI'
+  };
+  let statesFeatures=null;
+
+  function renderMap(){
+    if(!statesFeatures)return;
+    const el=document.getElementById('us-map');
+    const maxV=d3.max(geoRisk,d=>getVal(d))||1;
+    const color=d3.scaleSequential([0,maxV],d3.interpolateBlues);
+    const tip=document.getElementById('map-tooltip');
+    if(svgEl)svgEl.selectAll('path.state')
+      .attr('fill',d=>{const code=fips[String(+d.id).padStart(2,'0')];const info=byState[code];return info&&getVal(info)>0?color(getVal(info)):'#e2e8f0';});
+  }
+
   fetch('https://cdn.jsdelivr.net/npm/us-atlas@3/states-10m.json')
     .then(r=>r.json())
     .then(us=>{
-      const states=topojson.feature(us,us.objects.states);
-      const fips={
-        '01':'AL','02':'AK','04':'AZ','05':'AR','06':'CA','08':'CO','09':'CT','10':'DE','11':'DC',
-        '12':'FL','13':'GA','15':'HI','16':'ID','17':'IL','18':'IN','19':'IA','20':'KS','21':'KY',
-        '22':'LA','23':'ME','24':'MD','25':'MA','26':'MI','27':'MN','28':'MS','29':'MO','30':'MT',
-        '31':'NE','32':'NV','33':'NH','34':'NJ','35':'NM','36':'NY','37':'NC','38':'ND','39':'OH',
-        '40':'OK','41':'OR','42':'PA','44':'RI','45':'SC','46':'SD','47':'TN','48':'TX','49':'UT',
-        '50':'VT','51':'VA','53':'WA','54':'WV','55':'WI','56':'WY','72':'PR','78':'VI'
-      };
+      statesFeatures=topojson.feature(us,us.objects.states);
       const el=document.getElementById('us-map');
       const W=el.offsetWidth||600;const H=Math.round(W*0.62);
-      const proj=d3.geoAlbersUsa().fitSize([W,H],states);
+      const proj=d3.geoAlbersUsa().fitSize([W,H],statesFeatures);
       const path=d3.geoPath().projection(proj);
       const maxV=d3.max(geoRisk,d=>+d.total)||1;
       const color=d3.scaleSequential([0,maxV],d3.interpolateBlues);
-      const svg=d3.select('#us-map').append('svg').attr('width','100%').attr('viewBox',`0 0 ${W} ${H}`);
+      svgEl=d3.select('#us-map').append('svg').attr('width','100%').attr('viewBox',`0 0 ${W} ${H}`);
       const tip=document.getElementById('map-tooltip');
-      svg.selectAll('path').data(states.features).enter().append('path')
+      svgEl.selectAll('path.state').data(statesFeatures.features).enter().append('path')
+        .attr('class','state')
         .attr('d',path)
         .attr('fill',d=>{const code=fips[String(+d.id).padStart(2,'0')];const info=byState[code];return info&&+info.total>0?color(+info.total):'#e2e8f0';})
         .attr('stroke','#fff').attr('stroke-width',0.5)
@@ -4831,14 +5077,14 @@ function view_map():void{
         .on('mouseover',function(e,d){
           d3.select(this).attr('stroke','#1e3a5f').attr('stroke-width',1.5);
           const code=fips[String(+d.id).padStart(2,'0')];
-          const info=byState[code]||{total:0,active:0,risk_score:0,severe:0};
+          const info=byState[code]||{total:0,active:0,risk_score:0,severe:0,total_per_100k:null,risk_per_100k:null};
           tip.classList.remove('hidden');
-          tip.innerHTML=`<strong>${code||'?'}</strong><br>Total recalls: ${info.total||0}<br>Active: ${info.active||0}<br>Severe (Class I): ${info.severe||0}<br>Risk score: ${(+info.risk_score||0).toFixed(2)}`;
+          const pcLine=info.total_per_100k!=null?`<br>Per 100k: ${(+info.total_per_100k).toFixed(2)} recalls, ${(+(info.risk_per_100k||0)).toFixed(4)} risk`:'';
+          tip.innerHTML=`<strong>${code||'?'}</strong><br>Total recalls: ${info.total||0}<br>Active: ${info.active||0}<br>Severe (Class I): ${info.severe||0}<br>Risk score: ${(+info.risk_score||0).toFixed(2)}${pcLine}`;
         })
         .on('mouseout',function(){d3.select(this).attr('stroke','#fff').attr('stroke-width',0.5);tip.classList.add('hidden');})
         .on('click',(e,d)=>{const code=fips[String(+d.id).padStart(2,'0')];if(code)location='?page=recalls&state='+code;});
-      // State borders mesh
-      svg.append('path').datum(topojson.mesh(us,us.objects.states,(a,b)=>a!==b))
+      svgEl.append('path').datum(topojson.mesh(us,us.objects.states,(a,b)=>a!==b))
         .attr('fill','none').attr('stroke','#fff').attr('stroke-width',0.5).attr('d',path);
     })
     .catch(()=>{document.getElementById('us-map').innerHTML='<p class="text-sm text-slate-400 text-center py-12">Map unavailable — check network connection.</p>';});
