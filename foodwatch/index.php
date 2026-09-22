@@ -1464,6 +1464,11 @@ function q_recall(int $id):?array{
     $stmt=$db->prepare('SELECT h.type,h.name,h.slug,rh.confidence FROM recall_hazards rh JOIN hazards h ON h.id=rh.hazard_id WHERE rh.recall_id=?');$stmt->execute([$id]);$rec['hazards']=$stmt->fetchAll();
     $stmt=$db->prepare('SELECT m.id as mfr_id,m.name,m.city,m.state,rm.relationship_type,rm.confidence FROM recall_manufacturers rm JOIN manufacturers m ON m.id=rm.manufacturer_id WHERE rm.recall_id=?');$stmt->execute([$id]);$rec['manufacturers']=$stmt->fetchAll();
     $stmt=$db->prepare('SELECT rt.id as retailer_id,rt.name,rr.relationship_type,rr.confidence FROM recall_retailers rr JOIN retailers rt ON rt.id=rr.retailer_id WHERE rr.recall_id=?');$stmt->execute([$id]);$rec['retailers']=$stmt->fetchAll();
+    // GROUP 10: Load distributors associated with this recall
+    try{
+        $stmt=$db->prepare('SELECT d.id as dist_id,d.name,d.city,d.state,rd.relationship_type,rd.confidence FROM recall_distributors rd JOIN distributors d ON d.id=rd.distributor_id WHERE rd.recall_id=?');
+        $stmt->execute([$id]);$rec['distributors']=$stmt->fetchAll();
+    }catch(\Throwable){$rec['distributors']=[];}
     $stmt=$db->prepare('SELECT state_code,nationwide FROM recall_states WHERE recall_id=?');$stmt->execute([$id]);$rec['states']=$stmt->fetchAll();
     $stmt=$db->prepare('SELECT update_type,description,field_changed,old_value,new_value,updated_at FROM recall_updates WHERE recall_id=? ORDER BY updated_at DESC');$stmt->execute([$id]);$rec['updates']=$stmt->fetchAll();
     $stmt=$db->prepare('SELECT flag_type,description,severity FROM data_quality_flags WHERE recall_id=?');$stmt->execute([$id]);$rec['dq_flags']=$stmt->fetchAll();
@@ -1839,7 +1844,12 @@ function q_recall_outlook(int $recall_id):array{
     $days_stmt=db()->prepare("SELECT COALESCE(CAST((julianday('now')-julianday(MAX(transitioned_at))) AS INTEGER),0) FROM recall_transitions WHERE recall_id=?");
     $days_stmt->execute([$recall_id]);$days_in_state=(int)$days_stmt->fetchColumn();
     $labels=['announced','active','resolved','archived'];
-    return['state'=>$state,'state_name'=>$labels[$state]??'unknown','p_resolved_30d'=>$p30,'p_resolved_60d'=>$p60,'p_escalation'=>$p_esc,'expected_days_low'=>$e_low,'expected_days_high'=>$e_high,'confidence'=>$params['confidence']??'low','sample_n'=>(int)$params['sample_n'],'days_in_state'=>$days_in_state];
+    // GROUP 12: Add CI band for 30d horizon
+    $ci30=markov_ci_band($P,$N_mat,$state,$k30);
+    $ci60=markov_ci_band($P,$N_mat,$state,$k60);
+    // Worst-case SLA (GROUP 23 – 95th percentile estimate)
+    $sla_95=max($e_high,(int)round($e_raw*1.95));
+    return['state'=>$state,'state_name'=>$labels[$state]??'unknown','p_resolved_30d'=>$p30,'p_resolved_60d'=>$p60,'p_escalation'=>$p_esc,'expected_days_low'=>$e_low,'expected_days_high'=>$e_high,'confidence'=>$params['confidence']??'low','sample_n'=>(int)$params['sample_n'],'days_in_state'=>$days_in_state,'ci_lo_30d'=>$ci30['lo'],'ci_hi_30d'=>$ci30['hi'],'ci_lo_60d'=>$ci60['lo'],'ci_hi_60d'=>$ci60['hi'],'sla_95'=>$sla_95];
 }
 
 function q_seasonal():array{
@@ -2008,6 +2018,7 @@ function run_tests():array{
         'rate_limit'    =>'test_rate_limit',
         'saved_filters' =>'test_saved_filters',
         'watchlist_user'=>'test_watchlist_user',
+        'cdc_api'       =>'test_cdc_api',
     ];
     foreach($tests as $name=>$fn){
         try{
@@ -2222,6 +2233,15 @@ function test_watchlist_user():array{
     db()->prepare('DELETE FROM users WHERE id=?')->execute([$uid]);
     if($cnt!==1)return['status'=>'FAIL','msg'=>"Expected 1 entry, got $cnt (partial unique index failed)"];
     return['status'=>'PASS','msg'=>'User watchlist insert+dedup: PASS'];
+}
+
+// GROUP 13: CDC API connectivity test
+function test_cdc_api():array{
+    $url='https://data.cdc.gov/api/id/9tmd-k2qt.json?$limit=1';
+    $result=fw_fetch($url,[],8);
+    if(!$result['ok'])return['status'=>'WARN','msg'=>'CDC API unreachable: '.($result['error']??'HTTP '.$result['status'])];
+    if(empty($result['data']))return['status'=>'WARN','msg'=>'CDC API returned empty response (may be rate limited)'];
+    return['status'=>'PASS','msg'=>'CDC NORS API reachable; sample record received'];
 }
 
 // ================================================================
@@ -2679,6 +2699,8 @@ function render_page(string $p):void{
         'retailer'      =>view_retailer_detail(),
         'manufacturers' =>view_manufacturers(),
         'manufacturer'  =>view_manufacturer_detail(),
+        'distributor'   =>view_distributor_detail(),
+        'brand'         =>view_brand_detail(),
         'categories'    =>view_categories(),
         'analytics'     =>view_analytics(),
         'map'           =>view_map(),
@@ -3075,6 +3097,20 @@ function view_recall_detail():void{
     </div>
     <?php endif; ?>
 
+    <!-- GROUP 10: Distributor sidebar -->
+    <?php if(!empty($rec['distributors'])): ?>
+    <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
+      <h3 class="text-sm font-semibold text-slate-700 mb-2 flex items-center gap-2"><i data-lucide="truck" class="w-4 h-4"></i>Identified Distributors</h3>
+      <?php foreach($rec['distributors'] as $dist): ?>
+      <div class="text-sm mb-1 flex items-center justify-between">
+        <a href="?page=distributor&id=<?=(int)$dist['dist_id']?>" class="text-fw-500 hover:underline"><?=h($dist['name'])?></a>
+        <span class="text-xs text-slate-500"><?=h($dist['confidence'])?></span>
+      </div>
+      <?php if($dist['city']||$dist['state']): ?><div class="text-xs text-slate-400"><?=h(trim(($dist['city']??'').($dist['state']?', '.$dist['state']:''),', '))?></div><?php endif; ?>
+      <?php endforeach; ?>
+    </div>
+    <?php endif; ?>
+
     <!-- States -->
     <?php if($rec['states']): ?>
     <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
@@ -3102,11 +3138,17 @@ function view_recall_detail():void{
       <dl x-show="!loading&&!err&&outlook&&(outlook.sample_n??0)>=10" class="space-y-2 text-sm">
         <div class="flex justify-between items-center">
           <dt class="text-xs text-indigo-700 font-medium">P(resolved in 30d)</dt>
-          <dd class="font-bold" :class="(outlook?.p_resolved_30d??0)>0.6?'text-green-700':((outlook?.p_resolved_30d??0)>0.35?'text-amber-700':'text-red-700')" x-text="Math.round((outlook?.p_resolved_30d??0)*100)+'%'"></dd>
+          <dd class="flex flex-col items-end">
+            <span class="font-bold" :class="(outlook?.p_resolved_30d??0)>0.6?'text-green-700':((outlook?.p_resolved_30d??0)>0.35?'text-amber-700':'text-red-700')" x-text="Math.round((outlook?.p_resolved_30d??0)*100)+'%'"></span>
+            <span x-show="outlook?.ci_lo_30d!=null" class="text-xs text-indigo-400" x-text="'CI '+outlook?.ci_lo_30d+'–'+outlook?.ci_hi_30d+'%'"></span>
+          </dd>
         </div>
         <div class="flex justify-between items-center">
           <dt class="text-xs text-indigo-700 font-medium">P(resolved in 60d)</dt>
-          <dd class="font-bold" :class="(outlook?.p_resolved_60d??0)>0.7?'text-green-700':'text-slate-700'" x-text="Math.round((outlook?.p_resolved_60d??0)*100)+'%'"></dd>
+          <dd class="flex flex-col items-end">
+            <span class="font-bold" :class="(outlook?.p_resolved_60d??0)>0.7?'text-green-700':'text-slate-700'" x-text="Math.round((outlook?.p_resolved_60d??0)*100)+'%'"></span>
+            <span x-show="outlook?.ci_lo_60d!=null" class="text-xs text-indigo-400" x-text="'CI '+outlook?.ci_lo_60d+'–'+outlook?.ci_hi_60d+'%'"></span>
+          </dd>
         </div>
         <div class="flex justify-between items-center border-t border-indigo-200 pt-2">
           <dt class="text-xs text-indigo-700 font-medium">Escalation risk</dt>
@@ -3115,6 +3157,11 @@ function view_recall_detail():void{
         <div x-show="outlook?.expected_days_low" class="border-t border-indigo-200 pt-2">
           <dt class="text-xs text-indigo-700 font-medium mb-0.5">Typical resolution</dt>
           <dd class="text-sm font-semibold text-indigo-900" x-text="(outlook?.expected_days_low??'?')+'–'+(outlook?.expected_days_high??'?')+' days'"></dd>
+        </div>
+        <!-- GROUP 23: Worst-case SLA 95th pct -->
+        <div x-show="outlook?.sla_95" class="border-t border-indigo-200 pt-2 flex justify-between items-center">
+          <dt class="text-xs text-indigo-700 font-medium">Worst-case SLA (95th pct)</dt>
+          <dd class="text-sm font-semibold text-red-700" x-text="'≤ '+(outlook?.sla_95??'?')+' days'"></dd>
         </div>
       </dl>
       <p x-show="!loading&&!err&&outlook&&(outlook.sample_n??0)>=10" class="text-xs text-indigo-500 mt-3">
@@ -3394,6 +3441,125 @@ function view_retailer_detail():void{
     </div>
     <?php endif; ?>
   </div>
+</div>
+<?php layout_foot(); }
+
+// ================================================================
+// § DISTRIBUTOR DETAIL (GROUP 10)
+// ================================================================
+function q_distributor(int $id):?array{
+    $db=db();
+    $r=$db->prepare('SELECT d.id,d.name,d.normalized_name,d.city,d.state,d.created_at FROM distributors d WHERE d.id=?');
+    $r->execute([$id]);$row=$r->fetch();
+    if(!$row)return null;
+    // Active and all recalls via recall_distributors
+    try{
+        $rs=$db->prepare("SELECT r.id,r.title,r.severity,r.severity_label,r.classification,r.announced_date,r.status,a.code as agency,fc.name as category
+            FROM recall_distributors rd JOIN recalls r ON r.id=rd.recall_id JOIN agencies a ON a.id=r.agency_id LEFT JOIN food_categories fc ON fc.id=r.food_category_id
+            WHERE rd.distributor_id=? ORDER BY r.status='ongoing' DESC,r.announced_date DESC LIMIT 50");
+        $rs->execute([$id]);$row['recalls']=$rs->fetchAll();
+    }catch(\Throwable){$row['recalls']=[];}
+    return $row;
+}
+
+function view_distributor_detail():void{
+    $id=(int)($_GET['id']??0);
+    if(!$id)fw_abort('Missing distributor ID');
+    $d=q_distributor($id);
+    if(!$d)fw_abort('Distributor not found',404);
+    layout_head(h($d['name']),'retailers'); ?>
+<div class="mb-4">
+  <a href="?page=recalls" class="text-sm text-fw-500 hover:underline flex items-center gap-1"><i data-lucide="arrow-left" class="w-3 h-3"></i>Back to recalls</a>
+</div>
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-6">
+  <div class="flex items-center gap-3 mb-4">
+    <i data-lucide="truck" class="w-8 h-8 text-fw-500"></i>
+    <div>
+      <h2 class="text-xl font-bold text-slate-800"><?=h($d['name'])?></h2>
+      <?php if($d['city']||$d['state']): ?><p class="text-sm text-slate-500"><?=h(trim(($d['city']??'').($d['state']?', '.$d['state']:''),', '))?></p><?php endif; ?>
+    </div>
+  </div>
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+    <div class="text-center"><div class="text-2xl font-bold text-slate-800"><?=count($d['recalls'])?></div><div class="text-xs text-slate-500">Linked Recalls</div></div>
+    <div class="text-center"><div class="text-2xl font-bold text-red-600"><?=count(array_filter($d['recalls'],fn($r)=>$r['status']==='ongoing'))?></div><div class="text-xs text-slate-500">Active Recalls</div></div>
+  </div>
+</div>
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm">
+  <div class="px-4 py-3 border-b border-slate-200"><h3 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="alert-triangle" class="w-4 h-4 text-red-500"></i>Associated Recalls</h3></div>
+  <table class="fw-table w-full">
+    <thead><tr><th>Severity</th><th>Title</th><th>Agency</th><th>Category</th><th>Date</th><th>Status</th></tr></thead>
+    <tbody>
+    <?php foreach($d['recalls'] as $rc): ?>
+    <tr>
+      <td><?=sev_badge((float)$rc['severity'],$rc['severity_label']??'')?></td>
+      <td><a href="?page=recall&id=<?=(int)$rc['id']?>" class="text-fw-500 hover:underline"><?=h(mb_substr($rc['title'],0,70))?></a></td>
+      <td class="font-mono text-xs"><?=h($rc['agency']??'')?></td>
+      <td class="text-xs"><?=h($rc['category']??'—')?></td>
+      <td class="text-xs whitespace-nowrap"><?=h($rc['announced_date']??'—')?></td>
+      <td><?=status_badge($rc['status'])?></td>
+    </tr>
+    <?php endforeach; ?>
+    <?php if(empty($d['recalls'])): ?><tr><td colspan="6" class="text-center py-8 text-slate-400">No recalls linked to this distributor.</td></tr><?php endif; ?>
+    </tbody>
+  </table>
+</div>
+<?php layout_foot(); }
+
+// ================================================================
+// § BRAND DETAIL (GROUP 11)
+// ================================================================
+function q_brand(int $id):?array{
+    $db=db();
+    $r=$db->prepare('SELECT b.id,b.name,b.normalized_name,b.manufacturer_id,m.name as manufacturer_name FROM brands b LEFT JOIN manufacturers m ON m.id=b.manufacturer_id WHERE b.id=?');
+    $r->execute([$id]);$row=$r->fetch();
+    if(!$row)return null;
+    $rs=$db->prepare("SELECT r.id,r.title,r.severity,r.severity_label,r.classification,r.announced_date,r.status,a.code as agency,fc.name as category
+        FROM recall_products rp JOIN recalls r ON r.id=rp.recall_id JOIN agencies a ON a.id=r.agency_id LEFT JOIN food_categories fc ON fc.id=r.food_category_id
+        WHERE rp.brand_id=? ORDER BY r.status='ongoing' DESC,r.announced_date DESC LIMIT 50");
+    $rs->execute([$id]);$row['recalls']=$rs->fetchAll();
+    return $row;
+}
+
+function view_brand_detail():void{
+    $id=(int)($_GET['id']??0);
+    if(!$id)fw_abort('Missing brand ID');
+    $b=q_brand($id);
+    if(!$b)fw_abort('Brand not found',404);
+    layout_head(h($b['name']),'manufacturers'); ?>
+<div class="mb-4">
+  <?php if($b['manufacturer_id']): ?><a href="?page=manufacturer&id=<?=(int)$b['manufacturer_id']?>" class="text-sm text-fw-500 hover:underline flex items-center gap-1"><i data-lucide="arrow-left" class="w-3 h-3"></i>Back to <?=h($b['manufacturer_name']??'Manufacturer')?></a><?php else: ?><a href="?page=manufacturers" class="text-sm text-fw-500 hover:underline flex items-center gap-1"><i data-lucide="arrow-left" class="w-3 h-3"></i>Back to Manufacturers</a><?php endif; ?>
+</div>
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-6">
+  <div class="flex items-center gap-3 mb-4">
+    <i data-lucide="tag" class="w-8 h-8 text-fw-500"></i>
+    <div>
+      <h2 class="text-xl font-bold text-slate-800"><?=h($b['name'])?></h2>
+      <?php if($b['manufacturer_name']): ?><p class="text-sm text-slate-500">Brand of <a href="?page=manufacturer&id=<?=(int)$b['manufacturer_id']?>" class="text-fw-500 hover:underline"><?=h($b['manufacturer_name'])?></a></p><?php endif; ?>
+    </div>
+  </div>
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+    <div class="text-center"><div class="text-2xl font-bold text-slate-800"><?=count($b['recalls'])?></div><div class="text-xs text-slate-500">Total Recalls</div></div>
+    <div class="text-center"><div class="text-2xl font-bold text-red-600"><?=count(array_filter($b['recalls'],fn($r)=>$r['status']==='ongoing'))?></div><div class="text-xs text-slate-500">Active Recalls</div></div>
+  </div>
+</div>
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm">
+  <div class="px-4 py-3 border-b border-slate-200"><h3 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="alert-triangle" class="w-4 h-4 text-red-500"></i>Brand Recall History</h3></div>
+  <table class="fw-table w-full">
+    <thead><tr><th>Severity</th><th>Title</th><th>Agency</th><th>Category</th><th>Date</th><th>Status</th></tr></thead>
+    <tbody>
+    <?php foreach($b['recalls'] as $rc): ?>
+    <tr>
+      <td><?=sev_badge((float)$rc['severity'],$rc['severity_label']??'')?></td>
+      <td><a href="?page=recall&id=<?=(int)$rc['id']?>" class="text-fw-500 hover:underline"><?=h(mb_substr($rc['title'],0,70))?></a></td>
+      <td class="font-mono text-xs"><?=h($rc['agency']??'')?></td>
+      <td class="text-xs"><?=h($rc['category']??'—')?></td>
+      <td class="text-xs whitespace-nowrap"><?=h($rc['announced_date']??'—')?></td>
+      <td><?=status_badge($rc['status'])?></td>
+    </tr>
+    <?php endforeach; ?>
+    <?php if(empty($b['recalls'])): ?><tr><td colspan="6" class="text-center py-8 text-slate-400">No recalls linked to this brand.</td></tr><?php endif; ?>
+    </tbody>
+  </table>
 </div>
 <?php layout_foot(); }
 
@@ -4290,7 +4456,7 @@ function view_manufacturer_detail():void{
       <div class="space-y-1">
         <?php foreach($m['brands'] as $b): ?>
         <div class="flex justify-between text-sm">
-          <span class="text-slate-700"><?=h($b['name'])?></span>
+          <a href="?page=brand&id=<?=(int)$b['id']?>" class="text-fw-500 hover:underline"><?=h($b['name'])?></a>
           <span class="text-xs text-slate-400 font-mono"><?=(int)$b['recall_count']?> recall<?=$b['recall_count']!=1?'s':''?></span>
         </div>
         <?php endforeach; ?>
@@ -4410,6 +4576,21 @@ function view_analytics():void{
   <div id="trend-chart" class="p-4" style="height:240px"></div>
 </div>
 
+<!-- Seasonal Patterns Grouped Bar Chart (GROUP 14) -->
+<div class="bg-white rounded-lg border border-slate-200 shadow-sm mb-6">
+  <div class="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+    <div>
+      <h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="bar-chart-2" class="w-4 h-4 text-violet-500"></i>Seasonal Patterns — Recalls by Calendar Month</h2>
+      <p class="text-xs text-slate-500 mt-0.5">Monthly totals summed across all years. Grouped bars: all recalls vs. Class I / severe only.</p>
+    </div>
+    <div class="flex items-center gap-3 text-xs text-slate-500">
+      <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded-sm bg-violet-500"></span>All recalls</span>
+      <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded-sm bg-red-400"></span>Severe (Class I)</span>
+    </div>
+  </div>
+  <div id="seasonal-bar-chart" class="p-4 overflow-x-auto" style="min-height:200px"></div>
+</div>
+
 <!-- Seasonal Heatmap -->
 <div class="bg-white rounded-lg border border-slate-200 shadow-sm">
   <div class="px-4 py-3 border-b border-slate-200">
@@ -4454,6 +4635,73 @@ function view_analytics():void{
   }else{
     document.getElementById('trend-chart').innerHTML='<p class="text-sm text-slate-400 text-center py-8">No trend data yet. Run ingestion first.</p>';
   }
+
+  // Seasonal Patterns grouped bar chart (GROUP 14)
+  (function(){
+    const seas=<?=js($seasonal)?>;
+    const el=document.getElementById('seasonal-bar-chart');
+    if(!el)return;
+    if(!seas||!seas.length){el.innerHTML='<p class="text-sm text-slate-400 text-center py-8">No seasonal data yet. Run ingestion first.</p>';return;}
+    const mNames=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    // Aggregate totals and severe counts per calendar month (sum across all years)
+    const totals=new Array(12).fill(0),severes=new Array(12).fill(0);
+    seas.forEach(d=>{const mi=+d.month-1;if(mi>=0&&mi<12){totals[mi]+=(+d.total||0);severes[mi]+=(+d.severe||0);}});
+    const months=mNames.map((name,i)=>({name,total:totals[i],severe:severes[i],idx:i}));
+    const W=el.offsetWidth||700;
+    const m={top:16,right:16,bottom:36,left:40};
+    const H=180;
+    const iw=W-m.left-m.right,ih=H;
+    const svg=d3.select('#seasonal-bar-chart').append('svg')
+      .attr('width','100%').attr('viewBox',`0 0 ${W} ${H+m.top+m.bottom}`)
+      .attr('preserveAspectRatio','xMidYMid meet');
+    const g=svg.append('g').attr('transform',`translate(${m.left},${m.top})`);
+    // x0: month bands
+    const x0=d3.scaleBand().domain(months.map(d=>d.name)).range([0,iw]).paddingInner(0.2).paddingOuter(0.1);
+    // x1: grouped bars within a month band
+    const x1=d3.scaleBand().domain(['total','severe']).range([0,x0.bandwidth()]).padding(0.08);
+    const maxY=d3.max(months,d=>d.total)||1;
+    const y=d3.scaleLinear().domain([0,maxY]).nice().range([ih,0]);
+    // Grid lines
+    g.append('g').attr('class','grid').selectAll('line')
+      .data(y.ticks(5)).enter().append('line')
+      .attr('x1',0).attr('x2',iw)
+      .attr('y1',d=>y(d)).attr('y2',d=>y(d))
+      .attr('stroke','#e2e8f0').attr('stroke-dasharray','3,2');
+    // Bars — total
+    const grps=g.selectAll('.month-grp').data(months).enter().append('g')
+      .attr('class','month-grp').attr('transform',d=>`translate(${x0(d.name)},0)`);
+    grps.append('rect')
+      .attr('x',x1('total')).attr('y',d=>y(d.total))
+      .attr('width',x1.bandwidth()).attr('height',d=>Math.max(1,ih-y(d.total)))
+      .attr('fill','#7c3aed').attr('rx',2).attr('opacity',0.85);
+    // Bars — severe
+    grps.append('rect')
+      .attr('x',x1('severe')).attr('y',d=>y(d.severe))
+      .attr('width',x1.bandwidth()).attr('height',d=>Math.max(1,ih-y(d.severe)))
+      .attr('fill','#f87171').attr('rx',2).attr('opacity',0.85);
+    // Tooltips via title
+    grps.each(function(d){
+      d3.select(this).selectAll('rect').each(function(r,i){
+        d3.select(this).append('title').text(i===0?`${d.name}: ${d.total} total recalls`:`${d.name}: ${d.severe} severe recalls`);
+      });
+    });
+    // Value labels on top of bars (only if bar is tall enough)
+    grps.append('text')
+      .attr('x',x1('total')+x1.bandwidth()/2)
+      .attr('y',d=>y(d.total)-3)
+      .attr('text-anchor','middle').attr('font-size','8').attr('fill','#5b21b6')
+      .text(d=>d.total>0?d.total:'');
+    // x-axis
+    g.append('g').attr('transform',`translate(0,${ih})`)
+      .call(d3.axisBottom(x0).tickSize(0))
+      .select('.domain').attr('stroke','#cbd5e1');
+    g.selectAll('.tick text').attr('font-size','10').attr('fill','#64748b').attr('dy','1em');
+    // y-axis
+    g.append('g').call(d3.axisLeft(y).ticks(5).tickFormat(d3.format('d')))
+      .select('.domain').attr('stroke','#cbd5e1');
+    g.selectAll('.tick line').attr('stroke','#cbd5e1');
+    g.selectAll('.tick text').attr('font-size','10').attr('fill','#64748b');
+  })();
 
   // Seasonal heatmap
   const seas=<?=js($seasonal)?>;
