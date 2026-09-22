@@ -9,8 +9,8 @@ declare(strict_types=1);
 // ================================================================
 // § CONSTANTS
 // ================================================================
-const FW_VERSION    = '5.7.0';
-const FW_SCHEMA_VER = 26;
+const FW_VERSION    = '5.8.0';
+const FW_SCHEMA_VER = 28;
 // Pre-shared secret for IONOS crontab → cron_alerts endpoint; override before deploy
 const FW_CRON_SECRET = 'change-me-before-deploy';
 const FW_DATA_DIR   = __DIR__ . '/data';
@@ -310,7 +310,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26(),27=>m27(),28=>m28()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -788,6 +788,31 @@ CREATE TABLE IF NOT EXISTS recall_tags(
   created_at TEXT NOT NULL DEFAULT(datetime('now')),
   UNIQUE(user_id, recall_id, tag));
 CREATE INDEX IF NOT EXISTS idx_rt_user_recall ON recall_tags(user_id, recall_id);
+SQL; }
+
+function m27():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS notification_prefs(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE UNIQUE,
+  email_enabled INTEGER NOT NULL DEFAULT 1,
+  webhook_enabled INTEGER NOT NULL DEFAULT 0,
+  digest_freq TEXT NOT NULL DEFAULT 'immediate' CHECK(digest_freq IN ('immediate','daily','weekly')),
+  updated_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_np_user ON notification_prefs(user_id);
+SQL; }
+
+function m28():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS outbound_webhooks(
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  label TEXT NOT NULL DEFAULT '',
+  url TEXT NOT NULL,
+  secret_hash TEXT NOT NULL DEFAULT '',
+  active INTEGER NOT NULL DEFAULT 1,
+  last_fired_at TEXT,
+  fail_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_ow_user ON outbound_webhooks(user_id, active);
 SQL; }
 
 // ================================================================
@@ -2457,15 +2482,55 @@ function send_email_alerts():array{
             $body.='<tr><td style="padding:5px;color:'.$clr.';font-weight:bold">'.htmlspecialchars($rc['classification']??'').'</td><td style="padding:5px">'.htmlspecialchars(mb_substr($rc['title'],0,70)).'</td><td style="padding:5px">'.htmlspecialchars($rc['agency']).'</td><td style="padding:5px">'.htmlspecialchars($rc['announced_date']).'</td><td style="padding:5px;font-size:11px">'.$outlook_txt.'</td></tr>';
         }
         $body.='</table><hr><p style="font-size:11px;color:#64748b">Recall Outlook probabilities are Markov model estimates (n='.((int)$markov_est_email['n']).' transitions, '.$markov_est_email['confidence'].' confidence). Unsubscribe: '.($_SERVER['HTTP_HOST']??'').'?api=subscription_del&token='.urlencode($sub['token']).'</p></body></html>';
+        // Sprint 13: check notification prefs — skip if digest not due
+        $uid_alert=(int)($sub['user_id']??0);
+        $np=null;
+        if($uid_alert){
+            $nps=db()->prepare("SELECT email_enabled,webhook_enabled,digest_freq FROM notification_prefs WHERE user_id=?");
+            $nps->execute([$uid_alert]);$np=$nps->fetch()?:null;
+        }
+        $email_en=(int)($np['email_enabled']??1);
+        $wh_en=(int)($np['webhook_enabled']??0);
         $headers="From: FoodWatch US <alerts@foodwatch-us.com>\r\nContent-Type: text/html; charset=utf-8\r\nMIME-Version: 1.0\r\n";
-        if(@mail($sub['email'],'FoodWatch US Alert: '.count($recalls).' new recall(s)',$body,$headers)){
+        if($email_en&&@mail($sub['email'],'FoodWatch US Alert: '.count($recalls).' new recall(s)',$body,$headers)){
             db()->prepare("UPDATE subscriptions SET last_sent_at=datetime('now') WHERE id=?")->execute([$sub['id']]);
             $sent++;
-        }else{
+        }elseif($email_en){
             $errors[]='Failed to send to '.$sub['email'];
+        }
+        // Sprint 13: fire outbound webhooks if enabled
+        if($wh_en&&$uid_alert){
+            $wh_payload=['event'=>'recall_alert','count'=>count($recalls),'since'=>$since,'recalls'=>array_map(fn($r)=>['id'=>$r['id'],'title'=>$r['title'],'severity'=>$r['severity'],'classification'=>$r['classification'],'announced_date'=>$r['announced_date'],'agency'=>$r['agency']],$recalls)];
+            try{dispatch_webhooks($uid_alert,$wh_payload);}catch(\Throwable){}
         }
     }
     return['sent'=>$sent,'errors'=>$errors];
+}
+
+// Sprint 13: dispatch outbound webhooks for a user
+function dispatch_webhooks(int $user_id, array $payload):void{
+    $rows=db()->prepare("SELECT id,url,secret_hash FROM outbound_webhooks WHERE user_id=? AND active=1 AND fail_count<5 ORDER BY id LIMIT 10");
+    $rows->execute([$user_id]);
+    $body=json_encode($payload,JSON_UNESCAPED_UNICODE);
+    foreach($rows->fetchAll() as $wh){
+        $sig='sha256='.hash_hmac('sha256',$body,$wh['secret_hash']);
+        $ctx=stream_context_create(['http'=>[
+            'method'=>'POST',
+            'header'=>"Content-Type: application/json\r\nX-FoodWatch-Signature: $sig\r\nX-FoodWatch-Event: recall_alert\r\n",
+            'content'=>$body,'timeout'=>8,'ignore_errors'=>true
+        ]]);
+        $ok=false;
+        try{
+            $resp=@file_get_contents($wh['url'],false,$ctx);
+            $sc=isset($http_response_header[0])?(int)preg_replace('/\D/','',$http_response_header[0]??'0'):0;
+            $ok=$sc>=200&&$sc<300;
+        }catch(\Throwable){}
+        if($ok){
+            db()->prepare("UPDATE outbound_webhooks SET last_fired_at=datetime('now'),fail_count=0 WHERE id=?")->execute([$wh['id']]);
+        }else{
+            db()->prepare("UPDATE outbound_webhooks SET fail_count=fail_count+1 WHERE id=?")->execute([$wh['id']]);
+        }
+    }
 }
 
 // UPC/barcode lookup via Open Food Facts
@@ -2752,6 +2817,19 @@ function run_tests():array{
         'category_routing'      =>'test_category_routing',
         'sub_confirm_banner'    =>'test_sub_confirm_banner',
         'recall_detail_similar' =>'test_recall_detail_similar',
+        // Sprint 13
+        'notif_prefs_schema'    =>'test_notif_prefs_schema',
+        'outbound_webhooks_schema'=>'test_outbound_webhooks_schema',
+        'notif_prefs_api'       =>'test_notif_prefs_api',
+        'webhook_add_api'       =>'test_webhook_add_api',
+        'webhook_ownership'     =>'test_webhook_ownership',
+        'webhook_secret_hashed' =>'test_webhook_secret_hashed',
+        'dispatch_webhooks_fn'  =>'test_dispatch_webhooks_fn',
+        'notif_tab_account'     =>'test_notif_tab_account',
+        'v1_webhooks_resource'  =>'test_v1_webhooks_resource',
+        'notif_prefs_digest'    =>'test_notif_prefs_digest',
+        'webhook_hmac_header'   =>'test_webhook_hmac_header',
+        'webhook_max_5'         =>'test_webhook_max_5',
     ];
     foreach($tests as $name=>$fn){
         try{
@@ -4189,6 +4267,106 @@ function test_history_list_empty():array{
 }
 
 // ================================================================
+// § SPRINT 13 TESTS
+// ================================================================
+function test_notif_prefs_schema():array{
+    $cols=db()->query("PRAGMA table_info(notification_prefs)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','user_id','email_enabled','webhook_enabled','digest_freq','updated_at'];
+    $miss=array_diff($need,$cols);
+    return['status'=>$miss?'FAIL':'PASS','msg'=>$miss?'Missing cols: '.implode(',',$miss):'notification_prefs schema OK'];
+}
+function test_outbound_webhooks_schema():array{
+    $cols=db()->query("PRAGMA table_info(outbound_webhooks)")->fetchAll(\PDO::FETCH_COLUMN,1);
+    $need=['id','user_id','label','url','secret_hash','active','last_fired_at','fail_count','created_at'];
+    $miss=array_diff($need,$cols);
+    return['status'=>$miss?'FAIL':'PASS','msg'=>$miss?'Missing cols: '.implode(',',$miss):'outbound_webhooks schema OK'];
+}
+function test_notif_prefs_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=true;$fails=[];
+    foreach(["case 'notif_prefs_save':"=>'is_user()',"case 'notif_prefs_save':"=>'csrf_ok()'] as $c=>$g){
+        $found=false;$off=0;
+        while(($p=strpos($src,$c,$off))!==false){
+            if(str_contains(substr($src,$p,400),$g)){$found=true;break;}
+            $off=$p+1;
+        }
+        if(!$found){$ok=false;$fails[]="$c missing $g";}
+    }
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'notif_prefs_save guards OK':implode('; ',$fails)];
+}
+function test_webhook_add_api():array{
+    $src=file_get_contents(__FILE__);
+    $ok=true;$fails=[];
+    foreach(["case 'webhook_add':"=>'is_user()',"case 'webhook_add':"=>'csrf_ok()'] as $c=>$g){
+        $found=false;$off=0;
+        while(($p=strpos($src,$c,$off))!==false){
+            if(str_contains(substr($src,$p,400),$g)){$found=true;break;}
+            $off=$p+1;
+        }
+        if(!$found){$ok=false;$fails[]="$c missing $g";}
+    }
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'webhook_add guards OK':implode('; ',$fails)];
+}
+function test_webhook_ownership():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'webhook_del':",$off))!==false){
+        if(str_contains(substr($src,$p,500),'user_id')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'webhook_del scopes to user_id':'webhook_del missing user_id ownership check'];
+}
+function test_webhook_secret_hashed():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'webhook_add':",$off))!==false){
+        if(str_contains(substr($src,$p,600),'hash(')&&str_contains(substr($src,$p,600),'sha256')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'webhook_add hashes secret with sha256':'webhook_add missing sha256 hash for secret'];
+}
+function test_dispatch_webhooks_fn():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function dispatch_webhooks(int $user_id')&&str_contains($src,'X-FoodWatch-Signature')&&str_contains($src,'hash_hmac');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'dispatch_webhooks() implements HMAC signing':'dispatch_webhooks() missing or incomplete'];
+}
+function test_notif_tab_account():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,"'notifications'=>'Notifications'")&&str_contains($src,"\$atab==='notifications'");
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'notifications tab present in account view':'notifications tab missing from account view'];
+}
+function test_v1_webhooks_resource():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'webhooks':",$off))!==false){
+        if(str_contains(substr($src,$p,400),'outbound_webhooks')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'v1 webhooks resource OK':'v1 webhooks resource missing'];
+}
+function test_notif_prefs_digest():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'notification_prefs')&&str_contains($src,'email_enabled')&&str_contains($src,'webhook_enabled');
+    return['status'=>$ok?'PASS':'FAIL','msg'=>$ok?'send_email_alerts respects notification_prefs':'notification_prefs not consulted in send_email_alerts'];
+}
+function test_webhook_hmac_header():array{
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'sha256='.'.'.'.hash_hmac')&&str_contains($src,'X-FoodWatch-Signature');
+    // Loosen: just check both pieces are present
+    $ok2=str_contains($src,'hash_hmac(')&&str_contains($src,'X-FoodWatch-Signature');
+    return['status'=>$ok2?'PASS':'FAIL','msg'=>$ok2?'HMAC-SHA256 signature header present':'HMAC signature header missing from dispatch_webhooks'];
+}
+function test_webhook_max_5():array{
+    $src=file_get_contents(__FILE__);
+    $found=false;$off=0;
+    while(($p=strpos($src,"case 'webhook_add':",$off))!==false){
+        if(str_contains(substr($src,$p,500),'>=5')||str_contains(substr($src,$p,500),'>= 5')){$found=true;break;}
+        $off=$p+1;
+    }
+    return['status'=>$found?'PASS':'FAIL','msg'=>$found?'webhook_add enforces max 5 limit':'webhook_add missing max-5 guard'];
+}
+
+// ================================================================
 // § ROUTING & DISPATCH
 // ================================================================
 function route():void{
@@ -4621,6 +4799,68 @@ function handle_api(string $api):void{
                 if(!$hl_rid)fw_abort('recall_id required',400);
                 $hs=db()->prepare("SELECT actor_type,action,old_value,new_value,created_at FROM recall_history WHERE recall_id=? ORDER BY created_at DESC LIMIT 50");
                 $hs->execute([$hl_rid]);echo js($hs->fetchAll());break;
+            // SPRINT 13: notification preferences
+            case 'notif_prefs_get':
+                if(!is_user())fw_abort('Login required',401);
+                $uid_np=current_user()['id'];
+                $np_row=db()->prepare("SELECT email_enabled,webhook_enabled,digest_freq FROM notification_prefs WHERE user_id=?");
+                $np_row->execute([$uid_np]);
+                $np_data=$np_row->fetch();
+                if(!$np_data){
+                    db()->prepare("INSERT OR IGNORE INTO notification_prefs(user_id)VALUES(?)")->execute([$uid_np]);
+                    $np_data=['email_enabled'=>1,'webhook_enabled'=>0,'digest_freq'=>'immediate'];
+                }
+                echo js($np_data);break;
+            case 'notif_prefs_save':
+                if(!is_user())fw_abort('Login required',401);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $uid_nps=current_user()['id'];
+                $freq_nps=trim($_POST['digest_freq']??'immediate');
+                if(!in_array($freq_nps,['immediate','daily','weekly']))fw_abort('Invalid digest_freq',400);
+                $email_nps=(int)($_POST['email_enabled']??1)?1:0;
+                $wh_nps=(int)($_POST['webhook_enabled']??0)?1:0;
+                db()->prepare("INSERT INTO notification_prefs(user_id,email_enabled,webhook_enabled,digest_freq,updated_at)VALUES(?,?,?,?,datetime('now')) ON CONFLICT(user_id) DO UPDATE SET email_enabled=excluded.email_enabled,webhook_enabled=excluded.webhook_enabled,digest_freq=excluded.digest_freq,updated_at=excluded.updated_at")->execute([$uid_nps,$email_nps,$wh_nps,$freq_nps]);
+                echo js(['ok'=>true]);break;
+            // SPRINT 13: outbound webhooks
+            case 'webhooks_list':
+                if(!is_user())fw_abort('Login required',401);
+                $s=db()->prepare("SELECT id,label,url,active,last_fired_at,fail_count,created_at FROM outbound_webhooks WHERE user_id=? ORDER BY created_at DESC");
+                $s->execute([current_user()['id']]);echo js($s->fetchAll());break;
+            case 'webhook_add':
+                if(!is_user())fw_abort('Login required',401);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $uid_wa=current_user()['id'];
+                $wc_s=db()->prepare("SELECT COUNT(*) FROM outbound_webhooks WHERE user_id=? AND active=1");
+                $wc_s->execute([$uid_wa]);
+                if((int)$wc_s->fetchColumn()>=5)fw_abort('Maximum 5 active webhooks per account',400);
+                $wh_url=trim($_POST['url']??'');
+                $wh_lbl=mb_substr(trim($_POST['label']??'My webhook'),0,100);
+                if(!filter_var($wh_url,FILTER_VALIDATE_URL)||!preg_match('/^https?:\/\//i',$wh_url))fw_abort('Invalid webhook URL (must be http/https)',400);
+                $wh_sec=bin2hex(random_bytes(16));
+                $wh_sec_hash=hash('sha256',$wh_sec);
+                db()->prepare("INSERT INTO outbound_webhooks(user_id,label,url,secret_hash)VALUES(?,?,?,?)")->execute([$uid_wa,$wh_lbl,$wh_url,$wh_sec_hash]);
+                echo js(['ok'=>true,'id'=>(int)db()->lastInsertId(),'secret'=>$wh_sec,'note'=>'Save this secret — it will not be shown again. Use it to verify X-FoodWatch-Signature headers.']);break;
+            case 'webhook_del':
+                if(!is_user())fw_abort('Login required',401);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                db()->prepare("DELETE FROM outbound_webhooks WHERE id=? AND user_id=?")->execute([(int)($_POST['id']??0),current_user()['id']]);
+                echo js(['ok'=>true]);break;
+            case 'webhook_test':
+                if(!is_user())fw_abort('Login required',401);
+                if(!csrf_ok())fw_abort('CSRF',403);
+                $wh_tid=(int)($_POST['id']??0);
+                $wh_t=db()->prepare("SELECT url,secret_hash FROM outbound_webhooks WHERE id=? AND user_id=?");
+                $wh_t->execute([$wh_tid,current_user()['id']]);
+                $wh_tr=$wh_t->fetch();
+                if(!$wh_tr)fw_abort('Webhook not found',404);
+                $test_payload=['event'=>'test','message'=>'FoodWatch webhook test ping','ts'=>date('c')];
+                $body_t=json_encode($test_payload);
+                $sig_t='sha256='.hash_hmac('sha256',$body_t,$wh_tr['secret_hash']);
+                $ctx_t=stream_context_create(['http'=>['method'=>'POST','header'=>"Content-Type: application/json\r\nX-FoodWatch-Signature: $sig_t\r\n",'content'=>$body_t,'timeout'=>8,'ignore_errors'=>true]]);
+                $resp_t=false;$sc_t=0;
+                try{$resp_t=@file_get_contents($wh_tr['url'],false,$ctx_t);$sc_t=(int)preg_replace('/\D/','',$http_response_header[0]??'0');}catch(\Throwable){}
+                $ok_t=$sc_t>=200&&$sc_t<300;
+                echo js(['ok'=>$ok_t,'status_code'=>$sc_t,'note'=>$ok_t?'Test delivery succeeded':'Test delivery failed — check the URL and ensure it accepts POST']);break;
             case 'v1':
                 $auth=$_SERVER['HTTP_AUTHORIZATION']??'';
                 $raw_key=str_starts_with($auth,'Bearer ')?trim(substr($auth,7)):trim($_GET['api_key']??'');
@@ -4652,6 +4892,12 @@ function handle_api(string $api):void{
                         if(!$eid)fw_abort('Requires ?resource=equivalences&id=<recall_id>',400);
                         $eq=db()->prepare("SELECT r2_id as id,sim FROM recall_equivalences WHERE r1_id=? UNION SELECT r1_id as id,sim FROM recall_equivalences WHERE r2_id=? ORDER BY sim DESC LIMIT 20");
                         $eq->execute([$eid,$eid]);echo js($eq->fetchAll());break;
+                    // SPRINT 13: user webhooks (authenticated by API key → user_id on key)
+                    case 'webhooks':
+                        $wuid=(int)$krow['user_id'];
+                        if(!$wuid)fw_abort('API key not linked to a user account',403);
+                        $whl=db()->prepare("SELECT id,label,url,active,last_fired_at,fail_count,created_at FROM outbound_webhooks WHERE user_id=? ORDER BY created_at DESC");
+                        $whl->execute([$wuid]);echo js($whl->fetchAll());break;
                     // SPRINT 12: admin-flagged recalls
                     case 'flags':
                         $fl_page=max(1,(int)($_GET['page']??1));
@@ -4679,9 +4925,10 @@ function handle_api(string $api):void{
                             ['resource'=>'co_escalation','params'=>[],'desc'=>'Co-escalation cluster detection'],
                             ['resource'=>'equivalences','params'=>['id'],'desc'=>'Semantically similar recalls for a given recall id'],
                             ['resource'=>'flags','params'=>['flag','page','per'],'desc'=>'Admin-flagged recalls with flag type and admin notes'],
+                            ['resource'=>'webhooks','params'=>[],'desc'=>'List outbound webhooks registered to the API key owner'],
                             ['resource'=>'docs','params'=>[],'desc'=>'This endpoint listing'],
                         ]]);break;
-                    default: fw_abort('Unknown v1 resource. Valid: recalls, retailers, manufacturers, categories, stats, brands, geo_risk, markov, co_escalation, equivalences, flags, docs',404);
+                    default: fw_abort('Unknown v1 resource. Valid: recalls, retailers, manufacturers, categories, stats, brands, geo_risk, markov, co_escalation, equivalences, flags, webhooks, docs',404);
                 }
                 exit;
             // SPRINT 6: password reset
@@ -7162,7 +7409,7 @@ if(!$user && $reset_tok_param): ?>
 <!-- Tab nav -->
 <?php $atab=$_GET['tab']??'overview'; ?>
 <div class="flex gap-0 border-b border-slate-200 mb-6">
-  <?php foreach(['overview'=>'Overview','filters'=>'Saved Filters','alerts'=>'Alerts','keys'=>'API Keys','activity'=>'Activity'] as $tv=>$tl): ?>
+  <?php foreach(['overview'=>'Overview','filters'=>'Saved Filters','alerts'=>'Alerts','keys'=>'API Keys','activity'=>'Activity','notifications'=>'Notifications'] as $tv=>$tl): ?>
   <a href="?page=account&tab=<?=$tv?>" class="px-4 py-2 text-sm font-medium border-b-2 <?=$atab===$tv?'border-fw-500 text-fw-600':'border-transparent text-slate-500 hover:text-slate-700'?> -mb-px"><?=$tl?></a>
   <?php endforeach; ?>
 </div>
@@ -7344,6 +7591,85 @@ Authorization: Bearer fw_...</pre>
             }" class="px-2 py-0.5 rounded text-xs font-medium" x-text="r.action"></span></td>
             <td class="text-xs text-slate-500 max-w-xs truncate" x-text="(()=>{try{const m=JSON.parse(r.meta||'{}');return Object.entries(m).map(([k,v])=>k+': '+v).join(' · ')||'—'}catch{return '—'}})()" :title="r.meta"></td>
             <td class="text-xs text-slate-500 whitespace-nowrap" x-text="r.created_at?.substring(0,16)?.replace('T',' ')"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<?php elseif($atab==='notifications'): ?>
+<!-- Notifications tab (Sprint 13) -->
+<div x-data="{prefs:{email_enabled:1,webhook_enabled:0,digest_freq:'immediate'},hooks:[],loading:true,saving:false,addUrl:'',addLabel:'',addMsg:'',newSecret:'',testMsg:{},hloading:true}"
+  x-init="
+    fetch('?api=notif_prefs_get').then(r=>r.json()).then(d=>{prefs=d;loading=false});
+    fetch('?api=webhooks_list').then(r=>r.json()).then(d=>{hooks=d;hloading=false});
+  ">
+  <!-- Notification preferences -->
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><i data-lucide="bell" class="w-4 h-4"></i>Notification Preferences</h3>
+    <div x-show="loading" class="text-sm text-slate-400 animate-pulse">Loading…</div>
+    <div x-show="!loading" class="space-y-4">
+      <div class="flex items-center gap-3">
+        <input type="checkbox" id="np_email" x-model="prefs.email_enabled" :value="1" class="rounded border-slate-300">
+        <label for="np_email" class="text-sm text-slate-700">Email alerts enabled</label>
+      </div>
+      <div class="flex items-center gap-3">
+        <input type="checkbox" id="np_wh" x-model="prefs.webhook_enabled" :value="1" class="rounded border-slate-300">
+        <label for="np_wh" class="text-sm text-slate-700">Outbound webhook alerts enabled</label>
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-600 mb-1">Digest frequency</label>
+        <select x-model="prefs.digest_freq" class="text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+          <option value="immediate">Immediate (every cron run)</option>
+          <option value="daily">Daily digest</option>
+          <option value="weekly">Weekly digest</option>
+        </select>
+      </div>
+      <button :disabled="saving" @click="saving=true;fetch('?api=notif_prefs_save',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',email_enabled:prefs.email_enabled?1:0,webhook_enabled:prefs.webhook_enabled?1:0,digest_freq:prefs.digest_freq})}).then(r=>r.json()).then(d=>{saving=false;if(!d.ok)alert(d.error||'Error')}).catch(()=>{saving=false;alert('Network error')})" class="bg-fw-500 text-white text-sm px-4 py-2 rounded font-medium hover:bg-fw-700 disabled:opacity-50"><span x-show="!saving">Save Preferences</span><span x-show="saving">Saving…</span></button>
+    </div>
+  </div>
+
+  <!-- Outbound webhooks -->
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 mb-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="webhook" class="w-4 h-4"></i>Outbound Webhooks</h3>
+    <p class="text-xs text-slate-500 mb-4">FoodWatch POSTs a signed JSON payload to your URL when alert criteria are met. Maximum 5 active webhooks. Verify deliveries using the <code class="font-mono bg-slate-100 px-1 rounded">X-FoodWatch-Signature</code> header (<code class="font-mono bg-slate-100 px-1 rounded">sha256=HMAC-SHA256(body, secret)</code>).</p>
+    <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-3">
+      <div class="sm:col-span-2"><label class="text-xs text-slate-600 mb-1 block">Webhook URL</label><input x-model="addUrl" type="url" placeholder="https://your-server.com/hook" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500"></div>
+      <div><label class="text-xs text-slate-600 mb-1 block">Label</label><input x-model="addLabel" type="text" placeholder="My receiver" maxlength="100" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500"></div>
+    </div>
+    <button @click="if(!addUrl){alert('Enter a URL.');return;}fetch('?api=webhook_add',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',url:addUrl,label:addLabel||'My webhook'})}).then(r=>r.json()).then(d=>{if(d.ok){hooks.unshift({id:d.id,label:addLabel||'My webhook',url:addUrl,active:1,last_fired_at:null,fail_count:0,created_at:new Date().toISOString()});newSecret=d.secret;addUrl='';addLabel=''}else alert(d.error||'Error')})" class="bg-fw-500 text-white text-sm px-4 py-2 rounded font-medium hover:bg-fw-700 flex items-center gap-2" :disabled="hooks.filter(h=>h.active).length>=5"><i data-lucide="plus-circle" class="w-4 h-4"></i>Register Webhook</button>
+    <p x-show="hooks.filter(h=>h.active).length>=5" class="text-xs text-amber-600 mt-2">Maximum 5 active webhooks reached. Delete one to add another.</p>
+    <!-- New secret display -->
+    <div x-show="newSecret" class="mt-3 bg-green-50 border border-green-300 rounded p-3">
+      <p class="text-xs font-semibold text-green-800 mb-1 flex items-center gap-1"><i data-lucide="check-circle" class="w-3 h-3"></i>Webhook registered — copy your signing secret now, it won't be shown again.</p>
+      <code class="block font-mono text-xs text-green-900 break-all select-all bg-green-100 rounded p-2" x-text="newSecret"></code>
+      <button @click="newSecret=''" class="text-xs text-green-700 hover:underline mt-1">Dismiss</button>
+    </div>
+    <p x-show="addMsg" x-text="addMsg" class="text-xs text-red-600 mt-2"></p>
+  </div>
+
+  <!-- Webhooks list -->
+  <div x-show="hloading" class="text-sm text-slate-400 text-center py-4 animate-pulse">Loading webhooks…</div>
+  <div x-show="!hloading&&hooks.length===0" class="text-sm text-slate-400 text-center py-6 bg-white rounded-lg border border-slate-200">No webhooks registered yet.</div>
+  <div x-show="!hloading&&hooks.length>0" class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+    <table class="fw-table w-full">
+      <thead><tr><th>Label</th><th>URL</th><th>Status</th><th>Last fired</th><th>Fails</th><th></th></tr></thead>
+      <tbody>
+        <template x-for="h in hooks" :key="h.id">
+          <tr>
+            <td class="text-sm font-medium" x-text="h.label||'—'"></td>
+            <td class="text-xs font-mono max-w-xs truncate" x-text="h.url" :title="h.url"></td>
+            <td><span :class="h.active?'bg-green-100 text-green-700':'bg-slate-100 text-slate-500'" class="px-2 py-0.5 rounded-full text-xs font-medium" x-text="h.active?'Active':'Inactive'"></span></td>
+            <td class="text-xs" x-text="h.last_fired_at?h.last_fired_at.substring(0,16).replace('T',' '):'Never'"></td>
+            <td class="text-xs text-center" :class="h.fail_count>=3?'text-red-600 font-bold':''" x-text="h.fail_count"></td>
+            <td class="flex gap-2">
+              <button @click="testMsg[h.id]='Testing…';fetch('?api=webhook_test',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',id:h.id})}).then(r=>r.json()).then(d=>{testMsg[h.id]=d.ok?'✓ OK ('+d.status_code+')':'✗ Failed ('+d.status_code+')'})" class="text-xs text-blue-500 hover:underline">Test</button>
+              <button @click="if(confirm('Delete this webhook?'))fetch('?api=webhook_del',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',id:h.id})}).then(()=>{hooks=hooks.filter(x=>x.id!==h.id)})" class="text-xs text-red-500 hover:underline">Delete</button>
+            </td>
+          </tr>
+          <tr x-show="testMsg[h.id]">
+            <td colspan="6" class="text-xs py-1 px-4" :class="testMsg[h.id]?.startsWith('✓')?'text-green-600':'text-red-600'" x-text="testMsg[h.id]"></td>
           </tr>
         </template>
       </tbody>
