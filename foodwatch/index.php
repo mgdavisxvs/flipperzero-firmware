@@ -1409,7 +1409,6 @@ function q_recall(int $id):?array{
     $r->execute([$id]);$rec=$r->fetch();
     if(!$rec)return null;
 
-    $rec['products']=$db->prepare('SELECT rp.*,b.name as brand_name,m.name as mfr_name FROM recall_products rp LEFT JOIN brands b ON b.id=rp.brand_id LEFT JOIN manufacturers m ON m.id=b.manufacturer_id WHERE rp.recall_id=?')->execute([$id])->fetchAll(); // can't chain like that
     $stmt=$db->prepare('SELECT rp.*,b.name as brand_name FROM recall_products rp LEFT JOIN brands b ON b.id=rp.brand_id WHERE rp.recall_id=?');$stmt->execute([$id]);$rec['products']=$stmt->fetchAll();
     $stmt=$db->prepare('SELECT h.type,h.name,h.slug,rh.confidence FROM recall_hazards rh JOIN hazards h ON h.id=rh.hazard_id WHERE rh.recall_id=?');$stmt->execute([$id]);$rec['hazards']=$stmt->fetchAll();
     $stmt=$db->prepare('SELECT m.id as mfr_id,m.name,m.city,m.state,rm.relationship_type,rm.confidence FROM recall_manufacturers rm JOIN manufacturers m ON m.id=rm.manufacturer_id WHERE rm.recall_id=?');$stmt->execute([$id]);$rec['manufacturers']=$stmt->fetchAll();
@@ -2395,11 +2394,12 @@ function handle_api(string $api):void{
                 $res_v1=$_GET['resource']??'';$id_v1=(int)($_GET['id']??0);
                 switch($res_v1){
                     case 'recalls':
-                        echo js($id_v1?q_recall($id_v1):q_recalls((int)($_GET['page']??1),(int)($_GET['per']??25),['status'=>$_GET['status']??'all','q'=>$_GET['q']??'','category'=>$_GET['category']??'','state'=>$_GET['state']??'']));break;
-                    case 'retailers': echo js(q_retailers($_GET['sort']??'risk',$_GET['state']??''));break;
-                    case 'categories':echo js(q_category_stats());break;
-                    case 'stats':     echo js(q_stats($_GET['state']??''));break;
-                    default: fw_abort('Unknown v1 resource',404);
+                        echo js($id_v1?q_recall($id_v1):q_recalls((int)($_GET['page']??1),min(100,(int)($_GET['per']??25)),['status'=>$_GET['status']??'all','q'=>$_GET['q']??'','category'=>$_GET['category']??'','state'=>$_GET['state']??'','severity'=>$_GET['severity']??'','agency'=>$_GET['agency']??'','hazard'=>$_GET['hazard']??'','sort'=>$_GET['sort']??'date']));break;
+                    case 'retailers':     echo js(q_retailers($_GET['sort']??'risk',$_GET['state']??''));break;
+                    case 'manufacturers': echo js(q_manufacturers(min(200,(int)($_GET['limit']??100))));break;
+                    case 'categories':    echo js(q_category_stats());break;
+                    case 'stats':         echo js(q_stats($_GET['state']??''));break;
+                    default: fw_abort('Unknown v1 resource. Valid: recalls, retailers, manufacturers, categories, stats',404);
                 }
                 exit;
             default:         fw_abort('Unknown API endpoint',404);
@@ -2715,6 +2715,7 @@ function view_recalls():void{
 <!-- Filters -->
 <form method="get" class="bg-white border border-slate-200 rounded-lg p-4 mb-4 grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
   <input type="hidden" name="page" value="recalls">
+  <?php if($f['q']): ?><input type="hidden" name="q" value="<?=h($f['q'])?>"><?php endif; ?>
   <select name="status" class="text-sm border border-slate-300 rounded px-2 py-1.5">
     <option value="all" <?=in_array($f['status'],['all',''])?'selected':''?>>All Statuses</option>
     <option value="ongoing" <?=$f['status']==='ongoing'?'selected':''?>>Active Only</option>
@@ -3742,7 +3743,8 @@ function view_account():void{
     <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="code" class="w-4 h-4"></i>REST API v1</h3>
     <p class="text-xs text-slate-600 mb-2">Base: <code class="font-mono bg-slate-100 px-1 rounded">?api=v1&resource=recalls</code></p>
     <p class="text-xs text-slate-500">Auth: <code class="font-mono">Authorization: Bearer fw_…</code><br>or <code class="font-mono">?api_key=fw_…</code></p>
-    <p class="text-xs text-slate-500 mt-1">Resources: <code class="font-mono">recalls</code> · <code class="font-mono">retailers</code> · <code class="font-mono">categories</code> · <code class="font-mono">stats</code></p>
+    <p class="text-xs text-slate-500 mt-1">Resources: <code class="font-mono">recalls</code> · <code class="font-mono">retailers</code> · <code class="font-mono">manufacturers</code> · <code class="font-mono">categories</code> · <code class="font-mono">stats</code></p>
+    <p class="text-xs text-slate-500 mt-1">Recall params: <code class="font-mono">status</code> · <code class="font-mono">severity</code> · <code class="font-mono">state</code> · <code class="font-mono">category</code> · <code class="font-mono">hazard</code> · <code class="font-mono">agency</code> · <code class="font-mono">q</code> · <code class="font-mono">page</code> · <code class="font-mono">per</code> (max 100)</p>
   </div>
 </div>
 
@@ -3770,7 +3772,7 @@ function view_account():void{
       <div class="bg-white rounded-lg border border-slate-200 p-4 flex items-center justify-between gap-4">
         <div>
           <p class="text-sm font-medium text-slate-800" x-text="f.name"></p>
-          <p class="text-xs text-slate-500 mt-0.5" x-text="JSON.stringify(JSON.parse(f.filter_json))"></p>
+          <p class="text-xs text-slate-500 mt-0.5" x-text="(d=>{const labels=[];if(d.status&&d.status!=='all')labels.push('Status: '+d.status);if(d.state)labels.push('State: '+d.state);if(d.severity)labels.push('Class '+(d.severity>=3?'I':d.severity>=2?'II':'III'));if(d.q)labels.push('Query: '+d.q);return labels.length?labels.join(' · '):'(all recalls)';})(JSON.parse(f.filter_json))"></p>
         </div>
         <div class="flex gap-2 shrink-0">
           <a :href="'?page=recalls&'+new URLSearchParams(JSON.parse(f.filter_json)).toString()" class="text-xs text-fw-500 hover:underline">Apply</a>
