@@ -9,8 +9,8 @@ declare(strict_types=1);
 // ================================================================
 // § CONSTANTS
 // ================================================================
-const FW_VERSION    = '16.0.0';
-const FW_SCHEMA_VER = 100;
+const FW_VERSION    = '17.0.0';
+const FW_SCHEMA_VER = 103;
 // Pre-shared secret for IONOS crontab → cron_alerts endpoint; override before deploy
 const FW_CRON_SECRET = 'change-me-before-deploy';
 const FW_DATA_DIR   = __DIR__ . '/data';
@@ -281,7 +281,7 @@ function db():PDO{
         PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC,
         PDO::ATTR_EMULATE_PREPARES=>false,
     ]);
-    $pdo->exec('PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;PRAGMA cache_size=-32000;PRAGMA foreign_keys=ON;PRAGMA temp_store=MEMORY;');
+    $pdo->exec('PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;PRAGMA cache_size=-65536;PRAGMA foreign_keys=ON;PRAGMA temp_store=MEMORY;PRAGMA busy_timeout=5000;PRAGMA mmap_size=536870912;');
     migrate($pdo);
     seed_system_settings();
     seed_feature_flags();
@@ -324,7 +324,7 @@ function migrate(PDO $db):void{
 }
 
 function migrations():array{
-    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26(),27=>m27(),28=>m28(),29=>m29(),30=>m30(),31=>m31(),32=>m32(),33=>m33(),34=>m34(),35=>m35(),36=>m36(),37=>m37(),38=>m38(),39=>m39(),40=>m40(),41=>m41(),42=>m42(),43=>m43(),44=>m44(),45=>m45(),46=>m46(),47=>m47(),48=>m48(),49=>m49(),50=>m50(),51=>m51(),52=>m52(),53=>m53(),54=>m54(),55=>m55(),56=>m56(),57=>m57(),58=>m58(),59=>m59(),60=>m60(),61=>m61(),62=>m62(),63=>m63(),64=>m64(),65=>m65(),66=>m66(),67=>m67(),68=>m68(),69=>m69(),70=>m70(),71=>m71(),72=>m72(),73=>m73(),74=>m74(),75=>m75(),76=>m76(),77=>m77(),78=>m78(),79=>m79(),80=>m80(),81=>m81(),82=>m82(),83=>m83(),84=>m84(),85=>m85(),86=>m86(),87=>m87(),88=>m88(),89=>m89(),90=>m90(),91=>m91(),92=>m92(),93=>m93(),94=>m94(),95=>m95(),96=>m96(),97=>m97(),98=>m98(),99=>m99(),100=>m100()];
+    return[1=>m1(),2=>m2(),3=>m3(),4=>m4(),5=>m5(),6=>m6(),7=>m7(),8=>m8(),9=>m9(),10=>m10(),11=>m11(),12=>m12(),13=>m13(),14=>m14(),15=>m15(),16=>m16(),17=>m17(),18=>m18(),19=>m19(),20=>m20(),21=>m21(),22=>m22(),23=>m23(),24=>m24(),25=>m25(),26=>m26(),27=>m27(),28=>m28(),29=>m29(),30=>m30(),31=>m31(),32=>m32(),33=>m33(),34=>m34(),35=>m35(),36=>m36(),37=>m37(),38=>m38(),39=>m39(),40=>m40(),41=>m41(),42=>m42(),43=>m43(),44=>m44(),45=>m45(),46=>m46(),47=>m47(),48=>m48(),49=>m49(),50=>m50(),51=>m51(),52=>m52(),53=>m53(),54=>m54(),55=>m55(),56=>m56(),57=>m57(),58=>m58(),59=>m59(),60=>m60(),61=>m61(),62=>m62(),63=>m63(),64=>m64(),65=>m65(),66=>m66(),67=>m67(),68=>m68(),69=>m69(),70=>m70(),71=>m71(),72=>m72(),73=>m73(),74=>m74(),75=>m75(),76=>m76(),77=>m77(),78=>m78(),79=>m79(),80=>m80(),81=>m81(),82=>m82(),83=>m83(),84=>m84(),85=>m85(),86=>m86(),87=>m87(),88=>m88(),89=>m89(),90=>m90(),91=>m91(),92=>m92(),93=>m93(),94=>m94(),95=>m95(),96=>m96(),97=>m97(),98=>m98(),99=>m99(),100=>m100(),101=>m101(),102=>m102(),103=>m103()];
 }
 
 function m1():string{ return <<<'SQL'
@@ -815,6 +815,44 @@ CREATE TABLE IF NOT EXISTS notification_prefs(
 CREATE INDEX IF NOT EXISTS idx_np_user ON notification_prefs(user_id);
 SQL; }
 
+// Sprint 101-103 migrations (GAP 1 jobs, GAP 4 app_log, GAP 5 rate_limit)
+function m101():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS jobs(
+  id INTEGER PRIMARY KEY,
+  queue TEXT NOT NULL DEFAULT 'default',
+  payload TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','running','done','failed')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  run_after TEXT NOT NULL DEFAULT(datetime('now')),
+  ran_at TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(queue,status,run_after);
+CREATE TABLE IF NOT EXISTS scraper_results(
+  id INTEGER PRIMARY KEY,
+  config_key TEXT NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
+  scraped_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_sr_key ON scraper_results(config_key,scraped_at);
+SQL;}
+function m102():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS app_log(
+  id INTEGER PRIMARY KEY,
+  request_id TEXT,
+  level TEXT NOT NULL DEFAULT 'INFO',
+  context TEXT,
+  message TEXT NOT NULL,
+  data TEXT,
+  created_at TEXT NOT NULL DEFAULT(datetime('now')));
+CREATE INDEX IF NOT EXISTS idx_app_log_created ON app_log(level,created_at);
+SQL;}
+function m103():string{ return <<<'SQL'
+CREATE TABLE IF NOT EXISTS rate_limit_buckets(
+  bucket_key TEXT PRIMARY KEY,
+  tokens REAL NOT NULL DEFAULT 0,
+  last_refill TEXT NOT NULL DEFAULT(datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT(datetime('now')));
+SQL;}
 // Sprint 61-100 migrations (highest first)
 function m100():string{ return <<<'SQL'
 CREATE TABLE IF NOT EXISTS retention_policies(table_name TEXT PRIMARY KEY,max_age_days INTEGER NOT NULL DEFAULT 90,enabled INTEGER NOT NULL DEFAULT 1,last_run_at TEXT);
@@ -3255,9 +3293,42 @@ function validate_webhook_hmac():bool{
     if(!$secret)return false;
     return hash_equals('sha256='.hash_hmac('sha256',$payload,$secret),$sig);
 }
-// Sprint 72: State Scraper Engine
-function run_scraper(string $context=''):void{
-    // stub: fetch URL, apply CSS selector, store results
+// Sprint 72: State Scraper Engine — GAP 3 (real DOMXPath scraper)
+function run_scraper(string $config_key=''):void{
+    $configs=[];
+    if($config_key){
+        $st=db()->prepare("SELECT * FROM scraper_configs WHERE key=? AND enabled=1");
+        $st->execute([$config_key]);$row=$st->fetch();
+        if($row)$configs=[$row];
+    }else{
+        $configs=db()->query("SELECT * FROM scraper_configs WHERE enabled=1 ORDER BY id")->fetchAll();
+    }
+    foreach($configs as $cfg){
+        try{
+            if(!function_exists('curl_init'))continue;
+            $ch=curl_init($cfg['url']);
+            curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_TIMEOUT=>20,CURLOPT_USERAGENT=>'FoodWatch/1.0',CURLOPT_FOLLOWLOCATION=>true,CURLOPT_SSL_VERIFYPEER=>true]);
+            $html=curl_exec($ch);curl_close($ch);
+            if($html===false)continue;
+            libxml_use_internal_errors(true);
+            $doc=new \DOMDocument();
+            $doc->loadHTML((string)$html);
+            $xp=new \DOMXPath($doc);
+            $nodes=$xp->query(css_to_xpath($cfg['selector']));
+            $count=0;
+            if($nodes)foreach($nodes as $node){
+                $text=trim((string)$node->textContent);
+                if($text){
+                    db()->prepare("INSERT OR IGNORE INTO scraper_results(config_key,content) VALUES(?,?)")->execute([$cfg['key'],mb_substr($text,0,2000)]);
+                    $count++;
+                }
+            }
+            db()->prepare("UPDATE scraper_configs SET last_run_at=datetime('now'),last_result_count=? WHERE key=?")->execute([$count,$cfg['key']]);
+            app_log('INFO','Scraper completed',['key'=>$cfg['key'],'count'=>$count],'scraper');
+        }catch(\Throwable $e){
+            app_log('ERROR','Scraper failed',['key'=>$cfg['key']??'','error'=>$e->getMessage()],'scraper');
+        }
+    }
 }
 function seed_scraper_configs():void{
     $cfgs=[
@@ -3267,13 +3338,29 @@ function seed_scraper_configs():void{
     $st=db()->prepare("INSERT OR IGNORE INTO scraper_configs(key,state,url,selector,enabled) VALUES(?,?,?,?,?)");
     foreach($cfgs as $c)$st->execute($c);
 }
-// Sprint 73: Barcode / UPC Lookup
+// Sprint 73: Barcode / UPC Lookup — GAP 3 (real Open Food Facts lookup)
 function lookup_barcode(string $upc):array{
     $st=db()->prepare("SELECT b.name as brand,c.name as category,bl.product_name FROM barcode_lookups bl LEFT JOIN brands b ON b.id=bl.brand_id LEFT JOIN categories c ON c.id=bl.category_id WHERE bl.upc=?");
     $st->execute([$upc]);$row=$st->fetch(\PDO::FETCH_ASSOC);
-    return$row?:[];
+    if($row)return $row;
+    if(!function_exists('curl_init'))return[];
+    $ch=curl_init('https://world.openfoodfacts.org/api/v0/product/'.rawurlencode($upc).'.json');
+    curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_TIMEOUT=>5,CURLOPT_USERAGENT=>'FoodWatch/1.0',CURLOPT_SSL_VERIFYPEER=>true]);
+    $resp=curl_exec($ch);curl_close($ch);
+    if($resp===false)return[];
+    $d=json_decode($resp,true);
+    if(($d['status']??0)!==1)return[];
+    $p=$d['product']??[];
+    $result=['brand'=>$p['brands']??'','category'=>$p['categories_tags'][0]??'','product_name'=>$p['product_name']??''];
+    cache_barcode_result($upc,$result['product_name']);
+    return $result;
 }
-function cache_barcode_result():bool{
+function cache_barcode_result(string $upc='',string $product_name=''):bool{
+    if(!$upc)return false;
+    try{
+        $st=db()->prepare("INSERT OR IGNORE INTO barcode_lookups(upc,product_name,fetched_at) VALUES(?,?,datetime('now'))");
+        $st->execute([$upc,$product_name]);
+    }catch(\Throwable){}
     return true;
 }
 // Sprint 74: Recall Duplicate Detection
@@ -3321,26 +3408,81 @@ function seed_smtp_config():void{
     $st=db()->prepare("INSERT OR IGNORE INTO smtp_config(key,value) VALUES(?,?)");
     foreach($defaults as $d)$st->execute($d);
 }
-// Sprint 78: SMS Dispatch
-function dispatch_sms(string $context=''):void{
-    // stub: send SMS via configured provider
+// Sprint 78: SMS Dispatch — GAP 3 (real Twilio implementation)
+function dispatch_sms(string $phone,string $message):void{
+    $sid=get_sys_setting('twilio_account_sid','');
+    $token=get_sys_setting('twilio_auth_token','');
+    $from=get_sys_setting('twilio_from_number','');
+    if(!$sid||!$token||!$from){app_log('WARNING','SMS skipped: Twilio not configured',[],'sms');return;}
+    if(!function_exists('curl_init'))return;
+    $ch=curl_init('https://api.twilio.com/2010-04-01/Accounts/'.rawurlencode($sid).'/Messages.json');
+    curl_setopt_array($ch,[
+        CURLOPT_RETURNTRANSFER=>true,CURLOPT_POST=>true,
+        CURLOPT_USERPWD=>$sid.':'.$token,
+        CURLOPT_POSTFIELDS=>http_build_query(['To'=>$phone,'From'=>$from,'Body'=>$message]),
+        CURLOPT_TIMEOUT=>10,CURLOPT_SSL_VERIFYPEER=>true,
+    ]);
+    $resp=curl_exec($ch);$code=curl_getinfo($ch,CURLINFO_HTTP_CODE);curl_close($ch);
+    $ok=($code>=200&&$code<300);
+    log_sms_dispatch($phone,$message,$ok?'sent':'failed','twilio');
+    if(!$ok)app_log('ERROR','SMS dispatch failed',['code'=>$code],'sms');
 }
-function log_sms_dispatch(string $context=''):void{
-    $st=db()->prepare("INSERT INTO sms_dispatch_log(phone,message,status,provider) VALUES(?,?,?,?)");
-    $st->execute(['','','pending','stub']);
+function log_sms_dispatch(string $phone='',string $message='',string $status='pending',string $provider='twilio'):void{
+    try{
+        $st=db()->prepare("INSERT INTO sms_dispatch_log(phone,message,status,provider) VALUES(?,?,?,?)");
+        $st->execute([$phone,$message,$status,$provider]);
+    }catch(\Throwable){}
 }
 // Sprint 79: Web Push Notifications
 function store_push_subscription():bool{
     return true;
 }
-function send_web_push(string $context=''):void{
-    // stub: encode payload, send via Web Push Protocol
+function send_web_push(string $endpoint='',string $p256dh='',string $auth_key='',string $payload=''):void{
+    if(!$endpoint||!function_exists('curl_init'))return;
+    $pub=get_sys_setting('vapid_public_key','');
+    $priv=get_sys_setting('vapid_private_key','');
+    $subj=get_sys_setting('vapid_subject','mailto:admin@example.com');
+    if(!$pub||!$priv){app_log('WARNING','VAPID keys not configured',[],'push');return;}
+    $raw_priv=base64url_decode($priv);
+    $raw_pub_full=base64url_decode($pub);
+    $xy=(strlen($raw_pub_full)===65&&$raw_pub_full[0]==="\x04")?substr($raw_pub_full,1):$raw_pub_full;
+    $pem=vapid_pem_from_raw($raw_priv,$xy);
+    $pk=openssl_pkey_get_private($pem);
+    if(!$pk){app_log('ERROR','VAPID key load failed',[],'push');return;}
+    $h=base64url_encode(json_encode(['typ'=>'JWT','alg'=>'ES256']));
+    $aud=parse_url($endpoint,PHP_URL_SCHEME).'://'.parse_url($endpoint,PHP_URL_HOST);
+    $c=base64url_encode(json_encode(['aud'=>$aud,'exp'=>time()+86400,'sub'=>$subj]));
+    if(openssl_sign($h.'.'.$c,$der,$pk,OPENSSL_ALGO_SHA256)===false){app_log('ERROR','VAPID sign failed',[],'push');return;}
+    $rlen=ord($der[3]);$r=substr($der,4,$rlen);
+    $slen=ord($der[5+$rlen]);$s=substr($der,6+$rlen,$slen);
+    if(strlen($r)===33&&$r[0]==="\x00")$r=substr($r,1);
+    if(strlen($s)===33&&$s[0]==="\x00")$s=substr($s,1);
+    $jwt=$h.'.'.$c.'.'.base64url_encode(str_pad($r,32,"\x00",STR_PAD_LEFT).str_pad($s,32,"\x00",STR_PAD_LEFT));
+    $ch=curl_init($endpoint);
+    curl_setopt_array($ch,[
+        CURLOPT_RETURNTRANSFER=>true,CURLOPT_POST=>true,
+        CURLOPT_HTTPHEADER=>['Authorization: vapid t='.$jwt.',k='.$pub,'Content-Type: application/octet-stream','TTL: 86400'],
+        CURLOPT_POSTFIELDS=>$payload,
+        CURLOPT_TIMEOUT=>10,CURLOPT_SSL_VERIFYPEER=>true,
+    ]);
+    $resp=curl_exec($ch);$code=curl_getinfo($ch,CURLINFO_HTTP_CODE);curl_close($ch);
+    if($code>=400)app_log('ERROR','Web push failed',['code'=>$code,'ep'=>substr($endpoint,0,60)],'push');
 }
 function seed_vapid_keys():void{
-    // stub: generate VAPID keys on first run, store in system_settings
     $st=db()->prepare("INSERT OR IGNORE INTO system_settings(key,value,label,type) VALUES(?,?,?,?)");
     $st->execute(['vapid_public_key','','VAPID Public Key','text']);
     $st->execute(['vapid_private_key','','VAPID Private Key','secret']);
+    if(!get_sys_setting('vapid_public_key','')&&function_exists('openssl_pkey_new')){
+        try{
+            $key=openssl_pkey_new(['curve_name'=>'prime256v1','private_key_type'=>OPENSSL_KEYTYPE_EC]);
+            if($key){
+                $d=openssl_pkey_get_details($key);
+                $u=db()->prepare("UPDATE system_settings SET value=? WHERE key=?");
+                $u->execute([base64url_encode("\x04".$d['ec']['x'].$d['ec']['y']),'vapid_public_key']);
+                $u->execute([base64url_encode($d['ec']['d']),'vapid_private_key']);
+            }
+        }catch(\Throwable){}
+    }
 }
 // Sprint 80: Notification Retry Queue
 function queue_notification_retry():bool{
@@ -3402,10 +3544,296 @@ function seed_system_settings():void{
         ['recall_alert_threshold','50','Recall Alert Threshold','int'],
         ['enable_fts','1','Enable Full-Text Search','bool'],
         ['data_retention_days','365','Default Data Retention (days)','int'],
+        ['twilio_account_sid','','Twilio Account SID','secret'],
+        ['twilio_auth_token','','Twilio Auth Token','secret'],
+        ['twilio_from_number','','Twilio From Number','string'],
+        ['rate_limit_ip','60','Rate Limit IP (req/min)','int'],
+        ['rate_limit_api_key','1000','Rate Limit API Key (req/min)','int'],
+        ['log_min_level','INFO','Minimum Log Level','string'],
+        ['backup_ftp_host','','Backup FTP Host','string'],
+        ['backup_ftp_user','','Backup FTP User','string'],
+        ['backup_ftp_pass','','Backup FTP Password','secret'],
+        ['vapid_subject','mailto:admin@example.com','VAPID Subject','string'],
     ];
     $st=db()->prepare("INSERT OR IGNORE INTO system_settings(key,value,label,type) VALUES(?,?,?,?)");
     foreach($settings as $s)$st->execute($s);
 }
+
+// ================================================================
+// § GUC GAP IMPLEMENTATIONS (v17.0.0)
+// ================================================================
+
+// GAP 4: Structured Logging
+function init_request_id():string{
+    static $rid='';
+    if($rid==='')$rid=bin2hex(random_bytes(8));
+    return $rid;
+}
+function app_log(string $level,string $message,array $data=[],string $context=''):void{
+    static $levels=['DEBUG'=>0,'INFO'=>1,'WARNING'=>2,'ERROR'=>3,'CRITICAL'=>4];
+    $min=get_sys_setting('log_min_level','INFO');
+    if(($levels[$level]??0)<($levels[$min]??1))return;
+    try{
+        $st=db()->prepare("INSERT INTO app_log(request_id,level,context,message,data) VALUES(?,?,?,?,?)");
+        $st->execute([init_request_id(),$level,$context,$message,$data?json_encode($data):null]);
+    }catch(\Throwable){}
+}
+
+// GAP 8: HTTP Security Headers
+function send_security_headers():void{
+    static $sent=false;
+    if($sent||headers_sent()){$sent=true;return;}
+    $sent=true;
+    header("X-Content-Type-Options: nosniff");
+    header("X-Frame-Options: DENY");
+    header("X-XSS-Protection: 1; mode=block");
+    header("Referrer-Policy: strict-origin-when-cross-origin");
+    header("Permissions-Policy: geolocation=(), microphone=(), camera=()");
+    header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://cdn.tailwindcss.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'");
+    if(!empty($_SERVER['HTTPS'])&&$_SERVER['HTTPS']!=='off'){
+        header("Strict-Transport-Security: max-age=31536000; includeSubDomains");
+    }
+}
+
+// GAP 5: Token-Bucket Rate Limiting
+function check_rate_limit(string $bucket_key='',int $max=0):bool{
+    $db=db();
+    try{
+        if($bucket_key===''){
+            $ip=$_SERVER['REMOTE_ADDR']??'0.0.0.0';
+            $bucket_key='ip:'.$ip;
+        }
+        if($max===0){
+            $max=str_starts_with($bucket_key,'ip:')
+                ?(int)get_sys_setting('rate_limit_ip','60')
+                :(int)get_sys_setting('rate_limit_api_key','1000');
+        }
+        $db->beginTransaction();
+        $st=$db->prepare("SELECT tokens,CAST(strftime('%s',last_refill) AS INTEGER) as ts FROM rate_limit_buckets WHERE bucket_key=?");
+        $st->execute([$bucket_key]);
+        $row=$st->fetch();
+        if($row){
+            $elapsed=time()-(int)$row['ts'];
+            $refill=min((float)$max,(float)$row['tokens']+($elapsed/60.0)*$max);
+            if($refill<1.0){$db->rollBack();return false;}
+            $db->prepare("UPDATE rate_limit_buckets SET tokens=?,last_refill=datetime('now'),updated_at=datetime('now') WHERE bucket_key=?")->execute([$refill-1.0,$bucket_key]);
+        }else{
+            $db->prepare("INSERT INTO rate_limit_buckets(bucket_key,tokens,last_refill) VALUES(?,?,datetime('now'))")->execute([$bucket_key,(float)($max-1)]);
+        }
+        $db->commit();
+        return true;
+    }catch(\Throwable){
+        try{$db->rollBack();}catch(\Throwable){}
+        return true;
+    }
+}
+
+// GAP 9: Declarative Input Validation
+function validate_api_fields(array $data,array $schema):array{
+    $errors=[];
+    foreach($schema as $field=>$rules){
+        $value=$data[$field]??null;
+        $required=in_array('required',$rules,true);
+        if($required&&($value===null||$value==='')){$errors[$field]="$field is required";continue;}
+        if($value===null||$value==='')continue;
+        foreach($rules as $rule){
+            if($rule==='required')continue;
+            if($rule==='int'&&!ctype_digit(ltrim((string)$value,'-'))){$errors[$field]="$field must be integer";break;}
+            if($rule==='float'&&!is_numeric($value)){$errors[$field]="$field must be numeric";break;}
+            if($rule==='email'&&!filter_var($value,FILTER_VALIDATE_EMAIL)){$errors[$field]="$field invalid email";break;}
+            if($rule==='url'&&!filter_var($value,FILTER_VALIDATE_URL)){$errors[$field]="$field invalid URL";break;}
+            if(str_starts_with($rule,'max:')&&mb_strlen((string)$value)>(int)substr($rule,4)){$errors[$field]="$field too long";break;}
+            if(str_starts_with($rule,'min:')&&mb_strlen((string)$value)<(int)substr($rule,4)){$errors[$field]="$field too short";break;}
+        }
+    }
+    return $errors;
+}
+
+// GAP 1: Background Job Queue
+function enqueue_job(string $queue,array $payload,int $delay_secs=0):int{
+    $st=db()->prepare("INSERT INTO jobs(queue,payload,run_after) VALUES(?,?,datetime('now',?))");
+    $st->execute([$queue,json_encode($payload),$delay_secs>0?"+{$delay_secs} seconds":'+0 seconds']);
+    return (int)db()->lastInsertId();
+}
+function run_job_queue(string $queue='default',int $limit=10):void{
+    $db=db();
+    $jobs=$db->prepare("SELECT * FROM jobs WHERE queue=? AND status='pending' AND run_after<=datetime('now') ORDER BY id LIMIT ?");
+    $jobs->execute([$queue,$limit]);
+    foreach($jobs->fetchAll() as $job){
+        $db->prepare("UPDATE jobs SET status='running',attempts=attempts+1,ran_at=datetime('now') WHERE id=?")->execute([$job['id']]);
+        try{
+            $payload=json_decode($job['payload'],true)??[];
+            $type=$payload['type']??'';
+            match($type){
+                'ingest_fda'  =>ingest_fda(),
+                'ingest_fsis' =>ingest_fsis(),
+                'scraper'     =>run_scraper($payload['config']??''),
+                'backup'      =>run_db_backup_safe(),
+                'retention'   =>run_retention_policy(),
+                default       =>null,
+            };
+            $db->prepare("UPDATE jobs SET status='done' WHERE id=?")->execute([$job['id']]);
+        }catch(\Throwable $e){
+            $db->prepare("UPDATE jobs SET status='failed',error=? WHERE id=?")->execute([$e->getMessage(),$job['id']]);
+            app_log('ERROR',"Job {$job['id']} failed",['type'=>$payload['type']??'','error'=>$e->getMessage()],'job_queue');
+        }
+    }
+}
+function run_ingest_due():void{
+    $due=db()->query("SELECT * FROM ingest_schedules WHERE next_trigger_at<=datetime('now') AND active=1 ORDER BY next_trigger_at LIMIT 5")->fetchAll();
+    foreach($due as $sched){
+        $src=$sched['agency_code']??'fda';
+        enqueue_job('default',['type'=>'ingest_'.$src]);
+        $interval=$sched['interval_minutes']??360;
+        db()->prepare("UPDATE ingest_schedules SET last_triggered_at=datetime('now'),next_trigger_at=datetime('now',?) WHERE id=?")->execute(["+{$interval} minutes",$sched['id']]);
+    }
+}
+
+// GAP 2: Database Backup
+function run_db_backup_safe():bool{
+    $backup=FW_DATA_DIR.'/foodwatch_backup_'.date('Ymd_His').'.db';
+    try{
+        db()->prepare("VACUUM INTO ?")->execute([$backup]);
+        app_log('INFO','Database backup created',['file'=>basename($backup)],'backup');
+        $files=glob(FW_DATA_DIR.'/foodwatch_backup_*.db')?:[];
+        rsort($files);
+        foreach(array_slice($files,7) as $old)@unlink($old);
+        return true;
+    }catch(\Throwable $e){
+        app_log('ERROR','Backup failed',['error'=>$e->getMessage()],'backup');
+        return false;
+    }
+}
+function get_db_row_counts():array{
+    $tables=['recalls','recall_products','manufacturers','retailers','users','audit_log','app_log','jobs'];
+    $out=[];
+    foreach($tables as $t){
+        try{$out[$t]=(int)db()->query("SELECT COUNT(*) FROM ".preg_replace('/[^a-z_]/','',strtolower($t)))->fetchColumn();}
+        catch(\Throwable){$out[$t]=0;}
+    }
+    $stat=@stat(FW_DB_PATH);
+    $out['_file_bytes']=$stat?$stat['size']:0;
+    return $out;
+}
+function offsite_backup_ftp():bool{
+    $host=get_sys_setting('backup_ftp_host','');
+    $user=get_sys_setting('backup_ftp_user','');
+    $pass=get_sys_setting('backup_ftp_pass','');
+    if(!$host||!$user)return false;
+    if(!run_db_backup_safe())return false;
+    $files=glob(FW_DATA_DIR.'/foodwatch_backup_*.db')?:[];
+    rsort($files);
+    $newest=$files[0]??'';
+    if(!$newest||!function_exists('curl_init'))return false;
+    try{
+        $fh=fopen($newest,'rb');
+        if(!$fh)return false;
+        $ch=curl_init('ftp://'.rawurlencode($host).'/foodwatch/'.basename($newest));
+        curl_setopt_array($ch,[
+            CURLOPT_UPLOAD=>true,
+            CURLOPT_USERPWD=>$user.':'.$pass,
+            CURLOPT_INFILE=>$fh,
+            CURLOPT_INFILESIZE=>filesize($newest),
+            CURLOPT_TIMEOUT=>120,
+        ]);
+        $ok=curl_exec($ch)!==false;
+        curl_close($ch);
+        fclose($fh);
+        app_log($ok?'INFO':'ERROR','FTP backup '.($ok?'succeeded':'failed'),['file'=>basename($newest)],'backup');
+        return $ok;
+    }catch(\Throwable $e){
+        app_log('ERROR','FTP backup exception',['error'=>$e->getMessage()],'backup');
+        return false;
+    }
+}
+
+// GAP 6: ML Model Validation + Markov Retraining
+function validate_severity_model():array{
+    $params=db()->query("SELECT feature,weight FROM severity_model_params")->fetchAll(\PDO::FETCH_KEY_PAIR);
+    $required=['class_i_weight','class_ii_weight','keyword_weight','brand_history_weight','state_risk_weight'];
+    $errors=[];$sum=0.0;
+    foreach($required as $k){
+        if(!array_key_exists($k,$params)){$errors[]="Missing: $k";continue;}
+        $v=(float)$params[$k];
+        if($v<0||$v>1)$errors[]="$k out of range: $v";
+        $sum+=$v;
+    }
+    if(abs($sum-1.0)>0.01)$errors[]=sprintf("Weights sum %.4f (expected 1.0)",$sum);
+    return['valid'=>empty($errors),'sum'=>round($sum,4),'errors'=>$errors];
+}
+function retrain_severity_model_if_needed():void{
+    try{
+        $r=validate_severity_model();
+        if(!$r['valid']){
+            app_log('WARNING','Severity model invalid — reseeding',['errors'=>$r['errors']],'ml');
+            seed_severity_model();
+        }
+        $recent=db()->query("SELECT classification,COUNT(*) as cnt FROM recalls WHERE announced_date>date('now','-90 days') GROUP BY classification")->fetchAll(\PDO::FETCH_ASSOC);
+        $total=array_sum(array_column($recent,'cnt'));
+        if($total>100){
+            $map=array_column($recent,'cnt','classification');
+            $st=db()->prepare("INSERT INTO severity_model_params(feature,weight,updated_at) VALUES(?,?,datetime('now')) ON CONFLICT(feature) DO UPDATE SET weight=excluded.weight,updated_at=excluded.updated_at");
+            $st->execute(['markov_class_i_prior',round(($map['Class I']??0)/$total,4)]);
+            $st->execute(['markov_class_ii_prior',round(($map['Class II']??0)/$total,4)]);
+            app_log('INFO','Markov priors updated',['total'=>$total,'class_i'=>$map['Class I']??0],'ml');
+        }
+    }catch(\Throwable $e){
+        app_log('WARNING','Model retrain failed',['error'=>$e->getMessage()],'ml');
+    }
+}
+
+// GAP 3: VAPID helpers (Web Push)
+function base64url_encode(string $data):string{
+    return rtrim(strtr(base64_encode($data),'+/','-_'),'=');
+}
+function base64url_decode(string $data):string{
+    return base64_decode(strtr($data,'-_','+/'));
+}
+function vapid_pem_from_raw(string $raw_priv,string $raw_pub):string{
+    // DER-encode EC private key (P-256) for openssl_pkey_get_private
+    $der="\x30\x77\x02\x01\x01\x04\x20".$raw_priv."\xa0\x0a\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07\xa1\x44\x03\x42\x00\x04".$raw_pub;
+    return "-----BEGIN EC PRIVATE KEY-----\n".chunk_split(base64_encode($der),64,"\n")."-----END EC PRIVATE KEY-----\n";
+}
+
+// GAP 3: CSS-to-XPath minimal converter (for run_scraper)
+function css_to_xpath(string $css):string{
+    $css=preg_replace('/[^\w\s.\-_#]/', '', trim($css));
+    if(str_starts_with($css,'.')){
+        $cls=preg_replace('/[^\w\-_]/','',substr($css,1));
+        return "//*[contains(concat(' ',normalize-space(@class),' '),' $cls ')]";
+    }
+    if(preg_match('/^([a-zA-Z][a-zA-Z0-9]*)\.([a-zA-Z][a-zA-Z0-9_-]*)$/',$css,$m)){
+        return "//{$m[1]}[contains(concat(' ',normalize-space(@class),' '),' {$m[2]} ')]";
+    }
+    return '//'.preg_replace('/[^\w]/','',strtolower($css));
+}
+
+// GAP 7: Keyset (cursor-based) pagination for recalls API
+function q_recalls_keyset(int $per=25,array $f=[],?int $after_id=null):array{
+    $db=db();
+    $w=[];$p=[];
+    if($after_id!==null){$w[]='r.id<?';$p[]=$after_id;}
+    if(!empty($f['status'])&&$f['status']!=='all'){$w[]='r.status=?';$p[]=$f['status'];}
+    if(!empty($f['state'])){$w[]='r.id IN(SELECT recall_id FROM recall_states WHERE state_code=?)';$p[]=$f['state'];}
+    if(!empty($f['category'])){$w[]='r.food_category_id=?';$p[]=(int)$f['category'];}
+    if(!empty($f['agency'])){$w[]='r.agency_id=?';$p[]=(int)$f['agency'];}
+    if(!empty($f['q'])){
+        $fts_ids=$db->prepare('SELECT recall_id FROM recalls_fts WHERE recalls_fts MATCH ? LIMIT 500');
+        $fts_ids->execute([$f['q'].'*']);
+        $ids=array_column($fts_ids->fetchAll(),'recall_id');
+        if($ids){$w[]='r.id IN('.implode(',',array_fill(0,count($ids),'?')).')';$p=array_merge($p,$ids);}
+        else return['records'=>[],'next_cursor'=>null];
+    }
+    $where=$w?'WHERE '.implode(' AND ',$w):'';
+    $sql="SELECT r.id,r.source_id,r.title,r.reason,r.status,r.classification,r.severity,r.severity_label,r.announced_date,a.code as agency_code,a.name as agency_name FROM recalls r JOIN agencies a ON a.id=r.agency_id $where ORDER BY r.id DESC LIMIT ?";
+    $stmt=$db->prepare($sql);
+    $stmt->execute([...$p,$per+1]);
+    $records=$stmt->fetchAll();
+    $next=null;
+    if(count($records)>$per){array_pop($records);$last=end($records);$next=$last['id']??null;}
+    return['records'=>$records,'next_cursor'=>$next];
+}
+
 // Sprint 85: i18n String Manager
 function get_i18n_string(int $limit=50):array{
     return db()->query("SELECT key,locale,value FROM i18n_strings ORDER BY key,locale LIMIT 200")->fetchAll(\PDO::FETCH_ASSOC);
@@ -12132,12 +12560,18 @@ function route():void{
 function handle_api(string $api):void{
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store');
+    send_security_headers();
+    if(!check_rate_limit()){http_response_code(429);echo js(['error'=>'Too many requests','retry_after'=>60]);return;}
     try{
         switch($api){
             case 'stats':    echo js(q_stats($_GET['state']??''));break;
             case 'recalls':
                 $f=['status'=>$_GET['status']??'all','state'=>$_GET['state']??'','category'=>$_GET['cat']??'','hazard'=>$_GET['haz']??'','agency'=>$_GET['agency']??'','q'=>$_GET['q']??'','sort'=>$_GET['sort']??'date','severity'=>$_GET['sev']??''];
                 echo js(q_recalls((int)($_GET['page']??1),(int)($_GET['per']??25),$f));break;
+            case 'recalls_cursor':
+                $fc=['status'=>$_GET['status']??'all','state'=>$_GET['state']??'','category'=>$_GET['cat']??'','agency'=>$_GET['agency']??'','q'=>$_GET['q']??''];
+                $cur=isset($_GET['cursor'])?(int)$_GET['cursor']:null;
+                echo js(q_recalls_keyset((int)($_GET['per']??25),$fc,$cur));break;
             case 'recall':   echo js(q_recall((int)($_GET['id']??0)));break;
             case 'retailers':echo js(q_retailers($_GET['sort']??'risk',$_GET['state']??''));break;
             case 'categories':echo js(q_category_stats());break;
@@ -13308,6 +13742,20 @@ function handle_api(string $api):void{
             case 'barcode_cache_list':
                 if(!is_admin()){echo js(['error'=>'auth']);break;}
                 echo js(db()->query("SELECT * FROM barcode_lookups ORDER BY fetched_at DESC LIMIT 50")->fetchAll(\PDO::FETCH_ASSOC));break;
+            case 'db_stats':
+                if(!is_admin()){echo js(['error'=>'auth']);break;}
+                echo js(get_db_row_counts());break;
+            case 'db_backup':
+                if(!is_admin()){echo js(['error'=>'auth']);break;}
+                if(!csrf_ok()){echo js(['error'=>'csrf']);break;}
+                echo js(['ok'=>run_db_backup_safe()]);break;
+            case 'model_validate':
+                if(!is_user()){echo js(['error'=>'auth']);break;}
+                echo js(validate_severity_model());break;
+            case 'model_retrain':
+                if(!is_admin()){echo js(['error'=>'auth']);break;}
+                if(!csrf_ok()){echo js(['error'=>'csrf']);break;}
+                retrain_severity_model_if_needed();echo js(['ok'=>true]);break;
             case 'duplicate_list':
                 if(!is_admin()){echo js(['error'=>'auth']);break;}
                 echo js(find_recall_duplicates());break;
@@ -13977,7 +14425,8 @@ function paginator(int $page,int $total_pages,array $query_params,int $window=2)
     return $out;
 }
 
-function layout_head(string $title,string $page):void{ ?>
+function layout_head(string $title,string $page):void{
+    send_security_headers(); ?>
 <!DOCTYPE html>
 <html lang="en" class="h-full">
 <head>
@@ -20083,6 +20532,21 @@ function view_markov_admin():void{
 // ================================================================
 // § BOOTSTRAP & MAIN DISPATCH
 // ================================================================
+init_request_id();
+set_exception_handler(function(\Throwable $e):void{
+    http_response_code(500);
+    try{app_log('CRITICAL','Unhandled exception',['msg'=>$e->getMessage(),'file'=>$e->getFile(),'line'=>$e->getLine()]);}catch(\Throwable){}
+    if(is_ajax()){
+        header('Content-Type: application/json');
+        echo json_encode(['error'=>'Internal server error']);
+    }else{
+        echo '<!DOCTYPE html><html><head><title>FoodWatch US — Error</title></head><body style="font-family:sans-serif;padding:2rem;max-width:600px">';
+        echo '<h2 style="color:#dc2626">Application Error</h2>';
+        echo '<p>'.htmlspecialchars($e->getMessage(),ENT_QUOTES,'UTF-8').'</p>';
+        echo '<p>If this is the first run, ensure the <code>data/</code> directory is writable by PHP.</p>';
+        echo '</body></html>';
+    }
+});
 try{
     db(); // Initialize DB and run migrations
     route();
