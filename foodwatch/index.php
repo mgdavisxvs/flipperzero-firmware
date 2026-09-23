@@ -14437,14 +14437,37 @@ function layout_head(string $title,string $page):void{
 <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
 <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/lucide@latest/dist/umd/lucide.min.js"></script>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
 <style>
-body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc}
+:root{
+  --fw-surface:#f8fafc;--fw-surface-card:#ffffff;--fw-surface-card-border:#e2e8f0;
+  --fw-surface-table-head:#f8fafc;--fw-text-primary:#0f172a;--fw-text-secondary:#475569;
+  --fw-text-muted:#94a3b8;--fw-table-row-hover:#f1f5f9;--fw-table-border:#e2e8f0;
+  --fw-hazard-bio:#dc2626;--fw-hazard-allergen:#d97706;--fw-hazard-physical:#7c3aed;
+  --fw-hazard-chemical:#0891b2;--fw-hazard-regulatory:#64748b;
+}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --fw-surface:#0f172a;--fw-surface-card:#1e293b;--fw-surface-card-border:#334155;
+  --fw-surface-table-head:#162032;--fw-text-primary:#f1f5f9;--fw-text-secondary:#94a3b8;
+  --fw-text-muted:#64748b;--fw-table-row-hover:#263347;--fw-table-border:#334155;
+  --fw-hazard-bio:#f87171;--fw-hazard-allergen:#fbbf24;--fw-hazard-physical:#a78bfa;
+  --fw-hazard-chemical:#22d3ee;--fw-hazard-regulatory:#94a3b8;
+}}
+:root[data-theme="dark"]{
+  --fw-surface:#0f172a;--fw-surface-card:#1e293b;--fw-surface-card-border:#334155;
+  --fw-surface-table-head:#162032;--fw-text-primary:#f1f5f9;--fw-text-secondary:#94a3b8;
+  --fw-text-muted:#64748b;--fw-table-row-hover:#263347;--fw-table-border:#334155;
+  --fw-hazard-bio:#f87171;--fw-hazard-allergen:#fbbf24;--fw-hazard-physical:#a78bfa;
+  --fw-hazard-chemical:#22d3ee;--fw-hazard-regulatory:#94a3b8;
+}
+body{font-family:'Inter',system-ui,sans-serif;background:var(--fw-surface);color:var(--fw-text-primary)}
 .fw-nav-link{@apply flex items-center gap-2 px-3 py-2 rounded text-sm font-medium text-slate-300 hover:bg-slate-700 hover:text-white transition-colors}
 .fw-nav-link.active{@apply bg-slate-700 text-white}
-.fw-stat{@apply bg-white rounded-lg border border-slate-200 p-4 shadow-sm}
-.fw-table th{@apply px-3 py-2 text-left text-xs font-semibold text-slate-500 uppercase tracking-wide bg-slate-50 border-b border-slate-200}
-.fw-table td{@apply px-3 py-2 text-sm text-slate-700 border-b border-slate-100}
-.fw-table tr:hover td{@apply bg-slate-50}
+.fw-stat{background:var(--fw-surface-card);border:1px solid var(--fw-surface-card-border);border-radius:.5rem;padding:1rem;box-shadow:0 1px 2px 0 rgb(0 0 0/.05)}
+.fw-table th{padding:.5rem .75rem;text-align:left;font-size:.75rem;font-weight:600;color:var(--fw-text-secondary);text-transform:uppercase;letter-spacing:.05em;background:var(--fw-surface-table-head);border-bottom:1px solid var(--fw-table-border)}
+.fw-table td{padding:.5rem .75rem;font-size:.875rem;color:var(--fw-text-primary);border-bottom:1px solid var(--fw-table-border)}
+.fw-table tr:hover td{background:var(--fw-table-row-hover)}
+#fw-chart-tooltip{position:fixed;background:var(--fw-surface-card);border:1px solid var(--fw-surface-card-border);color:var(--fw-text-primary);padding:.375rem .625rem;border-radius:.375rem;font-size:.75rem;pointer-events:none;opacity:0;transition:opacity .15s;z-index:50;box-shadow:0 4px 6px -1px rgb(0 0 0/.1)}
 @media print{nav,form,button,.no-print{display:none!important}main{margin-left:0!important}body{background:#fff}}
 </style>
 </head>
@@ -14514,6 +14537,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8fafc}
 
 function layout_foot():void{ ?>
 </div></main></div>
+<div id="fw-chart-tooltip" role="tooltip"></div>
 <script>lucide.createIcons();</script>
 </body></html>
 <?php }
@@ -14596,19 +14620,12 @@ function view_dashboard():void{
   <a href="?" class="text-xs text-fw-500 hover:underline">Clear</a>
   <?php endif; ?>
   <span class="text-xs text-slate-400">Last sync: <?=h($stats['last_sync']?date('M j, Y g:ia',strtotime($stats['last_sync'])):'Never')?></span>
-  <?php foreach(($stats['api_health']??[]) as $code=>$ah): ?>
-  <?php $ok=(int)($ah['consecutive_failures']??0)===0&&($ah['last_status']??0)===200; ?>
-  <span class="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full border <?=$ok?'bg-green-50 border-green-300 text-green-700':'bg-red-50 border-red-300 text-red-700'?>">
-    <span class="w-1.5 h-1.5 rounded-full <?=$ok?'bg-green-500':'bg-red-500'?>"></span>
-    <?=h($code)?><?=$ok?'':' ('.((int)($ah['consecutive_failures']??0)).' failures)'?>
-  </span>
-  <?php endforeach; ?>
   <span class="ml-auto"></span>
 </div>
 
 <!-- Sprint 9: Recall Velocity Surge Banner (z-score > 2.0) -->
 <?php if(($velocity['z_score']??0)>2.0): ?>
-<div class="bg-amber-50 border border-amber-400 rounded-lg p-4 mb-4 flex items-start gap-3">
+<div role="alert" aria-live="polite" class="bg-amber-50 border border-amber-400 rounded-lg p-4 mb-4 flex items-start gap-3">
   <i data-lucide="trending-up" class="w-5 h-5 text-amber-600 shrink-0 mt-0.5"></i>
   <div class="flex-1 min-w-0">
     <div class="font-semibold text-amber-800 text-sm">Recall Activity Surge Detected</div>
@@ -14745,25 +14762,46 @@ function view_dashboard():void{
     <div class="px-4 py-3 border-b border-slate-200">
       <h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="biohazard" class="w-4 h-4 text-orange-500"></i>Hazard Distribution (Active)</h2>
     </div>
-    <div id="hazard-chart" class="p-4 h-56"></div>
+    <div id="hazard-chart" class="p-4" style="min-height:14rem" aria-label="Hazard distribution bar chart" role="img"></div>
     <script>
     (function(){
       const data=<?=js(array_values(array_filter($hazards,fn($h)=>$h['active']>0)))?>;
-      if(!data.length){document.getElementById('hazard-chart').innerHTML='<p class="text-sm text-slate-400 text-center py-8">No hazard data yet</p>';return;}
+      const el=document.getElementById('hazard-chart');
+      if(!data.length){el.innerHTML='<p class="text-sm text-center py-8" style="color:var(--fw-text-muted)">No hazard data yet</p>';return;}
       const byType={};
       data.forEach(d=>{byType[d.type]=(byType[d.type]||0)+parseInt(d.active)});
       const types=Object.entries(byType).sort((a,b)=>b[1]-a[1]);
-      const colors={biological:'#dc2626',allergen:'#d97706',physical:'#7c3aed',chemical:'#0891b2',regulatory:'#64748b'};
-      const el=document.getElementById('hazard-chart');
-      const w=el.offsetWidth||300,h=180,margin={top:10,right:10,bottom:30,left:80};
-      const svg=d3.select('#hazard-chart').append('svg').attr('width','100%').attr('height',h+margin.top+margin.bottom);
-      const g=svg.append('g').attr('transform',`translate(${margin.left},${margin.top})`);
-      const iw=w-margin.left-margin.right,ih=h;
-      const x=d3.scaleLinear().domain([0,d3.max(types,d=>d[1])]).range([0,iw]);
-      const y=d3.scaleBand().domain(types.map(d=>d[0])).range([0,ih]).padding(0.2);
-      g.selectAll('.bar').data(types).enter().append('rect').attr('class','bar').attr('y',d=>y(d[0])).attr('width',d=>x(d[1])).attr('height',y.bandwidth()).attr('fill',d=>colors[d[0]]||'#64748b').attr('rx',3);
-      g.selectAll('.label').data(types).enter().append('text').attr('x',d=>x(d[1])+4).attr('y',d=>y(d[0])+y.bandwidth()/2+4).attr('font-size','11').attr('fill','#475569').text(d=>`${d[0]} (${d[1]})`);
-      g.append('g').attr('transform',`translate(0,${ih})`).call(d3.axisBottom(x).ticks(4).tickFormat(d3.format('d'))).selectAll('text').attr('font-size','10');
+      const tip=document.getElementById('fw-chart-tooltip');
+      const margin={top:10,right:10,bottom:30,left:80};
+      function drawHazard(){
+        el.innerHTML='';
+        const cs=getComputedStyle(document.documentElement);
+        const w=el.getBoundingClientRect().width||320;
+        const barH=Math.max(types.length*34,80);
+        const h=barH+margin.top+margin.bottom;
+        const iw=w-margin.left-margin.right,ih=barH;
+        const svg=d3.select(el).append('svg').attr('width','100%').attr('viewBox',`0 0 ${w} ${h}`).attr('aria-hidden','true');
+        const g=svg.append('g').attr('transform',`translate(${margin.left},${margin.top})`);
+        const x=d3.scaleLinear().domain([0,d3.max(types,d=>d[1])]).range([0,iw]);
+        const y=d3.scaleBand().domain(types.map(d=>d[0])).range([0,ih]).padding(0.25);
+        g.selectAll('.bar').data(types).enter().append('rect').attr('class','bar')
+          .attr('y',d=>y(d[0])).attr('width',d=>x(d[1])).attr('height',y.bandwidth())
+          .attr('fill',d=>cs.getPropertyValue('--fw-hazard-'+d[0].toLowerCase()).trim()||'#64748b').attr('rx',3)
+          .attr('tabindex','0').attr('role','img').attr('aria-label',d=>`${d[0]}: ${d[1]} active recalls`)
+          .on('mousemove',(e,d)=>{if(!tip)return;tip.textContent='';const b=document.createElement('span');b.style.fontWeight='600';b.textContent=d[0];tip.appendChild(b);tip.appendChild(document.createTextNode(': '+d[1]));tip.style.opacity=1;tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY-32)+'px';})
+          .on('mouseleave',()=>{if(tip)tip.style.opacity=0;})
+          .on('focus',(e,d)=>{if(!tip)return;const r=e.target.getBoundingClientRect();tip.textContent=d[0]+': '+d[1];tip.style.opacity=1;tip.style.left=(r.right+4)+'px';tip.style.top=r.top+'px';})
+          .on('blur',()=>{if(tip)tip.style.opacity=0;});
+        g.selectAll('.lbl').data(types).enter().append('text').attr('class','lbl')
+          .attr('x',d=>x(d[1])+4).attr('y',d=>y(d[0])+y.bandwidth()/2+4)
+          .attr('font-size','0.6875rem').attr('fill',cs.getPropertyValue('--fw-text-secondary').trim()||'#475569')
+          .text(d=>`${d[0]} (${d[1]})`);
+        g.append('g').attr('transform',`translate(0,${ih})`)
+          .call(d3.axisBottom(x).ticks(4).tickFormat(d3.format('d')))
+          .selectAll('text').attr('font-size','0.625rem').attr('fill',cs.getPropertyValue('--fw-text-muted').trim()||'#94a3b8');
+      }
+      drawHazard();
+      if(window.ResizeObserver){new ResizeObserver(()=>drawHazard()).observe(el);}else{window.addEventListener('resize',drawHazard);}
     })();
     </script>
   </div>
