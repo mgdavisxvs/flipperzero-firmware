@@ -14469,9 +14469,46 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--fw-surface);color
 .fw-table tr:hover td{background:var(--fw-table-row-hover)}
 #fw-chart-tooltip{position:fixed;background:var(--fw-surface-card);border:1px solid var(--fw-surface-card-border);color:var(--fw-text-primary);padding:.375rem .625rem;border-radius:.375rem;font-size:.75rem;pointer-events:none;opacity:0;transition:opacity .15s;z-index:50;box-shadow:0 4px 6px -1px rgb(0 0 0/.1)}
 @media print{nav,form,button,.no-print{display:none!important}main{margin-left:0!important}body{background:#fff}}
+/* ── dark mode: Tailwind bg/border/text class overrides scoped to main ─ */
+@media(prefers-color-scheme:dark){
+  :root:not([data-theme="light"]) main .bg-white{background-color:var(--fw-surface-card)!important}
+  :root:not([data-theme="light"]) main .bg-slate-50{background-color:var(--fw-surface-table-head)!important}
+  :root:not([data-theme="light"]) main .bg-slate-100{background-color:#253348!important}
+  :root:not([data-theme="light"]) main .border-slate-200,:root:not([data-theme="light"]) main .border-slate-100{border-color:var(--fw-surface-card-border)!important}
+  :root:not([data-theme="light"]) main .divide-slate-100>:not([hidden])~:not([hidden]){border-color:var(--fw-surface-card-border)!important}
+  :root:not([data-theme="light"]) main .text-slate-900,:root:not([data-theme="light"]) main .text-slate-800{color:var(--fw-text-primary)!important}
+  :root:not([data-theme="light"]) main .text-slate-700{color:#cbd5e1!important}
+  :root:not([data-theme="light"]) main .text-slate-600{color:var(--fw-text-secondary)!important}
+  :root:not([data-theme="light"]) main .text-slate-500{color:var(--fw-text-muted)!important}
+  :root:not([data-theme="light"]) main .text-slate-400{color:#64748b!important}
+  :root:not([data-theme="light"]) main .border-slate-300{border-color:var(--fw-surface-card-border)!important}
+  :root:not([data-theme="light"]) main select,:root:not([data-theme="light"]) main input[type=text],:root:not([data-theme="light"]) main input[type=search],:root:not([data-theme="light"]) main input[type=email],:root:not([data-theme="light"]) main input[type=password],:root:not([data-theme="light"]) main textarea{background-color:var(--fw-surface-card)!important;color:var(--fw-text-primary)!important;border-color:var(--fw-surface-card-border)!important}
+  :root:not([data-theme="light"]) main .shadow-sm{box-shadow:0 1px 3px 0 rgb(0 0 0/.3),0 1px 2px -1px rgb(0 0 0/.2)!important}
+  :root:not([data-theme="light"]) main .hover\:bg-slate-50:hover{background-color:var(--fw-table-row-hover)!important}
+  :root:not([data-theme="light"]) main .hover\:bg-slate-100:hover{background-color:#263347!important}
+}
+:root[data-theme="dark"] main .bg-white{background-color:var(--fw-surface-card)!important}
+:root[data-theme="dark"] main .bg-slate-50{background-color:var(--fw-surface-table-head)!important}
+:root[data-theme="dark"] main .bg-slate-100{background-color:#253348!important}
+:root[data-theme="dark"] main .border-slate-200,:root[data-theme="dark"] main .border-slate-100{border-color:var(--fw-surface-card-border)!important}
+:root[data-theme="dark"] main .divide-slate-100>:not([hidden])~:not([hidden]){border-color:var(--fw-surface-card-border)!important}
+:root[data-theme="dark"] main .text-slate-900,:root[data-theme="dark"] main .text-slate-800{color:var(--fw-text-primary)!important}
+:root[data-theme="dark"] main .text-slate-700{color:#cbd5e1!important}
+:root[data-theme="dark"] main .text-slate-600{color:var(--fw-text-secondary)!important}
+:root[data-theme="dark"] main .text-slate-500{color:var(--fw-text-muted)!important}
+:root[data-theme="dark"] main .text-slate-400{color:#64748b!important}
+:root[data-theme="dark"] main .border-slate-300{border-color:var(--fw-surface-card-border)!important}
+:root[data-theme="dark"] main select,:root[data-theme="dark"] main input[type=text],:root[data-theme="dark"] main input[type=search],:root[data-theme="dark"] main input[type=email],:root[data-theme="dark"] main input[type=password],:root[data-theme="dark"] main textarea{background-color:var(--fw-surface-card)!important;color:var(--fw-text-primary)!important;border-color:var(--fw-surface-card-border)!important}
+:root[data-theme="dark"] main .shadow-sm{box-shadow:0 1px 3px 0 rgb(0 0 0/.3),0 1px 2px -1px rgb(0 0 0/.2)!important}
+:root[data-theme="dark"] main .hover\:bg-slate-50:hover{background-color:var(--fw-table-row-hover)!important}
+:root[data-theme="dark"] main .hover\:bg-slate-100:hover{background-color:#263347!important}
+/* ── global polish ── */
+[x-cloak]{display:none!important}
+*:focus-visible{outline:2px solid #3b5bdb;outline-offset:2px}
+main>div.p-6{transition:background .2s}
 </style>
 </head>
-<body class="h-full" x-data="{navOpen:false}">
+<body class="h-full" x-data="{navOpen:false,theme:(()=>{try{return localStorage.getItem('fw-theme')||'system';}catch(e){return 'system';}})(),toggleTheme(){this.theme=this.theme==='dark'?'light':this.theme==='light'?'system':'dark';try{localStorage.setItem('fw-theme',this.theme);}catch(e){}this.applyTheme()},applyTheme(){const h=document.documentElement;if(this.theme==='dark')h.setAttribute('data-theme','dark');else if(this.theme==='light')h.setAttribute('data-theme','light');else h.removeAttribute('data-theme');}}" x-init="applyTheme()">
 <div class="min-h-full flex">
 <!-- Mobile nav toggle -->
 <button @click="navOpen=!navOpen" class="fixed top-3 left-3 z-30 md:hidden bg-slate-800 text-white rounded p-1.5 shadow-lg" aria-label="Toggle menu">
@@ -14519,7 +14556,15 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--fw-surface);color
   </div>
   <div class="p-3 border-t border-slate-700 text-xs text-slate-500 flex items-center justify-between">
     <span>v<?=FW_VERSION?></span>
-    <?php if(is_user()):?><span class="text-green-400 flex items-center gap-1"><i data-lucide="circle" class="w-2 h-2"></i>Signed in</span><?php endif;?>
+    <div class="flex items-center gap-2">
+      <button @click="toggleTheme()" :title="'Theme: '+theme" class="text-slate-400 hover:text-slate-200 transition-colors w-5 h-5 flex items-center justify-center rounded focus-visible:ring-1 focus-visible:ring-slate-400" aria-label="Toggle colour theme">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
+          <path x-show="theme!=='dark'" x-cloak stroke-linecap="round" stroke-linejoin="round" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"/>
+          <path x-show="theme==='dark'" x-cloak stroke-linecap="round" stroke-linejoin="round" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
+        </svg>
+      </button>
+      <?php if(is_user()):?><span class="text-green-400 flex items-center gap-1"><i data-lucide="circle" class="w-2 h-2"></i>Signed in</span><?php endif;?>
+    </div>
   </div>
 </nav>
 <!-- Main content -->
@@ -14538,6 +14583,26 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--fw-surface);color
 function layout_foot():void{ ?>
 </div></main></div>
 <div id="fw-chart-tooltip" role="tooltip"></div>
+<!-- Toast notification system -->
+<div id="fw-toast" role="status" aria-live="polite" aria-atomic="true"
+  x-data="{show:false,msg:'',type:'info',_t:null}"
+  @fw-toast.window="show=true;msg=$event.detail.msg;type=$event.detail.type||'info';clearTimeout(_t);_t=setTimeout(()=>show=false,3400)"
+  x-show="show" x-cloak
+  x-transition:enter="transition ease-out duration-200"
+  x-transition:enter-start="opacity-0 translate-y-2"
+  x-transition:enter-end="opacity-100 translate-y-0"
+  x-transition:leave="transition ease-in duration-150"
+  x-transition:leave-start="opacity-100 translate-y-0"
+  x-transition:leave-end="opacity-0 translate-y-2"
+  :class="{'bg-red-600':type==='error','bg-green-600':type==='success','bg-slate-800':type==='info','bg-amber-600':type==='warn'}"
+  class="fixed bottom-5 left-1/2 -translate-x-1/2 z-50 text-white text-sm px-4 py-2.5 rounded-lg shadow-xl flex items-center gap-2 min-w-[12rem] max-w-sm pointer-events-none select-none"
+  style="bottom:max(1.25rem,env(safe-area-inset-bottom,0px))">
+  <svg x-show="type==='error'" class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+  <svg x-show="type==='success'" class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 13.01 9 10.01"/></svg>
+  <svg x-show="type==='warn'" class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+  <svg x-show="type==='info'" class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+  <span x-text="msg" class="truncate"></span>
+</div>
 <script>lucide.createIcons();</script>
 </body></html>
 <?php }
