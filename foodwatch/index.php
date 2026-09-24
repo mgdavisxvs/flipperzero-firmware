@@ -157,12 +157,13 @@ function current_user():?array{
     if(!$uid)return null;
     static $cache=[];
     if(isset($cache[$uid]))return $cache[$uid];
-    $s=db()->prepare('SELECT id,email,display_name,created_at FROM users WHERE id=?');
+    $s=db()->prepare('SELECT id,email,display_name,created_at,is_admin FROM users WHERE id=?');
     $s->execute([$uid]);
     $cache[$uid]=$s->fetch()?:null;
     return $cache[$uid];
 }
 function is_user():bool{ return current_user()!==null; }
+function is_db_admin():bool{ return !empty(current_user()['is_admin']); }
 function user_register(string $email,string $pass):int|string{
     $email=strtolower(trim($email));
     if(!filter_var($email,FILTER_VALIDATE_EMAIL))return 'Invalid email address.';
@@ -12548,6 +12549,7 @@ function route():void{
         case 'watchlist':     render_page('watchlist');break;
         case 'account':       render_page('account');break;
         case 'settings':      render_page('settings');break;
+        case 'recall_builder': render_page('recall_builder');break;
         case 'tags':          render_page('tags');break;
         case 'shared':        render_page('shared');break;
         case 'status':        render_page('status');break;
@@ -12810,6 +12812,69 @@ function handle_api(string $api):void{
                 db()->prepare('UPDATE users SET password_hash=? WHERE id=?')->execute([$cp_hash,$cp_user['id']]);
                 try{db()->prepare("INSERT INTO user_activity(user_id,action,meta,ip_hash)VALUES(?,?,?,?)")->execute([$cp_user['id'],'password_change','{}',hash('sha256',$_SERVER['REMOTE_ADDR']??'')]);}catch(\Throwable){}
                 echo js(['ok'=>true,'message'=>'Password updated successfully.']);break;
+            case 'recall_create':
+                if(!csrf_ok())fw_abort('CSRF',403);
+                if(!is_db_admin())fw_abort('Admin required',403);
+                $rc_title=trim($_POST['title']??'');
+                if(!$rc_title)fw_abort('Title is required',400);
+                $rc_agency=(int)($_POST['agency_id']??0);
+                if(!$rc_agency)fw_abort('Agency is required',400);
+                $rc_sid='MANUAL-'.date('Ymd-His').'-'.bin2hex(random_bytes(3));
+                $rc_sev=(float)($_POST['severity']??1.0);
+                $rc_sevlabel=['3.0'=>'Class I','2.0'=>'Class II','1.0'=>'Class III'][(string)$rc_sev]??'Class III';
+                $rc_stmt=db()->prepare('INSERT INTO recalls(agency_id,source_id,source_url,title,reason,status,classification,severity,severity_label,voluntary_mandated,announced_date,initiation_date,distribution_description,quantity_recalled,units,food_category_id)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+                $rc_stmt->execute([
+                    $rc_agency,$rc_sid,trim($_POST['source_url']??'')||null,
+                    $rc_title,trim($_POST['reason']??''),
+                    trim($_POST['status']??'ongoing'),
+                    trim($_POST['classification']??''),
+                    $rc_sev,$rc_sevlabel,
+                    trim($_POST['voluntary_mandated']??''),
+                    trim($_POST['announced_date']??'')||null,
+                    trim($_POST['initiation_date']??'')||null,
+                    trim($_POST['distribution_description']??''),
+                    trim($_POST['quantity_recalled']??''),
+                    trim($_POST['units']??''),
+                    ($_POST['food_category_id']??'')?((int)$_POST['food_category_id']??null):null,
+                ]);
+                $rc_id=(int)db()->lastInsertId();
+                // Hazards
+                foreach(array_filter(array_map('intval',explode(',',trim($_POST['hazard_ids']??'')))) as $hid){
+                    try{db()->prepare('INSERT OR IGNORE INTO recall_hazards(recall_id,hazard_id,confidence)VALUES(?,?,?)')->execute([$rc_id,$hid,'confirmed']);}catch(\Throwable){}
+                }
+                // States
+                foreach(array_filter(array_map('trim',explode(',',trim($_POST['states']??'')))) as $sc){
+                    if(preg_match('/^[A-Z]{2}$/',$sc))try{db()->prepare('INSERT OR IGNORE INTO recall_states(recall_id,state_code)VALUES(?,?)')->execute([$rc_id,$sc]);}catch(\Throwable){}
+                }
+                // Products
+                $rc_prods=json_decode(trim($_POST['products']??'[]'),true)??[];
+                foreach(array_slice($rc_prods,0,50) as $rp){
+                    $rp_desc=trim($rp['description']??'');if(!$rp_desc)continue;
+                    db()->prepare('INSERT INTO recall_products(recall_id,description,upc,lot_number,use_by_date)VALUES(?,?,?,?,?)')->execute([$rc_id,$rp_desc,trim($rp['upc']??''),trim($rp['lot_number']??''),trim($rp['use_by_date']??'')]);
+                }
+                try{db()->prepare("INSERT INTO user_activity(user_id,action,meta,ip_hash)VALUES(?,?,?,?)")->execute([current_user()['id'],'recall_create',json_encode(['recall_id'=>$rc_id,'title'=>$rc_title]),hash('sha256',$_SERVER['REMOTE_ADDR']??'')]);}catch(\Throwable){}
+                echo js(['ok'=>true,'id'=>$rc_id,'source_id'=>$rc_sid]);break;
+            case 'recall_update_manual':
+                if(!csrf_ok())fw_abort('CSRF',403);
+                if(!is_db_admin())fw_abort('Admin required',403);
+                $rum_id=(int)($_POST['id']??0);if(!$rum_id)fw_abort('id required',400);
+                $rum_fields=[];$rum_vals=[];
+                foreach(['title','reason','status','classification','voluntary_mandated','announced_date','initiation_date','distribution_description','quantity_recalled','units','source_url'] as $rf){
+                    if(isset($_POST[$rf])){$rum_fields[]="$rf=?";$rum_vals[]=trim($_POST[$rf]);}
+                }
+                if(isset($_POST['severity'])){$rum_fields[]='severity=?';$rum_vals[]=(float)$_POST['severity'];$rum_fields[]='severity_label=?';$rum_vals[]=['3'=>'Class I','2'=>'Class II','1'=>'Class III'][(string)(int)$_POST['severity']]??'';}
+                if(isset($_POST['food_category_id'])){$rum_fields[]='food_category_id=?';$rum_vals[]=$_POST['food_category_id']?(int)$_POST['food_category_id']:null;}
+                if($rum_fields){$rum_vals[]=$rum_id;db()->prepare('UPDATE recalls SET '.implode(',',$rum_fields).",updated_at=datetime('now') WHERE id=?")->execute($rum_vals);}
+                echo js(['ok'=>true]);break;
+            case 'recall_delete_manual':
+                if(!csrf_ok())fw_abort('CSRF',403);
+                if(!is_db_admin())fw_abort('Admin required',403);
+                $rdm_id=(int)($_POST['id']??0);if(!$rdm_id)fw_abort('id required',400);
+                // Only allow deletion of manually created recalls
+                $rdm_chk=db()->prepare("SELECT source_id FROM recalls WHERE id=?");$rdm_chk->execute([$rdm_id]);$rdm_row=$rdm_chk->fetch();
+                if(!$rdm_row||!str_starts_with($rdm_row['source_id'],'MANUAL-'))fw_abort('Can only delete manually-created recalls',403);
+                db()->prepare('DELETE FROM recalls WHERE id=?')->execute([$rdm_id]);
+                echo js(['ok'=>true]);break;
             case 'filter_save':
                 if(!csrf_ok())fw_abort('CSRF',403);
                 if(!is_user())fw_abort('Login required',401);
@@ -14621,6 +14686,7 @@ main>div.p-6{transition:background .2s}
       <a href="?page=playground" class="fw-nav-link <?=$page==='playground'?'active':''?>"><i data-lucide="terminal" class="w-4 h-4"></i>API Playground</a>
       <a href="?page=status" class="fw-nav-link <?=$page==='status'?'active':''?>"><i data-lucide="activity" class="w-4 h-4"></i>System Status</a>
       <a href="?page=tests" class="fw-nav-link <?=$page==='tests'?'active':''?>"><i data-lucide="check-circle" class="w-4 h-4"></i>Self-Tests</a>
+      <a href="?page=recall_builder" class="fw-nav-link <?=$page==='recall_builder'?'active':''?>"><i data-lucide="file-plus" class="w-4 h-4"></i>Build Recall</a>
       <a href="?page=admin" class="fw-nav-link <?=$page==='admin'?'active':''?>"><i data-lucide="settings" class="w-4 h-4"></i>Admin</a>
     </div>
   </div>
@@ -14710,6 +14776,7 @@ function render_page(string $p):void{
         'watchlist'     =>view_watchlist(),
         'account'       =>view_account(),
         'settings'      =>view_settings(),
+        'recall_builder'=>view_recall_builder(),
         'tags'          =>view_tags(),
         'shared'        =>view_shared(),
         'status'        =>view_status(),
@@ -19172,6 +19239,328 @@ Authorization: Bearer fw_...</pre>
 
 <?php endif; ?>
 <?php endif; ?>
+<?php layout_foot(); }
+
+function view_recall_builder():void{
+    if(!is_db_admin()){layout_head('Recall Builder','recall_builder');echo '<div class="max-w-xl mx-auto mt-16 text-center"><div class="text-4xl mb-3">🔒</div><h2 class="text-lg font-semibold text-slate-700 mb-1">Admin Access Required</h2><p class="text-sm text-slate-400">Recall creation requires administrator privileges.</p></div>';layout_foot();return;}
+    $agencies=db()->query('SELECT id,code,name FROM agencies ORDER BY code')->fetchAll(\PDO::FETCH_ASSOC);
+    $cats=db()->query('SELECT id,name FROM food_categories ORDER BY name')->fetchAll(\PDO::FETCH_ASSOC);
+    $hazards=db()->query('SELECT id,name,type FROM hazards ORDER BY type,name')->fetchAll(\PDO::FETCH_ASSOC);
+    layout_head('Recall Builder','recall_builder'); ?>
+<div class="max-w-3xl mx-auto" x-data="{
+  step:1,
+  form:{
+    title:'',reason:'',status:'ongoing',classification:'Class I',severity:3,voluntary_mandated:'Voluntary',
+    announced_date:'',initiation_date:'',agency_id:'<?=h($agencies[0]['id']??1)?>',
+    food_category_id:'',distribution_description:'',quantity_recalled:'',units:'',
+    source_url:'',hazard_ids:[],states:[],
+    products:[{description:'',upc:'',lot_number:'',use_by_date:''}]
+  },
+  saving:false,err:'',saved_id:null,saved_source:'',
+  exportFmt:'json',
+  toggleState(code){const i=this.form.states.indexOf(code);if(i>-1)this.form.states.splice(i,1);else this.form.states.push(code)},
+  toggleHazard(id){const i=this.form.hazard_ids.indexOf(id);if(i>-1)this.form.hazard_ids.splice(i,1);else this.form.hazard_ids.push(id)},
+  addProduct(){this.form.products.push({description:'',upc:'',lot_number:'',use_by_date:''})},
+  removeProduct(i){this.form.products.splice(i,1)},
+  submit(){
+    this.saving=true;this.err='';
+    const body=new URLSearchParams({
+      csrf:'<?=csrf()?>',
+      title:this.form.title,reason:this.form.reason,status:this.form.status,
+      classification:this.form.classification,severity:this.form.severity,
+      voluntary_mandated:this.form.voluntary_mandated,
+      agency_id:this.form.agency_id,food_category_id:this.form.food_category_id,
+      announced_date:this.form.announced_date,initiation_date:this.form.initiation_date,
+      distribution_description:this.form.distribution_description,
+      quantity_recalled:this.form.quantity_recalled,units:this.form.units,
+      source_url:this.form.source_url,
+      hazard_ids:this.form.hazard_ids.join(','),
+      states:this.form.states.join(','),
+      products:JSON.stringify(this.form.products.filter(p=>p.description.trim()))
+    });
+    fetch('?api=recall_create',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body})
+      .then(r=>r.json()).then(d=>{
+        this.saving=false;
+        if(d.ok){this.saved_id=d.id;this.saved_source=d.source_id;this.step=5;}
+        else this.err=d.error||'Failed to create recall.';
+      }).catch(()=>{this.saving=false;this.err='Network error.'});
+  },
+  exportRecall(){
+    if(!this.saved_id)return;
+    if(this.exportFmt==='json')window.open('?api=export_json&q='+encodeURIComponent(this.saved_source),'_blank');
+    else if(this.exportFmt==='csv')window.open('?api=export_csv&q='+encodeURIComponent(this.saved_source),'_blank');
+    else window.open('?api=export_pdf&q='+encodeURIComponent(this.saved_source),'_blank');
+  }
+}">
+
+<?php /* ── Header + Progress ── */ ?>
+<div class="flex items-center justify-between mb-6">
+  <div>
+    <h1 class="text-lg font-semibold text-slate-800">Recall Builder</h1>
+    <p class="text-xs text-slate-500 mt-0.5">Manually author a recall record and export in any format</p>
+  </div>
+  <a href="?page=recalls" class="text-xs text-fw-600 hover:underline flex items-center gap-1"><i data-lucide="arrow-left" class="w-3 h-3"></i>Back to Recalls</a>
+</div>
+
+<!-- Progress bar -->
+<div x-show="step<5" class="flex items-center gap-1 mb-6">
+  <?php foreach([1=>'Basics',2=>'Classification',3=>'Scope',4=>'Products'] as $sn=>$sl): ?>
+  <div class="flex items-center gap-1 flex-1 <?=$sn>1?'ml-1':''?>">
+    <div :class="step>= <?=$sn?> ?'bg-fw-500 text-white':'bg-slate-200 text-slate-400'" class="w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold shrink-0"><?=$sn?></div>
+    <span :class="step>=<?=$sn?>?'text-fw-600':'text-slate-400'" class="text-xs font-medium"><?=$sl?></span>
+    <?php if($sn<4):?><div :class="step>?php echo $sn; ?>?'bg-fw-500':'bg-slate-200'" class="flex-1 h-0.5 ml-1"></div><?php endif?>
+  </div>
+  <?php endforeach; ?>
+</div>
+
+<?php /* ── Step 1: Basics ── */ ?>
+<div x-show="step===1" class="space-y-5">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 space-y-4">
+    <h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="file-text" class="w-4 h-4 text-fw-500"></i>Basic Information</h2>
+    <div>
+      <label class="block text-xs text-slate-500 mb-1">Recall Title <span class="text-red-500">*</span></label>
+      <input type="text" x-model="form.title" placeholder="e.g. Brand X recalls frozen burritos due to Listeria contamination" class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500">
+    </div>
+    <div>
+      <label class="block text-xs text-slate-500 mb-1">Reason / Description</label>
+      <textarea x-model="form.reason" rows="3" placeholder="Detailed reason for the recall…" class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500 resize-none"></textarea>
+    </div>
+    <div class="grid grid-cols-2 gap-4">
+      <div>
+        <label class="block text-xs text-slate-500 mb-1">Announced Date</label>
+        <input type="date" x-model="form.announced_date" class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500">
+      </div>
+      <div>
+        <label class="block text-xs text-slate-500 mb-1">Initiation Date</label>
+        <input type="date" x-model="form.initiation_date" class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500">
+      </div>
+    </div>
+    <div>
+      <label class="block text-xs text-slate-500 mb-1">Issuing Agency <span class="text-red-500">*</span></label>
+      <select x-model="form.agency_id" class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500">
+        <?php foreach($agencies as $ag): ?>
+        <option value="<?=$ag['id']?>"><?=h($ag['code'])?> — <?=h($ag['name'])?></option>
+        <?php endforeach; ?>
+      </select>
+    </div>
+    <div>
+      <label class="block text-xs text-slate-500 mb-1">Source URL <span class="text-slate-400">(optional)</span></label>
+      <input type="url" x-model="form.source_url" placeholder="https://www.fda.gov/safety/recalls-market-withdrawals-safety-alerts/…" class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500">
+    </div>
+  </div>
+  <div class="flex justify-end">
+    <button @click="if(!form.title.trim()){err='Title is required.';return;}err='';step=2" class="px-5 py-2 bg-fw-500 text-white text-sm rounded hover:bg-fw-700 flex items-center gap-2">Next <i data-lucide="arrow-right" class="w-3.5 h-3.5"></i></button>
+  </div>
+  <p x-show="err" x-text="err" class="text-xs text-red-600"></p>
+</div>
+
+<?php /* ── Step 2: Classification ── */ ?>
+<div x-show="step===2" class="space-y-5">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 space-y-4">
+    <h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="shield-alert" class="w-4 h-4 text-fw-500"></i>Classification &amp; Severity</h2>
+    <div class="grid grid-cols-3 gap-3">
+      <button @click="form.classification='Class I';form.severity=3" :class="form.classification==='Class I'?'ring-2 ring-red-500 bg-red-50 border-red-300':'border-slate-200 hover:bg-slate-50'" class="rounded-lg border p-3 text-left transition-all">
+        <span class="text-xs font-bold text-red-600 block mb-0.5">Class I</span>
+        <span class="text-xs text-slate-500">Serious / life-threatening</span>
+      </button>
+      <button @click="form.classification='Class II';form.severity=2" :class="form.classification==='Class II'?'ring-2 ring-amber-400 bg-amber-50 border-amber-300':'border-slate-200 hover:bg-slate-50'" class="rounded-lg border p-3 text-left transition-all">
+        <span class="text-xs font-bold text-amber-600 block mb-0.5">Class II</span>
+        <span class="text-xs text-slate-500">Remote probability of adverse health</span>
+      </button>
+      <button @click="form.classification='Class III';form.severity=1" :class="form.classification==='Class III'?'ring-2 ring-slate-400 bg-slate-50 border-slate-400':'border-slate-200 hover:bg-slate-50'" class="rounded-lg border p-3 text-left transition-all">
+        <span class="text-xs font-bold text-slate-500 block mb-0.5">Class III</span>
+        <span class="text-xs text-slate-500">Unlikely to cause adverse health</span>
+      </button>
+    </div>
+    <div class="grid grid-cols-2 gap-4">
+      <div>
+        <label class="block text-xs text-slate-500 mb-1">Status</label>
+        <select x-model="form.status" class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500">
+          <option value="ongoing">Ongoing</option>
+          <option value="completed">Completed</option>
+          <option value="terminated">Terminated</option>
+        </select>
+      </div>
+      <div>
+        <label class="block text-xs text-slate-500 mb-1">Voluntary / Mandated</label>
+        <select x-model="form.voluntary_mandated" class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500">
+          <option value="Voluntary">Voluntary</option>
+          <option value="Mandated">Mandated</option>
+          <option value="FDA Requested">FDA Requested</option>
+        </select>
+      </div>
+    </div>
+    <div>
+      <label class="block text-xs text-slate-500 mb-2">Hazard Types</label>
+      <div class="flex flex-wrap gap-2">
+        <?php foreach($hazards as $hz): ?>
+        <button type="button" @click="toggleHazard(<?=$hz['id']?>)" :class="form.hazard_ids.includes(<?=$hz['id']?>)?'bg-fw-100 border-fw-500 text-fw-700':'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'" class="px-2.5 py-1 rounded-full border text-xs font-medium transition-all"><?=h($hz['name'])?></button>
+        <?php endforeach; ?>
+      </div>
+    </div>
+    <div>
+      <label class="block text-xs text-slate-500 mb-1">Food Category</label>
+      <select x-model="form.food_category_id" class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500">
+        <option value="">— Select category —</option>
+        <?php foreach($cats as $c): ?>
+        <option value="<?=$c['id']?>"><?=h($c['name'])?></option>
+        <?php endforeach; ?>
+      </select>
+    </div>
+  </div>
+  <div class="flex justify-between">
+    <button @click="step=1" class="px-4 py-2 text-sm text-slate-600 border border-slate-300 rounded hover:bg-slate-50 flex items-center gap-1.5"><i data-lucide="arrow-left" class="w-3.5 h-3.5"></i>Back</button>
+    <button @click="step=3" class="px-5 py-2 bg-fw-500 text-white text-sm rounded hover:bg-fw-700 flex items-center gap-2">Next <i data-lucide="arrow-right" class="w-3.5 h-3.5"></i></button>
+  </div>
+</div>
+
+<?php /* ── Step 3: Distribution Scope + States ── */ ?>
+<div x-show="step===3" class="space-y-5">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 space-y-4">
+    <h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="truck" class="w-4 h-4 text-fw-500"></i>Distribution &amp; Scope</h2>
+    <div>
+      <label class="block text-xs text-slate-500 mb-1">Distribution Description</label>
+      <textarea x-model="form.distribution_description" rows="2" placeholder="Nationwide, or specific states/regions…" class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500 resize-none"></textarea>
+    </div>
+    <div class="grid grid-cols-2 gap-4">
+      <div>
+        <label class="block text-xs text-slate-500 mb-1">Quantity Recalled</label>
+        <input type="text" x-model="form.quantity_recalled" placeholder="e.g. 12,500" class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500">
+      </div>
+      <div>
+        <label class="block text-xs text-slate-500 mb-1">Units</label>
+        <input type="text" x-model="form.units" placeholder="e.g. cases, lbs, pounds" class="w-full text-sm border border-slate-300 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-fw-500">
+      </div>
+    </div>
+    <div>
+      <label class="block text-xs text-slate-500 mb-2">Affected States <span class="text-slate-400 font-normal">(<span x-text="form.states.length"></span> selected)</span></label>
+      <div class="flex gap-2 mb-2">
+        <button type="button" @click="form.states=<?=json_encode(array_keys(US_STATES))?>" class="text-xs text-fw-600 hover:underline">Select all</button>
+        <span class="text-slate-300">·</span>
+        <button type="button" @click="form.states=[]" class="text-xs text-slate-400 hover:underline">Clear</button>
+      </div>
+      <div class="grid grid-cols-5 sm:grid-cols-8 gap-1 max-h-48 overflow-y-auto border border-slate-200 rounded p-2">
+        <?php foreach(US_STATES as $code=>$name): ?>
+        <button type="button" @click="toggleState('<?=$code?>')" :class="form.states.includes('<?=$code?>')?'bg-fw-500 text-white':'bg-slate-50 text-slate-600 hover:bg-slate-100'" class="rounded text-xs py-0.5 font-mono font-medium transition-all" title="<?=h($name)?>"><?=$code?></button>
+        <?php endforeach; ?>
+      </div>
+    </div>
+  </div>
+  <div class="flex justify-between">
+    <button @click="step=2" class="px-4 py-2 text-sm text-slate-600 border border-slate-300 rounded hover:bg-slate-50 flex items-center gap-1.5"><i data-lucide="arrow-left" class="w-3.5 h-3.5"></i>Back</button>
+    <button @click="step=4" class="px-5 py-2 bg-fw-500 text-white text-sm rounded hover:bg-fw-700 flex items-center gap-2">Next <i data-lucide="arrow-right" class="w-3.5 h-3.5"></i></button>
+  </div>
+</div>
+
+<?php /* ── Step 4: Products + Review + Submit ── */ ?>
+<div x-show="step===4" class="space-y-5">
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5 space-y-4">
+    <div class="flex items-center justify-between">
+      <h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2"><i data-lucide="package" class="w-4 h-4 text-fw-500"></i>Recalled Products</h2>
+      <button type="button" @click="addProduct()" class="text-xs text-fw-600 hover:underline flex items-center gap-1"><i data-lucide="plus" class="w-3 h-3"></i>Add product</button>
+    </div>
+    <template x-for="(prod,i) in form.products" :key="i">
+      <div class="border border-slate-200 rounded-lg p-3 space-y-2 relative">
+        <button type="button" @click="removeProduct(i)" x-show="form.products.length>1" class="absolute top-2 right-2 text-slate-300 hover:text-red-500"><i data-lucide="x" class="w-4 h-4"></i></button>
+        <input type="text" x-model="prod.description" placeholder="Product description *" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-fw-500">
+        <div class="grid grid-cols-3 gap-2">
+          <input type="text" x-model="prod.upc" placeholder="UPC" class="text-sm border border-slate-300 rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-fw-500">
+          <input type="text" x-model="prod.lot_number" placeholder="Lot / code" class="text-sm border border-slate-300 rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-fw-500">
+          <input type="date" x-model="prod.use_by_date" placeholder="Use-by date" class="text-sm border border-slate-300 rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-fw-500">
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <!-- Review summary -->
+  <div class="bg-indigo-50 border border-indigo-200 rounded-lg p-4 text-sm space-y-1">
+    <p class="font-semibold text-indigo-800 mb-2">Review</p>
+    <p class="text-indigo-700"><span class="font-medium">Title:</span> <span x-text="form.title||'—'"></span></p>
+    <p class="text-indigo-700"><span class="font-medium">Classification:</span> <span x-text="form.classification"></span> · <span x-text="form.status"></span></p>
+    <p class="text-indigo-700"><span class="font-medium">Hazards:</span> <span x-text="form.hazard_ids.length+' selected'"></span> · <span class="font-medium">States:</span> <span x-text="form.states.length+' selected'"></span></p>
+    <p class="text-indigo-700"><span class="font-medium">Products:</span> <span x-text="form.products.filter(p=>p.description.trim()).length+' item(s)'"></span></p>
+  </div>
+
+  <div class="flex justify-between items-center">
+    <button @click="step=3" class="px-4 py-2 text-sm text-slate-600 border border-slate-300 rounded hover:bg-slate-50 flex items-center gap-1.5"><i data-lucide="arrow-left" class="w-3.5 h-3.5"></i>Back</button>
+    <button @click="submit()" :disabled="saving||!form.title.trim()" class="px-6 py-2 bg-fw-500 text-white text-sm font-medium rounded hover:bg-fw-700 disabled:opacity-50 flex items-center gap-2">
+      <span x-show="!saving">Create Recall</span><span x-show="saving">Creating…</span>
+      <i data-lucide="check" class="w-4 h-4" x-show="!saving"></i>
+    </button>
+  </div>
+  <p x-show="err" x-text="err" class="text-xs text-red-600"></p>
+</div>
+
+<?php /* ── Step 5: Success + Export ── */ ?>
+<div x-show="step===5" class="space-y-5">
+  <div class="bg-green-50 border border-green-200 rounded-lg p-5 flex items-start gap-4">
+    <div class="w-10 h-10 rounded-full bg-green-500 flex items-center justify-center shrink-0">
+      <i data-lucide="check" class="w-5 h-5 text-white"></i>
+    </div>
+    <div>
+      <h2 class="text-base font-semibold text-green-800">Recall Created</h2>
+      <p class="text-sm text-green-700 mt-0.5">Record ID <span class="font-mono font-bold" x-text="'#'+saved_id"></span> saved with source ID <span class="font-mono text-xs bg-green-100 px-1.5 py-0.5 rounded" x-text="saved_source"></span></p>
+    </div>
+  </div>
+
+  <!-- Export panel -->
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2"><i data-lucide="download" class="w-4 h-4 text-fw-500"></i>Export This Recall</h3>
+    <div class="flex gap-3 mb-4">
+      <button @click="exportFmt='json'" :class="exportFmt==='json'?'ring-2 ring-fw-500 bg-fw-50 border-fw-500 text-fw-700':'border-slate-200 text-slate-600 hover:bg-slate-50'" class="flex-1 rounded-lg border px-4 py-3 text-center transition-all">
+        <i data-lucide="braces" class="w-5 h-5 mx-auto mb-1"></i>
+        <p class="text-xs font-semibold">JSON</p>
+        <p class="text-xs text-slate-400">Machine-readable</p>
+      </button>
+      <button @click="exportFmt='csv'" :class="exportFmt==='csv'?'ring-2 ring-fw-500 bg-fw-50 border-fw-500 text-fw-700':'border-slate-200 text-slate-600 hover:bg-slate-50'" class="flex-1 rounded-lg border px-4 py-3 text-center transition-all">
+        <i data-lucide="table" class="w-5 h-5 mx-auto mb-1"></i>
+        <p class="text-xs font-semibold">CSV</p>
+        <p class="text-xs text-slate-400">Spreadsheet</p>
+      </button>
+      <button @click="exportFmt='pdf'" :class="exportFmt==='pdf'?'ring-2 ring-fw-500 bg-fw-50 border-fw-500 text-fw-700':'border-slate-200 text-slate-600 hover:bg-slate-50'" class="flex-1 rounded-lg border px-4 py-3 text-center transition-all">
+        <i data-lucide="printer" class="w-5 h-5 mx-auto mb-1"></i>
+        <p class="text-xs font-semibold">Print / PDF</p>
+        <p class="text-xs text-slate-400">Print-ready report</p>
+      </button>
+    </div>
+    <div class="flex gap-3">
+      <button @click="exportRecall()" class="flex-1 px-4 py-2.5 bg-fw-500 text-white text-sm font-medium rounded hover:bg-fw-700 flex items-center justify-center gap-2">
+        <i data-lucide="download" class="w-4 h-4"></i>Download <span x-text="exportFmt.toUpperCase()"></span>
+      </button>
+      <a :href="'?page=recall&id='+saved_id" class="px-4 py-2.5 border border-slate-300 text-slate-700 text-sm rounded hover:bg-slate-50 flex items-center gap-2">
+        <i data-lucide="eye" class="w-4 h-4"></i>View Record
+      </a>
+    </div>
+  </div>
+
+  <!-- Export all current recalls -->
+  <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-5">
+    <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2"><i data-lucide="archive" class="w-4 h-4 text-fw-500"></i>Bulk Export All Recalls</h3>
+    <p class="text-xs text-slate-500 mb-4">Export the full recall dataset with all current filters applied.</p>
+    <div class="grid grid-cols-3 gap-2">
+      <a href="?api=export_csv" class="flex items-center justify-center gap-2 px-3 py-2 border border-slate-200 rounded text-sm text-slate-700 hover:bg-slate-50">
+        <i data-lucide="table" class="w-3.5 h-3.5 text-green-600"></i>All Recalls CSV
+      </a>
+      <a href="?api=export_json" class="flex items-center justify-center gap-2 px-3 py-2 border border-slate-200 rounded text-sm text-slate-700 hover:bg-slate-50">
+        <i data-lucide="braces" class="w-3.5 h-3.5 text-blue-600"></i>All Recalls JSON
+      </a>
+      <a href="?api=export_pdf" target="_blank" class="flex items-center justify-center gap-2 px-3 py-2 border border-slate-200 rounded text-sm text-slate-700 hover:bg-slate-50">
+        <i data-lucide="printer" class="w-3.5 h-3.5 text-slate-500"></i>Print Report
+      </a>
+    </div>
+  </div>
+
+  <div class="flex gap-3">
+    <button @click="step=1;form={title:'',reason:'',status:'ongoing',classification:'Class I',severity:3,voluntary_mandated:'Voluntary',announced_date:'',initiation_date:'',agency_id:'<?=h($agencies[0]['id']??1)?>',food_category_id:'',distribution_description:'',quantity_recalled:'',units:'',source_url:'',hazard_ids:[],states:[],products:[{description:'',upc:'',lot_number:'',use_by_date:''}]};saved_id=null;saved_source=''" class="px-4 py-2 text-sm border border-slate-300 rounded text-slate-600 hover:bg-slate-50 flex items-center gap-1.5">
+      <i data-lucide="plus" class="w-3.5 h-3.5"></i>Build Another
+    </button>
+    <a href="?page=recalls" class="px-4 py-2 text-sm bg-fw-500 text-white rounded hover:bg-fw-700 flex items-center gap-1.5">
+      <i data-lucide="list" class="w-3.5 h-3.5"></i>View All Recalls
+    </a>
+  </div>
+</div>
+
+</div>
 <?php layout_foot(); }
 
 function view_settings():void{
