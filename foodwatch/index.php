@@ -12547,6 +12547,7 @@ function route():void{
         case 'brand':         render_page('brand');break;
         case 'watchlist':     render_page('watchlist');break;
         case 'account':       render_page('account');break;
+        case 'settings':      render_page('settings');break;
         case 'tags':          render_page('tags');break;
         case 'shared':        render_page('shared');break;
         case 'status':        render_page('status');break;
@@ -12795,6 +12796,20 @@ function handle_api(string $api):void{
                 db()->prepare("DELETE FROM watchlists WHERE user_id=?")->execute([$uid_del]);
                 db()->prepare("DELETE FROM users WHERE id=?")->execute([$uid_del]);
                 echo js(['ok'=>true]);break;
+            case 'user_change_password':
+                if(!csrf_ok())fw_abort('CSRF',403);
+                if(!is_user())fw_abort('Login required',401);
+                $cp_user=current_user();
+                $cp_cur=trim($_POST['current_password']??'');
+                $cp_new=trim($_POST['new_password']??'');
+                if(strlen($cp_new)<8){echo js(['ok'=>false,'error'=>'New password must be at least 8 characters.']);break;}
+                $cp_row=db()->prepare('SELECT password_hash FROM users WHERE id=?');
+                $cp_row->execute([$cp_user['id']]);$cp_data=$cp_row->fetch();
+                if(!$cp_data||!password_verify($cp_cur,$cp_data['password_hash'])){echo js(['ok'=>false,'error'=>'Current password is incorrect.']);break;}
+                $cp_hash=password_hash($cp_new,PASSWORD_BCRYPT,['cost'=>12]);
+                db()->prepare('UPDATE users SET password_hash=? WHERE id=?')->execute([$cp_hash,$cp_user['id']]);
+                try{db()->prepare("INSERT INTO user_activity(user_id,action,meta,ip_hash)VALUES(?,?,?,?)")->execute([$cp_user['id'],'password_change','{}',hash('sha256',$_SERVER['REMOTE_ADDR']??'')]);}catch(\Throwable){}
+                echo js(['ok'=>true,'message'=>'Password updated successfully.']);break;
             case 'filter_save':
                 if(!csrf_ok())fw_abort('CSRF',403);
                 if(!is_user())fw_abort('Login required',401);
@@ -14601,6 +14616,7 @@ main>div.p-6{transition:background .2s}
     <a href="?page=watchlist" class="fw-nav-link <?=$page==='watchlist'?'active':''?>"><i data-lucide="bell" class="w-4 h-4"></i>Watchlist</a>
     <a href="?page=tags" class="fw-nav-link <?=$page==='tags'?'active':''?>"><i data-lucide="tags" class="w-4 h-4"></i>My Tags</a>
     <a href="?page=account" class="fw-nav-link <?=$page==='account'?'active':''?>"><i data-lucide="user" class="w-4 h-4"></i><?=is_user()?h(current_user()['email']):'Account'?></a>
+    <a href="?page=settings" class="fw-nav-link <?=$page==='settings'?'active':''?>"><i data-lucide="sliders" class="w-4 h-4"></i>Settings</a>
     <div class="border-t border-slate-700 my-2 pt-2">
       <a href="?page=playground" class="fw-nav-link <?=$page==='playground'?'active':''?>"><i data-lucide="terminal" class="w-4 h-4"></i>API Playground</a>
       <a href="?page=status" class="fw-nav-link <?=$page==='status'?'active':''?>"><i data-lucide="activity" class="w-4 h-4"></i>System Status</a>
@@ -14693,6 +14709,7 @@ function render_page(string $p):void{
         'risk_dashboard'=>view_risk_dashboard(),
         'watchlist'     =>view_watchlist(),
         'account'       =>view_account(),
+        'settings'      =>view_settings(),
         'tags'          =>view_tags(),
         'shared'        =>view_shared(),
         'status'        =>view_status(),
@@ -19155,6 +19172,202 @@ Authorization: Bearer fw_...</pre>
 
 <?php endif; ?>
 <?php endif; ?>
+<?php layout_foot(); }
+
+function view_settings():void{
+    if(!is_user()){header('Location: ?page=account');exit;}
+    $user=current_user();
+    layout_head('Settings','settings'); ?>
+<div class="max-w-2xl mx-auto space-y-6">
+
+<?php /* ── Profile ── */ ?>
+<section class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+  <div class="px-5 py-3 border-b border-slate-100 flex items-center gap-2">
+    <i data-lucide="user" class="w-4 h-4 text-fw-500"></i>
+    <h2 class="text-sm font-semibold text-slate-700">Profile</h2>
+  </div>
+  <div class="px-5 py-4 space-y-4">
+    <div class="flex items-center justify-between">
+      <div>
+        <p class="text-xs text-slate-500 mb-0.5">Email address</p>
+        <p class="text-sm font-medium text-slate-800"><?=h($user['email'])?></p>
+      </div>
+      <span class="text-xs text-slate-400">Member since <?=h(substr($user['created_at'],0,10))?></span>
+    </div>
+    <div class="border-t border-slate-100 pt-4" x-data="{open:false,cur:'',nw:'',err:'',ok:'',loading:false}">
+      <button @click="open=!open" class="text-sm text-fw-600 hover:underline flex items-center gap-1.5">
+        <i data-lucide="key" class="w-3.5 h-3.5"></i>Change password
+      </button>
+      <div x-show="open" x-transition class="mt-3 max-w-sm space-y-3">
+        <div>
+          <label class="block text-xs text-slate-500 mb-1">Current password</label>
+          <input type="password" x-model="cur" autocomplete="current-password" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+        </div>
+        <div>
+          <label class="block text-xs text-slate-500 mb-1">New password <span class="text-slate-400">(min 8 chars)</span></label>
+          <input type="password" x-model="nw" autocomplete="new-password" class="w-full text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+        </div>
+        <p x-show="err" x-text="err" class="text-xs text-red-600"></p>
+        <p x-show="ok" x-text="ok" class="text-xs text-green-700"></p>
+        <button @click="loading=true;err='';ok='';fetch('?api=user_change_password',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',current_password:cur,new_password:nw})}).then(r=>r.json()).then(d=>{loading=false;if(d.ok){ok=d.message||'Password updated.';cur='';nw='';setTimeout(()=>open=false,1500);}else err=d.error||'Update failed.';}).catch(()=>{loading=false;err='Network error.';})" :disabled="loading||!cur||nw.length<8" class="px-4 py-1.5 bg-fw-500 text-white text-sm rounded hover:bg-fw-700 disabled:opacity-50">
+          <span x-show="!loading">Update Password</span><span x-show="loading">Updating…</span>
+        </button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<?php /* ── Appearance ── */ ?>
+<section class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+  <div class="px-5 py-3 border-b border-slate-100 flex items-center gap-2">
+    <i data-lucide="sun" class="w-4 h-4 text-fw-500"></i>
+    <h2 class="text-sm font-semibold text-slate-700">Appearance</h2>
+  </div>
+  <div class="px-5 py-4">
+    <p class="text-xs text-slate-500 mb-3">Choose your preferred color scheme. The setting is saved in your browser.</p>
+    <div class="flex gap-3">
+      <button @click="theme='light';applyTheme();try{localStorage.setItem('fw-theme','light')}catch(e){}" :class="theme==='light'?'ring-2 ring-fw-500 bg-white':'bg-slate-50 hover:bg-white'" class="flex-1 rounded-lg border border-slate-200 px-4 py-3 flex flex-col items-center gap-1.5 transition-all cursor-pointer">
+        <i data-lucide="sun" class="w-5 h-5 text-amber-500"></i>
+        <span class="text-xs font-medium text-slate-700">Light</span>
+      </button>
+      <button @click="theme='dark';applyTheme();try{localStorage.setItem('fw-theme','dark')}catch(e){}" :class="theme==='dark'?'ring-2 ring-fw-500':'hover:bg-slate-700'" class="flex-1 rounded-lg border border-slate-600 bg-slate-800 px-4 py-3 flex flex-col items-center gap-1.5 transition-all cursor-pointer">
+        <i data-lucide="moon" class="w-5 h-5 text-slate-300"></i>
+        <span class="text-xs font-medium text-slate-300">Dark</span>
+      </button>
+      <button @click="theme='system';applyTheme();try{localStorage.setItem('fw-theme','system')}catch(e){}" :class="theme==='system'?'ring-2 ring-fw-500 bg-white':'bg-slate-50 hover:bg-white'" class="flex-1 rounded-lg border border-slate-200 px-4 py-3 flex flex-col items-center gap-1.5 transition-all cursor-pointer">
+        <i data-lucide="monitor" class="w-5 h-5 text-slate-500"></i>
+        <span class="text-xs font-medium text-slate-700">System</span>
+      </button>
+    </div>
+  </div>
+</section>
+
+<?php /* ── Notifications ── */ ?>
+<section class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden"
+  x-data="{prefs:{email_enabled:false,sms_enabled:false,frequency_cap:5},loading:true,saving:false,saved:false}"
+  x-init="fetch('?api=prefs_get').then(r=>r.json()).then(d=>{prefs=d;loading=false})">
+  <div class="px-5 py-3 border-b border-slate-100 flex items-center gap-2">
+    <i data-lucide="bell" class="w-4 h-4 text-fw-500"></i>
+    <h2 class="text-sm font-semibold text-slate-700">Notifications</h2>
+  </div>
+  <div class="px-5 py-4">
+    <div x-show="loading" class="text-sm text-slate-400 animate-pulse">Loading…</div>
+    <div x-show="!loading" class="space-y-4">
+      <label class="flex items-center justify-between cursor-pointer">
+        <div>
+          <p class="text-sm text-slate-700 font-medium">Email notifications</p>
+          <p class="text-xs text-slate-400">Receive recall alerts via email</p>
+        </div>
+        <button @click="prefs.email_enabled=!prefs.email_enabled" :class="prefs.email_enabled?'bg-fw-500':'bg-slate-200'" class="relative w-10 h-6 rounded-full transition-colors">
+          <span :class="prefs.email_enabled?'translate-x-5':'translate-x-1'" class="absolute top-1 left-0 w-4 h-4 bg-white rounded-full shadow transition-transform"></span>
+        </button>
+      </label>
+      <label class="flex items-center justify-between cursor-pointer">
+        <div>
+          <p class="text-sm text-slate-700 font-medium">SMS notifications</p>
+          <p class="text-xs text-slate-400">Receive recall alerts via text message</p>
+        </div>
+        <button @click="prefs.sms_enabled=!prefs.sms_enabled" :class="prefs.sms_enabled?'bg-fw-500':'bg-slate-200'" class="relative w-10 h-6 rounded-full transition-colors">
+          <span :class="prefs.sms_enabled?'translate-x-5':'translate-x-1'" class="absolute top-1 left-0 w-4 h-4 bg-white rounded-full shadow transition-transform"></span>
+        </button>
+      </label>
+      <div class="flex items-center gap-4 border-t border-slate-100 pt-3">
+        <div class="flex-1">
+          <p class="text-sm text-slate-700 font-medium">Max alerts per day</p>
+          <p class="text-xs text-slate-400">Limits daily notification volume</p>
+        </div>
+        <input type="number" x-model.number="prefs.frequency_cap" min="1" max="100" class="w-20 text-sm border border-slate-300 rounded px-2 py-1 text-center focus:outline-none focus:ring-2 focus:ring-fw-500">
+      </div>
+      <div class="flex items-center gap-3 pt-1">
+        <button @click="saving=true;saved=false;fetch('?api=prefs_set',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',email_enabled:prefs.email_enabled?'1':'0',sms_enabled:prefs.sms_enabled?'1':'0',frequency_cap:prefs.frequency_cap||1})}).then(r=>r.json()).then(d=>{saving=false;if(d.ok)saved=true;})" :disabled="saving" class="px-4 py-1.5 bg-fw-500 text-white text-sm rounded hover:bg-fw-700 disabled:opacity-50">
+          <span x-show="!saving">Save</span><span x-show="saving">Saving…</span>
+        </button>
+        <span x-show="saved" class="text-xs text-green-700 flex items-center gap-1"><i data-lucide="check" class="w-3 h-3"></i>Saved</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<?php /* ── API Keys ── */ ?>
+<section class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden"
+  x-data="{keys:[],loading:true,creating:false,newLabel:'My key',newKey:'',err:''}"
+  x-init="fetch('?api=keys_list').then(r=>r.json()).then(d=>{keys=d;loading=false})">
+  <div class="px-5 py-3 border-b border-slate-100 flex items-center justify-between">
+    <div class="flex items-center gap-2">
+      <i data-lucide="key" class="w-4 h-4 text-fw-500"></i>
+      <h2 class="text-sm font-semibold text-slate-700">API Keys</h2>
+    </div>
+    <span class="text-xs text-slate-400">Max 5 active keys</span>
+  </div>
+  <div class="px-5 py-4">
+    <div x-show="loading" class="text-sm text-slate-400 animate-pulse">Loading…</div>
+    <div x-show="!loading">
+      <div x-show="newKey" class="mb-4 p-3 bg-green-50 border border-green-200 rounded-lg">
+        <p class="text-xs font-semibold text-green-700 mb-1">New API key — copy it now, it won't be shown again:</p>
+        <code x-text="newKey" class="text-xs font-mono bg-green-100 text-green-800 px-2 py-1 rounded select-all break-all"></code>
+      </div>
+      <div x-show="keys.length===0&&!newKey" class="text-sm text-slate-400 py-2 mb-3">No API keys yet.</div>
+      <div class="space-y-2 mb-4">
+        <template x-for="k in keys" :key="k.id">
+          <div class="flex items-center gap-3 p-3 rounded border border-slate-200 bg-slate-50">
+            <div class="flex-1 min-w-0">
+              <p class="text-sm font-medium text-slate-700 truncate" x-text="k.label"></p>
+              <p class="text-xs text-slate-400 font-mono" x-text="k.key_prefix+'…'"></p>
+            </div>
+            <span class="text-xs text-slate-400 whitespace-nowrap" x-text="k.last_used?'Used '+k.last_used.substring(0,10):'Never used'"></span>
+            <button @click="if(confirm('Revoke this key?'))fetch('?api=key_del',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',id:k.id})}).then(r=>r.json()).then(d=>{if(d.ok)keys=keys.filter(x=>x.id!==k.id)})" class="text-xs text-red-500 hover:text-red-700 shrink-0">Revoke</button>
+          </div>
+        </template>
+      </div>
+      <div x-show="keys.length<5" class="flex items-center gap-2">
+        <input type="text" x-model="newLabel" placeholder="Key label" maxlength="64" class="flex-1 text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500">
+        <button @click="creating=true;err='';newKey='';fetch('?api=key_create',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',label:newLabel})}).then(r=>r.json()).then(d=>{creating=false;if(d.ok){newKey=d.key;fetch('?api=keys_list').then(r=>r.json()).then(r2=>keys=r2);}else err=d.error||'Error.';}).catch(()=>{creating=false;err='Network error.';});" :disabled="creating||!newLabel.trim()" class="px-4 py-1.5 bg-fw-500 text-white text-sm rounded hover:bg-fw-700 disabled:opacity-50 whitespace-nowrap">
+          <span x-show="!creating">Generate Key</span><span x-show="creating">Generating…</span>
+        </button>
+      </div>
+      <p x-show="err" x-text="err" class="text-xs text-red-600 mt-2"></p>
+    </div>
+  </div>
+</section>
+
+<?php /* ── Privacy ── */ ?>
+<section class="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+  <div class="px-5 py-3 border-b border-slate-100 flex items-center gap-2">
+    <i data-lucide="shield-check" class="w-4 h-4 text-fw-500"></i>
+    <h2 class="text-sm font-semibold text-slate-700">Privacy &amp; Data</h2>
+  </div>
+  <div class="px-5 py-4 space-y-3" x-data="{requesting:false,msg:''}">
+    <p class="text-xs text-slate-500">Request a copy of your data or permanently delete your account. Requests are processed within 72 hours.</p>
+    <div class="flex gap-3 flex-wrap">
+      <button @click="requesting=true;fetch('?api=data_request_create',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',type:'export'})}).then(r=>r.json()).then(d=>{requesting=false;msg=d.ok?'Export request submitted.':'Error creating request.';})" :disabled="requesting" class="px-4 py-2 bg-slate-100 text-slate-700 text-sm rounded hover:bg-slate-200 border border-slate-300 disabled:opacity-50 flex items-center gap-2">
+        <i data-lucide="download" class="w-3.5 h-3.5"></i>Request Data Export
+      </button>
+      <button @click="if(confirm('Request permanent account deletion? This action cannot be undone.'))fetch('?api=data_request_create',{method:'POST',headers:{'X-CSRF-Token':'<?=csrf()?>'},body:new URLSearchParams({csrf:'<?=csrf()?>',type:'deletion'})}).then(r=>r.json()).then(d=>{requesting=false;msg=d.ok?'Deletion request submitted.':'Error creating request.';})" :disabled="requesting" class="px-4 py-2 bg-red-50 text-red-700 text-sm rounded hover:bg-red-100 border border-red-200 disabled:opacity-50 flex items-center gap-2">
+        <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>Request Account Deletion
+      </button>
+    </div>
+    <p x-show="msg" x-text="msg" class="text-xs text-slate-600"></p>
+  </div>
+</section>
+
+<?php /* ── Danger zone: sign out ── */ ?>
+<section class="bg-white rounded-lg border border-red-200 shadow-sm overflow-hidden">
+  <div class="px-5 py-3 border-b border-red-100 flex items-center gap-2">
+    <i data-lucide="log-out" class="w-4 h-4 text-red-500"></i>
+    <h2 class="text-sm font-semibold text-red-700">Session</h2>
+  </div>
+  <div class="px-5 py-4 flex items-center justify-between">
+    <div>
+      <p class="text-sm text-slate-700">Signed in as <strong><?=h($user['email'])?></strong></p>
+      <p class="text-xs text-slate-400">Signing out ends your current session.</p>
+    </div>
+    <button onclick="fetch('?api=user_logout',{method:'POST',body:new URLSearchParams({csrf:'<?=csrf()?>'}),headers:{'X-CSRF-Token':'<?=csrf()?>'}}).then(()=>location.href='?page=account')" class="px-4 py-2 text-sm text-red-600 hover:text-red-800 border border-red-200 rounded hover:bg-red-50 flex items-center gap-1.5">
+      <i data-lucide="log-out" class="w-3.5 h-3.5"></i>Sign out
+    </button>
+  </div>
+</section>
+
+</div>
 <?php layout_foot(); }
 
 // ================================================================
