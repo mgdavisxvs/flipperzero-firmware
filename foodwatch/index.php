@@ -3589,7 +3589,7 @@ function send_security_headers():void{
     header("X-XSS-Protection: 1; mode=block");
     header("Referrer-Policy: strict-origin-when-cross-origin");
     header("Permissions-Policy: geolocation=(), microphone=(), camera=()");
-    header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://cdn.tailwindcss.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'");
+    header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'");
     if(!empty($_SERVER['HTTPS'])&&$_SERVER['HTTPS']!=='off'){
         header("Strict-Transport-Security: max-age=31536000; includeSubDomains");
     }
@@ -14432,12 +14432,17 @@ function layout_head(string $title,string $page):void{
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title><?=h($title)?> — FoodWatch US</title>
-<script src="https://cdn.tailwindcss.com"></script>
+<script src="assets/js/tailwind.js"></script>
 <script>tailwind.config={theme:{extend:{colors:{fw:{50:'#f0f4ff',100:'#dce7ff',500:'#3b5bdb',700:'#2c4cc4',900:'#1a3399'}}}}}</script>
-<script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
-<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/lucide@latest/dist/umd/lucide.min.js"></script>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+<script src="assets/js/alpine.min.js" defer></script>
+<script src="assets/js/d3.min.js"></script>
+<script src="assets/js/lucide.min.js"></script>
+<style>
+@font-face{font-family:'Inter';font-style:normal;font-weight:400;font-display:swap;src:url('assets/fonts/inter-400.woff2') format('woff2'),url('assets/fonts/inter-400.woff') format('woff')}
+@font-face{font-family:'Inter';font-style:normal;font-weight:500;font-display:swap;src:url('assets/fonts/inter-500.woff2') format('woff2'),url('assets/fonts/inter-500.woff') format('woff')}
+@font-face{font-family:'Inter';font-style:normal;font-weight:600;font-display:swap;src:url('assets/fonts/inter-600.woff2') format('woff2'),url('assets/fonts/inter-600.woff') format('woff')}
+@font-face{font-family:'Inter';font-style:normal;font-weight:700;font-display:swap;src:url('assets/fonts/inter-700.woff2') format('woff2'),url('assets/fonts/inter-700.woff') format('woff')}
+</style>
 <style>
 :root{
   --fw-surface:#f8fafc;--fw-surface-card:#ffffff;--fw-surface-card-border:#e2e8f0;
@@ -19934,7 +19939,7 @@ function view_map():void{
   <span>Color scale: light = fewer → dark blue = most</span>
   <span>Includes nationwide recalls in all states</span>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/topojson-client@3/dist/topojson.min.js"></script>
+<script src="assets/js/topojson.min.js"></script>
 <script>
 (function(){
   const geoRisk=<?=js(array_values($geo_risk))?>;
@@ -19993,7 +19998,7 @@ function view_map():void{
       .attr('fill',d=>{const code=fips[String(+d.id).padStart(2,'0')];const info=byState[code];return info&&getVal(info)>0?color(getVal(info)):'#e2e8f0';});
   }
 
-  fetch('https://cdn.jsdelivr.net/npm/us-atlas@3/states-10m.json')
+  fetch('assets/js/us-atlas-states-10m.json')
     .then(r=>r.json())
     .then(us=>{
       statesFeatures=topojson.feature(us,us.objects.states);
@@ -20130,7 +20135,7 @@ function view_sankey():void{
 <div class="bg-white rounded-lg border border-slate-200 shadow-sm p-4">
   <div id="sankey-chart" style="min-height:500px"></div>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/d3-sankey@0.12.3/dist/d3-sankey.min.js"></script>
+<script src="assets/js/d3-sankey.min.js"></script>
 <script>
 (function(){
   fetch('?api=sankey').then(r=>r.json()).then(links=>{
@@ -20219,7 +20224,7 @@ function view_graph3d():void{
   <div class="absolute bottom-3 left-3 text-slate-400 text-xs">Drag to rotate · Scroll to zoom · Click node for details</div>
   <button id="graph3d-hub-btn" class="absolute bottom-3 right-3 bg-indigo-600 text-white text-xs px-2 py-1 rounded hover:bg-indigo-700">Hub Analysis</button>
 </div>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="assets/js/three.min.js"></script>
 <script>
 (function(){
   const R=<?=js($recalls_raw)?>;
