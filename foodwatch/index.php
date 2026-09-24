@@ -14466,8 +14466,9 @@ function layout_head(string $title,string $page):void{
   --fw-hazard-chemical:#22d3ee;--fw-hazard-regulatory:#94a3b8;
 }
 body{font-family:'Inter',system-ui,sans-serif;background:var(--fw-surface);color:var(--fw-text-primary)}
-.fw-nav-link{@apply flex items-center gap-2 px-3 py-2 rounded text-sm font-medium text-slate-300 hover:bg-slate-700 hover:text-white transition-colors}
-.fw-nav-link.active{@apply bg-slate-700 text-white}
+.fw-nav-link{display:flex;align-items:center;gap:.5rem;padding:.5rem .75rem;border-radius:.25rem;font-size:.875rem;line-height:1.25rem;font-weight:500;color:#cbd5e1;white-space:nowrap;transition:color .15s,background-color .15s;text-decoration:none}
+.fw-nav-link svg{flex-shrink:0;width:1rem;height:1rem}
+.fw-nav-link:hover,.fw-nav-link.active{background-color:#334155;color:#fff}
 .fw-stat{background:var(--fw-surface-card);border:1px solid var(--fw-surface-card-border);border-radius:.5rem;padding:1rem;box-shadow:0 1px 2px 0 rgb(0 0 0/.05)}
 .fw-table th{padding:.5rem .75rem;text-align:left;font-size:.75rem;font-weight:600;color:var(--fw-text-secondary);text-transform:uppercase;letter-spacing:.05em;background:var(--fw-surface-table-head);border-bottom:1px solid var(--fw-table-border)}
 .fw-table td{padding:.5rem .75rem;font-size:.875rem;color:var(--fw-text-primary);border-bottom:1px solid var(--fw-table-border)}
@@ -14491,6 +14492,30 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--fw-surface);color
   :root:not([data-theme="light"]) main .shadow-sm{box-shadow:0 1px 3px 0 rgb(0 0 0/.3),0 1px 2px -1px rgb(0 0 0/.2)!important}
   :root:not([data-theme="light"]) main .hover\:bg-slate-50:hover{background-color:var(--fw-table-row-hover)!important}
   :root:not([data-theme="light"]) main .hover\:bg-slate-100:hover{background-color:#263347!important}
+  :root:not([data-theme="light"]) main .bg-blue-50{background-color:#172554!important}
+  :root:not([data-theme="light"]) main .bg-indigo-50{background-color:#1e1b4b!important}
+  :root:not([data-theme="light"]) main .border-blue-200{border-color:#1e3a8a!important}
+  :root:not([data-theme="light"]) main .border-indigo-200{border-color:#312e81!important}
+  :root:not([data-theme="light"]) main .text-blue-800,:root:not([data-theme="light"]) main .text-blue-700{color:#93c5fd!important}
+  :root:not([data-theme="light"]) main .text-indigo-800,:root:not([data-theme="light"]) main .text-indigo-700{color:#a5b4fc!important}
+  :root:not([data-theme="light"]) main .text-indigo-600{color:#818cf8!important}
+  :root:not([data-theme="light"]) main .text-blue-600{color:#60a5fa!important}
+  :root:not([data-theme="light"]) main .bg-blue-100{background-color:rgba(30,64,175,.35)!important}
+  :root:not([data-theme="light"]) main .bg-indigo-100{background-color:rgba(49,46,129,.4)!important}
+  :root:not([data-theme="light"]) main .bg-green-100{background-color:rgba(6,78,59,.4)!important}
+  :root:not([data-theme="light"]) main .bg-red-100{background-color:rgba(127,29,29,.4)!important}
+  :root:not([data-theme="light"]) main .bg-red-50{background-color:rgba(127,29,29,.25)!important}
+  :root:not([data-theme="light"]) main .bg-yellow-100{background-color:rgba(113,63,18,.4)!important}
+  :root:not([data-theme="light"]) main .bg-amber-100{background-color:rgba(120,53,15,.4)!important}
+  :root:not([data-theme="light"]) main .bg-gray-100{background-color:#1e293b!important}
+  :root:not([data-theme="light"]) main .text-green-700{color:#86efac!important}
+  :root:not([data-theme="light"]) main .text-green-800{color:#86efac!important}
+  :root:not([data-theme="light"]) main .text-red-700{color:#fca5a5!important}
+  :root:not([data-theme="light"]) main .text-red-800{color:#fca5a5!important}
+  :root:not([data-theme="light"]) main .text-yellow-700{color:#fde68a!important}
+  :root:not([data-theme="light"]) main .text-amber-700{color:#fcd34d!important}
+  :root:not([data-theme="light"]) main .text-gray-600{color:#94a3b8!important}
+  :root:not([data-theme="light"]) main .text-gray-700{color:#94a3b8!important}
 }
 :root[data-theme="dark"] main .bg-white{background-color:var(--fw-surface-card)!important}
 :root[data-theme="dark"] main .bg-slate-50{background-color:var(--fw-surface-table-head)!important}
@@ -14507,6 +14532,30 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--fw-surface);color
 :root[data-theme="dark"] main .shadow-sm{box-shadow:0 1px 3px 0 rgb(0 0 0/.3),0 1px 2px -1px rgb(0 0 0/.2)!important}
 :root[data-theme="dark"] main .hover\:bg-slate-50:hover{background-color:var(--fw-table-row-hover)!important}
 :root[data-theme="dark"] main .hover\:bg-slate-100:hover{background-color:#263347!important}
+:root[data-theme="dark"] main .bg-blue-50{background-color:#172554!important}
+:root[data-theme="dark"] main .bg-indigo-50{background-color:#1e1b4b!important}
+:root[data-theme="dark"] main .border-blue-200{border-color:#1e3a8a!important}
+:root[data-theme="dark"] main .border-indigo-200{border-color:#312e81!important}
+:root[data-theme="dark"] main .text-blue-800,:root[data-theme="dark"] main .text-blue-700{color:#93c5fd!important}
+:root[data-theme="dark"] main .text-indigo-800,:root[data-theme="dark"] main .text-indigo-700{color:#a5b4fc!important}
+:root[data-theme="dark"] main .text-indigo-600{color:#818cf8!important}
+:root[data-theme="dark"] main .text-blue-600{color:#60a5fa!important}
+:root[data-theme="dark"] main .bg-blue-100{background-color:rgba(30,64,175,.35)!important}
+:root[data-theme="dark"] main .bg-indigo-100{background-color:rgba(49,46,129,.4)!important}
+:root[data-theme="dark"] main .bg-green-100{background-color:rgba(6,78,59,.4)!important}
+:root[data-theme="dark"] main .bg-red-100{background-color:rgba(127,29,29,.4)!important}
+:root[data-theme="dark"] main .bg-red-50{background-color:rgba(127,29,29,.25)!important}
+:root[data-theme="dark"] main .bg-yellow-100{background-color:rgba(113,63,18,.4)!important}
+:root[data-theme="dark"] main .bg-amber-100{background-color:rgba(120,53,15,.4)!important}
+:root[data-theme="dark"] main .bg-gray-100{background-color:#1e293b!important}
+:root[data-theme="dark"] main .text-green-700{color:#86efac!important}
+:root[data-theme="dark"] main .text-green-800{color:#86efac!important}
+:root[data-theme="dark"] main .text-red-700{color:#fca5a5!important}
+:root[data-theme="dark"] main .text-red-800{color:#fca5a5!important}
+:root[data-theme="dark"] main .text-yellow-700{color:#fde68a!important}
+:root[data-theme="dark"] main .text-amber-700{color:#fcd34d!important}
+:root[data-theme="dark"] main .text-gray-600{color:#94a3b8!important}
+:root[data-theme="dark"] main .text-gray-700{color:#94a3b8!important}
 /* ── global polish ── */
 [x-cloak]{display:none!important}
 *:focus-visible{outline:2px solid #3b5bdb;outline-offset:2px}
@@ -14574,11 +14623,11 @@ main>div.p-6{transition:background .2s}
 </nav>
 <!-- Main content -->
 <main class="md:ml-56 flex-1 min-h-full">
-<div class="sticky top-0 z-10 bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between">
-  <h1 class="text-sm font-semibold text-slate-700"><?=h($title)?></h1>
+<div class="sticky top-0 z-10 px-6 py-3 flex items-center justify-between" style="background:var(--fw-surface-card);border-bottom:1px solid var(--fw-surface-card-border)">
+  <h1 class="text-sm font-semibold" style="color:var(--fw-text-secondary)"><?=h($title)?></h1>
   <form action="?" method="get" class="flex items-center gap-2">
     <input type="hidden" name="page" value="search">
-    <input type="search" name="q" placeholder="Search recalls, brands, retailers…" class="w-64 text-sm border border-slate-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500" value="<?=h($_GET['q']??'')?>">
+    <input type="search" name="q" placeholder="Search recalls, brands, retailers…" class="w-64 text-sm rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-fw-500" style="border:1px solid var(--fw-surface-card-border);background:var(--fw-surface-card);color:var(--fw-text-primary)" value="<?=h($_GET['q']??'')?>">
     <button class="text-slate-400 hover:text-slate-600"><i data-lucide="search" class="w-4 h-4"></i></button>
   </form>
 </div>
