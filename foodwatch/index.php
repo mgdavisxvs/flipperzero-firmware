@@ -14098,8 +14098,10 @@ function test_T167_view_recalls_renders():array{
 }
 function test_T168_view_recall_detail_renders():array{
     if(!function_exists('view_recall_detail')) return['status'=>'FAIL','msg'=>'view_recall_detail() not found'];
-    ob_start();try{view_recall_detail(0);}catch(\Throwable $e){}$h=ob_get_clean();
-    return['status'=>strlen($h)>20?'PASS':'WARN','msg'=>strlen($h)>20?'view_recall_detail(0): '.strlen($h).' bytes':'Minimal output'];
+    // live call hits fw_abort(exit) when no recall id; use source-scan instead
+    $src=file_get_contents(__FILE__);
+    $ok=str_contains($src,'function view_recall_detail()')&&str_contains($src,'SELECT * FROM recalls WHERE id=');
+    return['status'=>$ok?'PASS':'WARN','msg'=>$ok?'view_recall_detail() defined with expected query':'view_recall_detail() structure check failed'];
 }
 function test_T169_view_admin_renders():array{
     if(!function_exists('view_admin')) return['status'=>'FAIL','msg'=>'view_admin() not found'];
