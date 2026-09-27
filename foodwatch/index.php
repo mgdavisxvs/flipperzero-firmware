@@ -14683,10 +14683,11 @@ main>div.p-6{transition:background .2s}
     <a href="?page=account" class="fw-nav-link <?=$page==='account'?'active':''?>"><i data-lucide="user" class="w-4 h-4"></i><?=is_user()?h(current_user()['email']):'Account'?></a>
     <a href="?page=settings" class="fw-nav-link <?=$page==='settings'?'active':''?>"><i data-lucide="sliders" class="w-4 h-4"></i>Settings</a>
     <div class="border-t border-slate-700 my-2 pt-2">
+      <div class="text-xs text-slate-500 px-3 pt-1 pb-1 uppercase tracking-wider font-semibold">Admin</div>
+      <a href="?page=recall_builder" class="fw-nav-link <?=$page==='recall_builder'?'active':''?>"><i data-lucide="file-plus" class="w-4 h-4"></i>Build Recall</a>
       <a href="?page=playground" class="fw-nav-link <?=$page==='playground'?'active':''?>"><i data-lucide="terminal" class="w-4 h-4"></i>API Playground</a>
       <a href="?page=status" class="fw-nav-link <?=$page==='status'?'active':''?>"><i data-lucide="activity" class="w-4 h-4"></i>System Status</a>
       <a href="?page=tests" class="fw-nav-link <?=$page==='tests'?'active':''?>"><i data-lucide="check-circle" class="w-4 h-4"></i>Self-Tests</a>
-      <a href="?page=recall_builder" class="fw-nav-link <?=$page==='recall_builder'?'active':''?>"><i data-lucide="file-plus" class="w-4 h-4"></i>Build Recall</a>
       <a href="?page=admin" class="fw-nav-link <?=$page==='admin'?'active':''?>"><i data-lucide="settings" class="w-4 h-4"></i>Admin</a>
     </div>
   </div>
