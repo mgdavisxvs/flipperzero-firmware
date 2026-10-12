@@ -1,5 +1,13 @@
 <?php
 declare(strict_types=1);
+// Serve static files directly when using PHP built-in server
+if (PHP_SAPI === 'cli-server') {
+    $uri = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
+    $file = __DIR__ . $uri;
+    if ($uri !== '/' && is_file($file)) {
+        return false;
+    }
+}
 /**
  * FoodWatch US — Food Recall Intelligence Platform v1.0.0
  * PHP 8.2+ · SQLite WAL · TailwindCSS CDN · Alpine.js · D3.js · Lucide
