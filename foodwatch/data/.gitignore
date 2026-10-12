@@ -1,0 +1,7 @@
+# SQLite database and WAL files — generated at runtime, never committed
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
